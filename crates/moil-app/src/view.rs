@@ -506,6 +506,7 @@ mod tests {
             fraction,
             message: Some("diarizing".into()),
             started_at: Instant::now(),
+            stopping: false,
         }
     }
 

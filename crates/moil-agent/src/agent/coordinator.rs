@@ -220,6 +220,15 @@ struct Running {
     status: JobStatus,
 }
 
+impl Running {
+    /// Asks the attempt to stop; the first reason given wins. It shows as
+    /// stopping until the executor returns.
+    fn stop(&mut self, reason: StopReason) {
+        self.stopper.stop(reason);
+        self.status.stopping = true;
+    }
+}
+
 #[derive(Default)]
 struct Shutdown {
     waiters: Vec<oneshot::Sender<()>>,
@@ -350,17 +359,17 @@ impl Coordinator {
                 }
             }
             Command::StopJob => {
-                if let Some(running) = &self.running {
+                if let Some(running) = &mut self.running {
                     tracing::info!("stopping {}", running.key);
-                    running.stopper.stop(StopReason::Interrupted);
+                    running.stop(StopReason::Interrupted);
                 }
             }
             Command::Shutdown(reply) => {
                 let deliver_by = Instant::now() + self.options.shutdown_grace;
                 let shutdown = self.shutdown.get_or_insert_with(Shutdown::default);
                 shutdown.waiters.push(reply);
-                match &self.running {
-                    Some(running) => running.stopper.stop(StopReason::Interrupted),
+                match &mut self.running {
+                    Some(running) => running.stop(StopReason::Interrupted),
                     None => {
                         shutdown.deliver_by.get_or_insert(deliver_by);
                     }
@@ -556,6 +565,7 @@ impl Coordinator {
             fraction: None,
             message: None,
             started_at: Instant::now(),
+            stopping: false,
         };
         self.attempts.insert(key.clone(), attempt);
         self.running = Some(Running {
@@ -691,9 +701,9 @@ impl Coordinator {
             service: id.clone(),
             attempt,
         };
-        if let Some(running) = self.running.as_ref().filter(|r| r.key == key) {
+        if let Some(running) = self.running.as_mut().filter(|r| r.key == key) {
             tracing::info!("{id} cancelled {key}");
-            running.stopper.stop(StopReason::Cancelled);
+            running.stop(StopReason::Cancelled);
         }
     }
 
@@ -701,8 +711,8 @@ impl Coordinator {
     /// is sent.
     fn abandon(&mut self, key: &AttemptKey) {
         self.attempts.remove(key);
-        if let Some(running) = self.running.as_ref().filter(|r| r.key == *key) {
-            running.stopper.stop(StopReason::Cancelled);
+        if let Some(running) = self.running.as_mut().filter(|r| r.key == *key) {
+            running.stop(StopReason::Cancelled);
         }
     }
 
@@ -710,8 +720,8 @@ impl Coordinator {
     /// machine's messages, stopping the running one.
     fn drop_attempts(&mut self, id: &ServiceId) {
         self.attempts.retain(|key, _| key.service != *id);
-        if let Some(running) = self.running.as_ref().filter(|r| r.key.service == *id) {
-            running.stopper.stop(StopReason::Interrupted);
+        if let Some(running) = self.running.as_mut().filter(|r| r.key.service == *id) {
+            running.stop(StopReason::Interrupted);
         }
     }
 

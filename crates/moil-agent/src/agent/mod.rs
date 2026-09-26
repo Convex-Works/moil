@@ -265,4 +265,8 @@ pub struct JobStatus {
     /// The script's latest `progress.message`.
     pub message: Option<String>,
     pub started_at: Instant,
+    /// Whether the attempt was asked to stop (by the owner, its service, a
+    /// withdrawn approval or shutting down) and is winding down. It stays
+    /// the running job until the runtime has stopped it.
+    pub stopping: bool,
 }

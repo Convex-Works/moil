@@ -198,6 +198,7 @@ impl State {
                     fraction: None,
                     message: None,
                     started_at: Instant::now(),
+                    stopping: false,
                 })
             });
             self.run_job().await;

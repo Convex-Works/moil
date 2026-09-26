@@ -155,6 +155,14 @@ fn log(message: &str) -> JobEvent {
     JobEvent::log(LogLevel::Info, message)
 }
 
+/// How an attempt that was stopped by the owner or a shutdown ends.
+fn interrupted() -> Outcome {
+    Outcome::failed(moil_proto::JobError::new(
+        ErrorCode::Interrupted,
+        "stopped by the owner",
+    ))
+}
+
 /// The error of a failed `done`.
 fn failure(message: MachineMessage) -> (u64, moil_proto::JobError) {
     match message {
@@ -401,6 +409,51 @@ async fn the_owner_stopping_a_job_makes_it_retryable_elsewhere() {
         (1, ErrorCode::Interrupted, true)
     );
     assert_eq!(conn.recv().await, state(MachineState::Idle));
+}
+
+#[tokio::test]
+async fn a_stopping_job_shows_as_stopping_until_it_ends() {
+    for cause in ["the owner", "the service", "shutting down"] {
+        let mut setup = Setup::new().await;
+        let mut conn = setup.connect().await;
+        conn.send(assign("j1", 1, setup.hash(), 30_000));
+        assert_eq!(conn.recv().await, state(MachineState::Busy));
+        let mut run = setup.runs.next().await;
+        run.linger();
+        let job = snapshot_where(&setup.agent, "the job to show", |s| s.job.is_some()).await;
+        assert!(!job.job.unwrap().stopping, "{cause}");
+
+        let (reason, outcome) = match cause {
+            "the owner" => {
+                setup.agent.stop_job();
+                (StopReason::Interrupted, interrupted())
+            }
+            "the service" => {
+                conn.send(ServiceMessage::Cancel(attempt("j1", 1)));
+                (StopReason::Cancelled, Outcome::Cancelled)
+            }
+            _ => {
+                let agent = setup.agent.clone();
+                tokio::spawn(async move { agent.shutdown().await });
+                (StopReason::Interrupted, interrupted())
+            }
+        };
+        assert_eq!(run.stopped().await, reason, "{cause}");
+        snapshot_where(&setup.agent, "the job to show it's stopping", |s| {
+            s.job.as_ref().is_some_and(|j| j.stopping)
+        })
+        .await;
+
+        // The script takes its time; the job is still the running one.
+        run.emit(log("cleaning up"));
+        assert_eq!(conn.recv().await, event("j1", 1, 1, log("cleaning up")));
+        let job = setup.agent.snapshot().job;
+        assert!(job.is_some_and(|j| j.stopping), "{cause}");
+
+        run.finish(outcome.clone());
+        assert_eq!(conn.recv().await, done("j1", 1, 2, outcome), "{cause}");
+        snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+    }
 }
 
 #[tokio::test]
