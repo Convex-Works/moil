@@ -11,10 +11,11 @@ go-check:
 	cd sdk/go && test -z "$$(gofmt -l .)" && go vet ./... && go test -race ./...
 	cd examples/service && test -z "$$(gofmt -l .)" && go vet ./... && go test ./...
 
-# The Go SDK against the real `moil` binary and real uv.
+# The Go SDK against the real `moil` binary and real uv. -count=1: the
+# results depend on the moil binary, which go test's cache doesn't track.
 e2e:
 	cargo build -p moil-cli
-	cd e2e && go test ./...
+	cd e2e && test -z "$$(gofmt -l .)" && go vet ./... && go test -race -count=1 ./...
 
 fmt:
 	cargo fmt --all

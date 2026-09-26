@@ -1,6 +1,7 @@
 go 1.24
 
 use (
+	./e2e
 	./examples/service
 	./sdk/go
 )

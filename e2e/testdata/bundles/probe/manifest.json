@@ -1,0 +1,6 @@
+{
+  "moil": 1,
+  "name": "probe",
+  "version": "1",
+  "description": "Does what its params say, for moil's end-to-end tests."
+}
