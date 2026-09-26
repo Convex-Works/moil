@@ -22,6 +22,8 @@ pub struct ReviewWindow {
     state: State,
     /// The page shown no longer matches `state`.
     stale: bool,
+    /// The owner approved the bundle in this window.
+    approved: bool,
 }
 
 #[derive(Debug)]
@@ -62,7 +64,14 @@ impl ReviewWindow {
             hash,
             state: State::Loading,
             stale: false,
+            approved: false,
         }
+    }
+
+    /// Whether the owner approved the bundle here. A window closed any
+    /// other way leaves the decision for later.
+    pub fn approved(&self) -> bool {
+        self.approved
     }
 
     /// Whether the page shown is out of date and should be rendered again.
@@ -160,7 +169,12 @@ impl ReviewWindow {
     /// The agent finished approving or revoking: the window closes, or
     /// shows why it couldn't.
     pub fn finished(&mut self, result: Result<(), String>) -> Option<ReviewEffect> {
-        let State::Ready { busy, error, .. } = &mut self.state else {
+        let State::Ready {
+            review,
+            busy,
+            error,
+        } = &mut self.state
+        else {
             return None;
         };
         if !*busy {
@@ -168,7 +182,10 @@ impl ReviewWindow {
         }
         *busy = false;
         match result {
-            Ok(()) => Some(ReviewEffect::Close),
+            Ok(()) => {
+                self.approved = !review.approved;
+                Some(ReviewEffect::Close)
+            }
             Err(e) => {
                 *error = Some(e);
                 self.stale = true;

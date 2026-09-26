@@ -17,6 +17,8 @@ pub struct UnpairWindow {
     approvals: usize,
     busy: bool,
     error: Option<String>,
+    /// The page shown no longer matches the state.
+    stale: bool,
 }
 
 /// What the app should do next for an unpair window.
@@ -35,7 +37,14 @@ impl UnpairWindow {
             approvals: service.bundles.iter().filter(|b| b.approved).count(),
             busy: false,
             error: None,
+            stale: false,
         }
+    }
+
+    /// Whether the page shown is out of date and should be rendered again.
+    /// Clicking Unpair doesn't make it so: the page shows that it is busy.
+    pub fn needs_render(&mut self) -> bool {
+        std::mem::take(&mut self.stale)
     }
 
     pub fn service(&self) -> &ServiceId {
@@ -67,6 +76,7 @@ impl UnpairWindow {
             Ok(()) => Some(UnpairEffect::Close),
             Err(error) => {
                 self.error = Some(error);
+                self.stale = true;
                 None
             }
         }
@@ -155,6 +165,10 @@ mod tests {
             Some(UnpairEffect::Unpair(demo::service_id("klisi.example.com")))
         );
         assert_eq!(window.on_message(ConfirmMessage::Confirm {}), None);
+        assert!(
+            !window.needs_render(),
+            "the page shows it is busy by itself"
+        );
         assert!(window.render().contains("Unpairing…"));
         assert_eq!(window.finished(Ok(())), Some(UnpairEffect::Close));
     }

@@ -555,7 +555,7 @@ impl App {
         self.windows.get_mut(&window).map(|w| &mut w.content)
     }
 
-    /// Shows a window's page again, if it has changed.
+    /// Shows a window's page again, if its state has moved on from it.
     fn render(&mut self, id: WindowId) {
         let Some(window) = self.windows.get_mut(&id) else {
             return;
@@ -567,8 +567,18 @@ impl App {
                 }
                 (flow.title(), flow.render(SystemTime::now()))
             }
-            Content::Pair { flow, .. } => (flow.title().into(), flow.render(Instant::now())),
-            Content::Unpair(flow) => (flow.title(), flow.render()),
+            Content::Pair { flow, .. } => {
+                if !flow.needs_render() {
+                    return;
+                }
+                (flow.title().into(), flow.render(Instant::now()))
+            }
+            Content::Unpair(flow) => {
+                if !flow.needs_render() {
+                    return;
+                }
+                (flow.title(), flow.render())
+            }
             Content::Notice { .. } => return,
         };
         window.window.set_title(&title);
@@ -636,6 +646,7 @@ impl App {
             .map_err(|e| tracing::error!("couldn't show a page: {e}"))
             .ok()?;
         window.set_focus();
+        tracing::debug!(title = frame.title, "opened a window");
         self.windows.insert(
             id,
             Window {
@@ -654,7 +665,7 @@ impl App {
             return;
         };
         match window.content {
-            Content::Review(flow) => {
+            Content::Review(flow) if !flow.approved() => {
                 let (service, hash) = flow.subject();
                 let pending = self
                     .snapshot
@@ -670,7 +681,7 @@ impl App {
                     task.abort();
                 }
             }
-            Content::Unpair(_) => {}
+            Content::Review(_) | Content::Unpair(_) => {}
             Content::Notice { quit } => {
                 if quit {
                     self.quit();

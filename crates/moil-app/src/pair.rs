@@ -23,6 +23,8 @@ pub struct PairWindow {
     /// Increases with every pairing started here, so that the outcome of a
     /// pairing the owner abandoned is recognized and ignored.
     attempt: u64,
+    /// The page shown no longer matches `step`.
+    stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,7 +75,18 @@ impl PairWindow {
                 error: None,
             },
             attempt: 0,
+            stale: false,
         }
+    }
+
+    /// Whether the page shown is out of date and should be rendered again.
+    pub fn needs_render(&mut self) -> bool {
+        std::mem::take(&mut self.stale)
+    }
+
+    fn show(&mut self, step: Step) {
+        self.step = step;
+        self.stale = true;
     }
 
     /// A window for a `moil://pair` link: the address filled in, and the
@@ -88,11 +101,11 @@ impl PairWindow {
     /// unless a pairing is under way, which it doesn't interrupt.
     pub fn link(&mut self, url: &Url) {
         if !self.is_pairing() {
-            self.step = Step::Enter {
+            self.show(Step::Enter {
                 address: url.to_string(),
                 from_link: true,
                 error: None,
-            };
+            });
         }
     }
 
@@ -112,20 +125,20 @@ impl PairWindow {
                 match service_address(&url) {
                     Ok(parsed) => {
                         self.attempt += 1;
-                        self.step = Step::Starting {
+                        self.show(Step::Starting {
                             url: parsed.clone(),
-                        };
+                        });
                         Some(PairEffect::Start {
                             url: parsed,
                             attempt: self.attempt,
                         })
                     }
                     Err(error) => {
-                        self.step = Step::Enter {
+                        self.show(Step::Enter {
                             address: url,
                             from_link: *from_link,
                             error: Some(error),
-                        };
+                        });
                         None
                     }
                 }
@@ -134,11 +147,11 @@ impl PairWindow {
                 browser_url(&code.verification_uri_complete).map(PairEffect::OpenBrowser)
             }
             (PairMessage::Retry {}, Step::Failed { url, .. }) => {
-                self.step = Step::Enter {
+                self.show(Step::Enter {
                     address: url.to_string(),
                     from_link: false,
                     error: None,
-                };
+                });
                 None
             }
             _ => None,
@@ -162,19 +175,19 @@ impl PairWindow {
             Ok(code) => {
                 let open =
                     browser_url(&code.verification_uri_complete).map(PairEffect::OpenBrowser);
-                self.step = Step::Confirming {
+                self.show(Step::Confirming {
                     url: url.clone(),
                     code,
-                };
+                });
                 open
             }
             Err(error) => {
                 // Most failures here are about the address: let the owner fix it.
-                self.step = Step::Enter {
+                self.show(Step::Enter {
                     address: url.to_string(),
                     from_link: false,
                     error: Some(error),
-                };
+                });
                 None
             }
         }
@@ -188,13 +201,14 @@ impl PairWindow {
         if attempt != self.attempt {
             return;
         }
-        self.step = match result {
+        let step = match result {
             Ok(service_name) => Step::Paired { service_name },
             Err(error) => Step::Failed {
                 url: url.clone(),
                 error,
             },
         };
+        self.show(step);
     }
 
     /// The page for the current step. `now` says how long the code has left.
@@ -492,6 +506,33 @@ mod tests {
         window.started(attempt, Ok(code(now)));
         window.link(&"https://evil.example/moil".parse().unwrap());
         assert!(window.render(now).contains("WDJB-MJHT"));
+    }
+
+    #[test]
+    fn the_page_reloads_only_when_there_is_something_new_to_show() {
+        let now = Instant::now();
+        let mut window = PairWindow::new(None);
+        assert!(
+            !window.needs_render(),
+            "the app shows the first page itself"
+        );
+        for _ in 0..2 {
+            let bad = PairMessage::Start {
+                url: "ftp://klisi.example.com".into(),
+            };
+            window.on_message(bad);
+            // The form disabled its buttons when it was sent.
+            assert!(window.needs_render(), "every refusal brings a fresh form");
+        }
+        let attempt = start(&mut window, "https://klisi.example.com/moil");
+        assert!(window.needs_render());
+        window.started(attempt, Ok(code(now)));
+        assert!(window.needs_render());
+        window.on_message(PairMessage::OpenBrowser {});
+        assert!(
+            !window.needs_render(),
+            "reopening the browser keeps the page"
+        );
     }
 
     #[test]
