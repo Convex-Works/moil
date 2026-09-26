@@ -31,4 +31,10 @@ pub enum Error {
     Secrets(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A state file that can't be read back, e.g. after someone edited it.
+    #[error("{} is damaged ({reason}); repair or remove it", path.display())]
+    Damaged { path: PathBuf, reason: String },
+    /// A setting from the environment that moil can't use.
+    #[error("{0}")]
+    Config(String),
 }
