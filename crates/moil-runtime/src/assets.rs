@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use moil_bundle::{Asset, Manifest};
 use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel};
@@ -11,6 +12,9 @@ use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel};
 use crate::EventSink;
 use crate::http::{DownloadError, Http};
 use crate::locks::KeyedLocks;
+
+/// How the names of files still being downloaded start.
+const PARTIAL: &str = ".partial-";
 
 /// A directory of verified assets, each named by its SHA-256.
 ///
@@ -89,7 +93,7 @@ impl AssetCache {
         // publishes it is atomic. Deleted if anything goes wrong, including
         // the attempt being dropped mid-download.
         let partial = tempfile::Builder::new()
-            .prefix(".partial-")
+            .prefix(PARTIAL)
             .tempfile_in(&self.dir)
             .map_err(|e| {
                 failed(format!(
@@ -133,6 +137,30 @@ impl AssetCache {
             .persist(path)
             .map_err(|e| failed(format!("couldn't move it into the cache: {}", e.error)))?;
         Ok(())
+    }
+
+    /// Removes downloads that a crashed process left unfinished: partial
+    /// files nothing has written to for `idle`. Returns how many it removed.
+    pub fn remove_abandoned(&self, idle: Duration) -> io::Result<usize> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            other => other?,
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let abandoned = entry.file_name().to_string_lossy().starts_with(PARTIAL)
+                && entry
+                    .metadata()?
+                    .modified()?
+                    .elapsed()
+                    .is_ok_and(|age| age >= idle);
+            if abandoned {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Links every asset in `assets` into `dir` under its name, pointing at
@@ -197,6 +225,29 @@ mod tests {
             .collect();
         let text = serde_json::json!({"moil": 1, "name": "x", "version": "1", "assets": assets});
         Manifest::parse(&text.to_string()).unwrap()
+    }
+
+    #[test]
+    fn only_abandoned_downloads_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AssetCache::new(dir.path().to_owned());
+        let write = |name: &str, age: Duration| {
+            let file = std::fs::File::create(dir.path().join(name)).unwrap();
+            file.set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        };
+        let hour = Duration::from_secs(3600);
+        write(".partial-crashed", 2 * hour);
+        write(".partial-downloading", Duration::ZERO);
+        write(&"0".repeat(64), 2 * hour);
+
+        assert_eq!(cache.remove_abandoned(hour).unwrap(), 1);
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [".partial-downloading".to_owned(), "0".repeat(64)]);
     }
 
     #[test]

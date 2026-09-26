@@ -258,9 +258,13 @@ impl Runtime {
     /// anything.
     ///
     /// Attempts whose supervising process is still alive, including this
-    /// one's, are left alone, so calling it while attempts run is safe.
+    /// one's, are left alone, so calling it while attempts run is safe. It
+    /// also removes asset downloads that were abandoned mid-way, going by
+    /// files nothing has written to for an hour.
     pub fn reap_orphans(&self) -> std::io::Result<usize> {
-        orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs)
+        let reaped = orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs)?;
+        self.assets.remove_abandoned(Duration::from_secs(60 * 60))?;
+        Ok(reaped)
     }
 
     /// How this runtime runs uv.
