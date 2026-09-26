@@ -5,6 +5,8 @@
 //! prepares the bundle's uv environment, fetches and verifies assets,
 //! downloads inputs, runs `job.py`, turns its stdout into events, uploads
 //! outputs and decides the [`Outcome`].
+//!
+//! Unix only: scripts run in their own process group.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -15,8 +17,23 @@ use futures::future::BoxFuture;
 use moil_bundle::{Bundle, BundleStore};
 use moil_proto::control::Assign;
 use moil_proto::job::{Download, Upload};
-use moil_proto::{FileName, JobError, JobEvent, JobId, Outcome};
+use moil_proto::{ErrorCode, FileName, JobError, JobEvent, JobId, Outcome};
 use tokio::sync::{mpsc, watch};
+
+mod assets;
+mod attempt;
+mod http;
+mod orphans;
+mod outcome;
+mod process;
+mod stderr;
+mod stdout;
+mod sys;
+pub mod uv;
+mod workdir;
+
+pub use assets::asset_layout_conflict;
+pub use uv::Uv;
 
 /// Where a running attempt's events go. Unbounded, so a slow consumer never
 /// stalls the script.
@@ -142,8 +159,18 @@ pub struct RuntimeConfig {
     /// How long a stopped script gets between `SIGTERM` and `SIGKILL`.
     pub kill_grace: Duration,
     /// Extra environment variables for uv and the script, such as
-    /// `UV_CACHE_DIR` in tests.
+    /// `UV_CACHE_DIR` in tests. They apply after the runtime's own, except
+    /// that the script's `TMPDIR` and `PYTHONUNBUFFERED` are always the
+    /// runtime's.
     pub extra_env: Vec<(OsString, OsString)>,
+    /// Root certificates to trust for HTTPS on top of the platform's, as
+    /// PEM text; each entry may hold several. For networks with a CA of
+    /// their own that the platform doesn't know, and for tests.
+    pub extra_root_certificates: Vec<String>,
+    /// Copy what uv and the script write to stderr to this process's stderr
+    /// as it arrives, as `moil run` does for bundle authors. The runtime
+    /// keeps the tail for error reports either way.
+    pub echo_stderr: bool,
 }
 
 impl RuntimeConfig {
@@ -158,46 +185,137 @@ impl RuntimeConfig {
             keep_work_dirs: false,
             kill_grace: Duration::from_secs(10),
             extra_env: Vec::new(),
+            extra_root_certificates: Vec::new(),
+            echo_stderr: false,
         }
     }
 }
+
+/// A [`RuntimeConfig`] that can't work.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("couldn't set up HTTPS: {0}")]
+pub struct ConfigError(String);
 
 /// Runs attempts for real, with uv.
 #[derive(Debug)]
 pub struct Runtime {
     config: RuntimeConfig,
+    /// The client, or why it couldn't be built, reported by every attempt
+    /// that needs it.
+    http: Result<http::Http, ConfigError>,
+    assets: assets::AssetCache,
 }
 
 impl Runtime {
+    /// A runtime for `config`. If the config can't work (see
+    /// [`Runtime::try_new`]), attempts that move files fail as `internal`.
     pub fn new(config: RuntimeConfig) -> Self {
-        Self { config }
+        let http = http::Http::new(&config.extra_root_certificates, config.allow_insecure_http)
+            .map_err(ConfigError);
+        Self {
+            assets: assets::AssetCache::new(config.assets_dir.clone()),
+            http,
+            config,
+        }
+    }
+
+    /// A runtime for `config`, or why it can't work, such as an extra root
+    /// certificate that isn't valid PEM.
+    pub fn try_new(config: RuntimeConfig) -> Result<Self, ConfigError> {
+        let runtime = Self::new(config);
+        match &runtime.http {
+            Ok(_) => Ok(runtime),
+            Err(error) => Err(error.clone()),
+        }
     }
 
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
     }
 
+    /// Where attempt `attempt` of job `job_id` works, while it runs (and
+    /// after, with [`RuntimeConfig::keep_work_dirs`]).
+    pub fn work_dir(&self, job_id: &JobId, attempt: u32) -> PathBuf {
+        workdir::WorkDir::path(&self.config.jobs_dir, job_id, attempt)
+    }
+
     /// Kills processes left running by attempts of an earlier run of the
     /// app that crashed, and removes their working directories. Returns how
     /// many attempts it cleaned up. Call once at startup, before running
     /// anything.
+    ///
+    /// Attempts whose supervising process is still alive, including this
+    /// one's, are left alone, so calling it while attempts run is safe.
     pub fn reap_orphans(&self) -> std::io::Result<usize> {
-        todo!("moil-runtime: reap_orphans")
+        orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs)
+    }
+
+    /// How this runtime runs uv.
+    pub fn uv(&self) -> Uv {
+        Uv::new(&self.config.uv).with_env(self.config.extra_env.iter().cloned())
+    }
+
+    fn http(&self) -> Result<&http::Http, JobError> {
+        self.http
+            .as_ref()
+            .map_err(|error| JobError::new(ErrorCode::Internal, error.to_string()))
+    }
+
+    /// Stores `bundle`, creates its environment and fetches its assets.
+    /// Returns the stored bundle's directory.
+    async fn prepare_bundle(
+        &self,
+        bundle: &Bundle,
+        events: Option<&EventSink>,
+    ) -> Result<PathBuf, JobError> {
+        let dir = self.config.bundles.put(bundle).map_err(|e| {
+            JobError::new(
+                ErrorCode::Internal,
+                format!("couldn't store the bundle: {e}"),
+            )
+        })?;
+        let manifest = bundle.manifest();
+        if let Some((file, dir)) = asset_layout_conflict(manifest) {
+            return Err(JobError::new(
+                ErrorCode::Environment,
+                format!(
+                    "the bundle's assets {file:?} and {dir:?} can't both exist: {file:?} would have to be a file and a directory"
+                ),
+            ));
+        }
+        let fetch_assets = async {
+            if manifest.assets.is_empty() {
+                return Ok(());
+            }
+            let http = self.http()?;
+            for (name, asset) in &manifest.assets {
+                self.assets.fetch(http, name, asset, events).await?;
+            }
+            Ok(())
+        };
+        let (uv, script) = (self.uv(), dir.join(moil_bundle::SCRIPT));
+        let sync = uv::sync(&uv, &script, self.config.echo_stderr);
+        tokio::try_join!(sync, fetch_assets)?;
+        Ok(dir)
     }
 }
 
 impl Executor for Runtime {
-    fn prepare<'a>(&'a self, _bundle: &'a Bundle) -> BoxFuture<'a, Result<(), JobError>> {
-        todo!("moil-runtime: prepare")
+    fn prepare<'a>(&'a self, bundle: &'a Bundle) -> BoxFuture<'a, Result<(), JobError>> {
+        Box::pin(async move { self.prepare_bundle(bundle, None).await.map(drop) })
     }
 
-    fn run(&self, _job: Job, _events: EventSink, _stop: StopSignal) -> BoxFuture<'_, Outcome> {
-        todo!("moil-runtime: run")
+    fn run(&self, job: Job, events: EventSink, stop: StopSignal) -> BoxFuture<'_, Outcome> {
+        Box::pin(attempt::run(self, job, events, stop))
     }
 }
 
 /// Finds the uv binary: `$MOIL_UV`, then next to the current executable (as
 /// in the macOS app bundle), then on `PATH`.
 pub fn find_uv() -> Option<PathBuf> {
-    todo!("moil-runtime: find_uv")
+    uv::locate(
+        std::env::var_os("MOIL_UV"),
+        std::env::current_exe().ok(),
+        std::env::var_os("PATH"),
+    )
 }

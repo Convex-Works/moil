@@ -11,13 +11,26 @@ repository.workspace = true
 moil-proto.workspace = true
 moil-bundle.workspace = true
 futures.workspace = true
+hex.workspace = true
+libc = "0.2"
+# rustls with the platform's verifier, so roots the owner's OS trusts (such
+# as a corporate CA) work, plus any extra roots from the config.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "system-proxy"] }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+axum = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+time = "0.3"
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true
