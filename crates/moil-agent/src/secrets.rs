@@ -2,9 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::Error;
+use crate::{Error, Home};
+
+/// The secret store to use for `home`: `$MOIL_SECRETS` (`keychain` or
+/// `file`) if set, else the keychain on macOS and a file elsewhere.
+pub fn default_secrets(_home: &Home) -> Result<Arc<dyn SecretStore>, Error> {
+    todo!("moil-agent: default_secrets")
+}
 
 /// Stores secrets (machine tokens) by key.
 pub trait SecretStore: Send + Sync + std::fmt::Debug + 'static {
@@ -37,6 +43,27 @@ impl SecretStore for FileSecrets {
 
     fn delete(&self, _key: &str) -> Result<(), Error> {
         todo!("moil-agent: FileSecrets::delete")
+    }
+}
+
+/// Secrets in the macOS keychain, as generic passwords of the service
+/// `moil`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+pub struct KeychainSecrets;
+
+#[cfg(target_os = "macos")]
+impl SecretStore for KeychainSecrets {
+    fn get(&self, _key: &str) -> Result<Option<String>, Error> {
+        todo!("moil-agent: KeychainSecrets::get")
+    }
+
+    fn set(&self, _key: &str, _secret: &str) -> Result<(), Error> {
+        todo!("moil-agent: KeychainSecrets::set")
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), Error> {
+        todo!("moil-agent: KeychainSecrets::delete")
     }
 }
 

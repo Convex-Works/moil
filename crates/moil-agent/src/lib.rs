@@ -25,5 +25,7 @@ pub use home::{Home, Settings};
 pub use machine::{Machine, MachineConfig};
 pub use pairing::PairingSession;
 pub use review::Review;
-pub use secrets::{FileSecrets, MemorySecrets, SecretStore};
+#[cfg(target_os = "macos")]
+pub use secrets::KeychainSecrets;
+pub use secrets::{FileSecrets, MemorySecrets, SecretStore, default_secrets};
 pub use services::{Approval, PairedService, ServiceId};
