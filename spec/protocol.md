@@ -154,8 +154,10 @@ POST /v1/pair/token
 
 The app polls every `interval` seconds and adds 5 seconds to the interval
 on `slow_down`. `access_denied` means the user rejected the pairing;
-`expired_token` means the code expired or was already used. A device code
-yields a token exactly once.
+`expired_token` means the code expired, was already used, or was never
+issued. A device code yields a token exactly once. Services SHOULD tolerate
+some jitter before answering `slow_down` (the Go SDK accepts polls three
+quarters of an interval apart).
 
 The service MUST store only a hash of the token. Removing a machine on the
 service revokes its token and closes its control channel with code `4401`.
@@ -280,7 +282,9 @@ Authorization: Bearer <token>
 
 Every message is a JSON object in a single text frame, with a `type`
 field. A peer that receives a message it can't parse, or a known message
-with invalid fields, MAY close the channel with code `4400`.
+with invalid fields, MAY close the channel with code `4400`. The machine
+sends `hello` as soon as the channel opens; a service MAY close a channel
+that hasn't sent one within its ping interval.
 
 ### 6.1 Liveness
 
@@ -455,8 +459,10 @@ app may display. The machine answers with `bid` or `decline` before
 | `4400` | Protocol error | Reconnect with backoff |
 | `4401` | Machine removed or token revoked | Stop reconnecting; mark the service as unpaired |
 | `4409` | Another connection with the same token replaced this one | Stop reconnecting; show the conflict |
+| `1001` | The service is shutting down | Reconnect with backoff |
 
-An upgrade request answered with `401` means the same as `4401`.
+An upgrade request answered with `401` means the same as `4401`. Any other
+close, or a connection lost without one, means reconnect with backoff.
 
 ## 7. Job lifecycle
 
@@ -469,7 +475,9 @@ example the job owner's machine, or one with a GPU) and assigns the
 attempt to it. The machine that bid first doesn't automatically win.
 
 Offering doesn't reserve a machine. A service SHOULD NOT offer a machine a
-second job while an offer to it is open.
+second job while an offer to it is open, and SHOULD NOT offer a job again
+to a machine that declined it until that machine reports a change
+(`state` or `approved`).
 
 A machine bids only if it is idle, has approved the bundle for this
 service, and holds a verified copy of it. Otherwise it declines, giving the
@@ -496,7 +504,8 @@ another message for the attempt, for as long as the attempt runs.
 
 A lease keeps running while the machine is disconnected. If it runs out,
 the service fails the attempt with code `lease_expired`, which is
-retryable.
+retryable. If the machine is still connected, the service SHOULD also send
+it `cancel`, so a hung attempt doesn't keep the machine busy.
 
 ### 7.4 Inputs, outputs and assets
 
@@ -513,7 +522,9 @@ increasing by 1. The service processes each `seq` at most once, ignoring
 any `seq` it has already seen.
 
 The machine keeps every `event` and `done` of an attempt until the service
-acknowledges its `done` with `ack`. After reconnecting it lists those
+acknowledges its `done` with `ack`. The service acks every `done` it
+receives, including one for an attempt that is no longer current, so the
+machine can always let go of it. After reconnecting it lists those
 attempts in `hello.attempts`. In `welcome.resume` the service lists, for
 each attempt it still considers assigned to this machine, the last `seq` it
 processed (0 if none). The machine then:
@@ -524,7 +535,8 @@ processed (0 if none). The machine then:
 
 If `hello.attempts` omits an attempt the service considers assigned to
 that machine (for example after the app restarted), the service fails the
-attempt with code `lost`, which is retryable.
+attempt with code `lost`, which is retryable. Removing a machine fails its
+attempt the same way.
 
 A machine MAY bound what it keeps. If it had to drop events, it replays
 what it has and `seq` has a gap. It MUST keep `done`.
@@ -532,7 +544,8 @@ what it has and `seq` has a gap. It MUST keep `done`.
 ### 7.6 Cancellation and interruption
 
 `cancel` makes the machine stop the attempt (§8.6) and send `done` with
-outcome `cancelled`. If the owner stops a job on the machine, or quits the
+outcome `cancelled`. A machine MUST NOT report `cancelled` for an attempt
+the service didn't cancel. If the owner stops a job on the machine, or quits the
 app while one runs, the machine sends `done` with outcome `failed` and code
 `interrupted`, which is retryable, so the service can hand the job to
 another machine.
