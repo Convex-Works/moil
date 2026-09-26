@@ -16,6 +16,24 @@ moil-proto.workspace = true
 moil-bundle.workspace = true
 moil-runtime.workspace = true
 moil-agent.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+auto-launch = "0.6"
+getrandom = "0.4"
+maud = "0.27"
+open = "5"
+tao = "0.37"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tray-icon = "0.25"
+wry = "0.57"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

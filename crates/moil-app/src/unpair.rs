@@ -1,0 +1,173 @@
+//! The window that asks the owner to confirm unpairing a service, which
+//! can't be undone: pairing again means reviewing its bundles again.
+
+use maud::html;
+use moil_agent::{ServiceId, ServiceStatus};
+use url::Url;
+
+use crate::format;
+use crate::ipc::ConfirmMessage;
+use crate::page::{self, link, visible};
+
+#[derive(Debug)]
+pub struct UnpairWindow {
+    service: ServiceId,
+    name: String,
+    base_url: Url,
+    approvals: usize,
+    busy: bool,
+    error: Option<String>,
+}
+
+/// What the app should do next for an unpair window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnpairEffect {
+    Unpair(ServiceId),
+    Close,
+}
+
+impl UnpairWindow {
+    pub fn new(service: &ServiceStatus) -> Self {
+        Self {
+            service: service.id.clone(),
+            name: service.name.clone(),
+            base_url: service.base_url.clone(),
+            approvals: service.bundles.iter().filter(|b| b.approved).count(),
+            busy: false,
+            error: None,
+        }
+    }
+
+    pub fn service(&self) -> &ServiceId {
+        &self.service
+    }
+
+    pub fn title(&self) -> String {
+        format!("Unpair {}", self.name)
+    }
+
+    pub fn on_message(&mut self, message: ConfirmMessage) -> Option<UnpairEffect> {
+        match message {
+            ConfirmMessage::Close {} => Some(UnpairEffect::Close),
+            ConfirmMessage::Confirm {} if self.busy => None,
+            ConfirmMessage::Confirm {} => {
+                self.busy = true;
+                self.error = None;
+                Some(UnpairEffect::Unpair(self.service.clone()))
+            }
+        }
+    }
+
+    /// The agent finished unpairing: the window closes, or says why not.
+    pub fn finished(&mut self, result: Result<(), String>) -> Option<UnpairEffect> {
+        if !std::mem::replace(&mut self.busy, false) {
+            return None;
+        }
+        match result {
+            Ok(()) => Some(UnpairEffect::Close),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let name = visible(&self.name);
+        let body = html! {
+            main.dialog {
+                h1 { "Unpair " (name) "?" }
+                p {
+                    (name) " at " (link(self.base_url.as_str(), visible(self.base_url.as_str())))
+                    " will no longer be able to send jobs to this Mac. moil tells " (name)
+                    ", then forgets its token"
+                    @match self.approvals {
+                        0 => {},
+                        1 => " and the bundle you approved for it",
+                        n => { " and the " (format::count(n, "bundle")) " you approved for it" },
+                    }
+                    "."
+                }
+                p.hint { "To use " (name) " again, pair again and review its bundles again." }
+                @if let Some(error) = &self.error {
+                    div.callout.bad { (page::icon::error()) div { p.message { (visible(error)) } } }
+                }
+            }
+            footer.actions {
+                span.spacer {}
+                button data-action="close" disabled[self.busy] { "Cancel" }
+                button.danger data-action="confirm" data-busy="Unpairing…" disabled[self.busy] {
+                    @if self.busy { "Unpairing…" } @else { "Unpair" }
+                }
+            }
+        };
+        page::document(&self.title(), "dialog", body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moil_agent::{BundleStatus, Connection};
+    use moil_proto::BundleInfo;
+
+    use super::*;
+    use crate::demo;
+    use crate::page::tests::assert_locked_down;
+
+    fn klisi() -> ServiceStatus {
+        let bundle = |hash: &str, approved| BundleStatus {
+            info: BundleInfo {
+                hash: hash.parse().unwrap(),
+                name: "transcribe".into(),
+                version: "0.2.0".into(),
+                description: None,
+            },
+            approved,
+        };
+        ServiceStatus {
+            id: demo::service_id("klisi.example.com"),
+            name: "klisi".into(),
+            base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            connection: Connection::Connected,
+            bundles: vec![
+                bundle(&"a".repeat(64), true),
+                bundle(&"b".repeat(64), true),
+                bundle(&"c".repeat(64), false),
+            ],
+            insecure: false,
+        }
+    }
+
+    #[test]
+    fn says_what_unpairing_forgets() {
+        let page = UnpairWindow::new(&klisi()).render();
+        assert_locked_down(&page);
+        assert!(page.contains("Unpair klisi?"));
+        assert!(page.contains(r#"<a href="https://klisi.example.com/moil">"#));
+        assert!(page.contains("forgets its token and the 2 bundles you approved for it."));
+    }
+
+    #[test]
+    fn confirming_unpairs_once() {
+        let mut window = UnpairWindow::new(&klisi());
+        assert_eq!(
+            window.on_message(ConfirmMessage::Confirm {}),
+            Some(UnpairEffect::Unpair(demo::service_id("klisi.example.com")))
+        );
+        assert_eq!(window.on_message(ConfirmMessage::Confirm {}), None);
+        assert!(window.render().contains("Unpairing…"));
+        assert_eq!(window.finished(Ok(())), Some(UnpairEffect::Close));
+    }
+
+    #[test]
+    fn a_failure_is_shown_and_can_be_retried() {
+        let mut window = UnpairWindow::new(&klisi());
+        window.on_message(ConfirmMessage::Confirm {});
+        assert_eq!(
+            window.finished(Err("couldn't delete the token".into())),
+            None
+        );
+        assert!(window.render().contains("couldn't delete the token"));
+        assert!(window.on_message(ConfirmMessage::Confirm {}).is_some());
+    }
+}
