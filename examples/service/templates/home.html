@@ -1,0 +1,95 @@
+{{define "content"}}
+{{with .Notice}}<p class="notice">{{.}}</p>{{end}}
+
+<section>
+  <h2>Pair a machine</h2>
+  <p>In the moil app, add this service by its URL:</p>
+  <pre>{{.MoilURL}}</pre>
+  <p class="muted">The app shows a code and opens a page here to confirm it.</p>
+</section>
+
+<section>
+  <h2>Machines</h2>
+  {{if .Machines}}
+  <table>
+    <tr><th>Machine</th><th>State</th><th>Approved bundles</th><th></th></tr>
+    {{range $m := .Machines}}
+    <tr>
+      <td>
+        <b>{{$m.Name}}</b><br>
+        <span class="muted">{{$m.OS}}/{{$m.Arch}}{{if $m.CPUs}}, {{$m.CPUs}} CPUs{{end}}{{range $m.GPUs}}, {{.Name}}{{end}}</span><br>
+        <code class="muted">{{$m.ID}}</code>
+      </td>
+      <td>
+        <span class="pill {{$m.State}}">{{$m.State}}</span>
+        {{if not $m.Online}}<br><span class="muted">{{if $m.LastSeen.IsZero}}never connected{{else}}seen {{ago $m.LastSeen}}{{end}}</span>{{end}}
+      </td>
+      <td>
+        {{range $b := $.Bundles}}
+          <div>{{if $m.HasApproved $b.Hash}}✓{{else}}<span class="muted">✗</span>{{end}} {{$b.Name}} {{$b.Version}}</div>
+        {{else}}<span class="muted">no bundles published</span>{{end}}
+      </td>
+      <td>
+        <form method="post" action="/machines/{{$m.ID}}/remove"><button class="link">remove</button></form>
+      </td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+  <p class="muted">No machines yet.</p>
+  {{end}}
+</section>
+
+<section>
+  <h2>Bundles</h2>
+  {{if .Bundles}}
+  <table>
+    <tr><th>Bundle</th><th>Hash</th></tr>
+    {{range .Bundles}}
+    <tr>
+      <td><b>{{.Name}}</b> {{.Version}}<br><span class="muted">{{.Description}}</span></td>
+      <td><code title="{{.Hash}}">{{short .Hash}}…</code></td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+  <p class="muted">None. Start the service with <code>-bundles DIR</code>.</p>
+  {{end}}
+</section>
+
+{{if .Bundles}}
+<section>
+  <h2>Run a job</h2>
+  <form class="stack" method="post" action="/jobs">
+    <label>Bundle
+      <select name="bundle">{{range .Bundles}}<option value="{{.Hash}}">{{.Name}} {{.Version}}</option>{{end}}</select>
+    </label>
+    <label>Title <input name="title" placeholder="What machine owners see"></label>
+    <label><span>Text, handed to the script as the input file <code>input.txt</code></span>
+      <textarea name="text">Hello from the moil demo.</textarea>
+    </label>
+    <label>Params, as JSON <textarea name="params" rows="2">{}</textarea></label>
+    <label>Output files the script may produce, comma-separated
+      <input name="outputs" value="output.txt">
+    </label>
+    <div><button class="primary">Submit</button></div>
+  </form>
+</section>
+{{end}}
+
+{{if .Jobs}}
+<section>
+  <h2>Jobs</h2>
+  <table>
+    {{range .Jobs}}
+    <tr>
+      <td><a href="/jobs/{{.Run.ID}}">{{or .Title .Run.ID}}</a></td>
+      <td>{{.Bundle.Name}}</td>
+      <td><span class="pill {{.Run.State}}">{{.Run.State}}</span></td>
+      <td class="muted">{{ago .Created}}</td>
+    </tr>
+    {{end}}
+  </table>
+</section>
+{{end}}
+{{end}}
