@@ -78,9 +78,12 @@ def run(step, job):
         data({"pid": child.pid, "script": os.getpid(), "uv": os.getppid()})
     elif "on_sigterm" in step:
         message, linger = step["on_sigterm"], step.get("linger", 0)
+        line = (json.dumps({"type": "log", "message": message}) + "\n").encode()
 
         def handle(signum, frame):
-            emit({"type": "log", "message": message})
+            # Not print(): the signal may arrive while the main code is
+            # inside print(), and Python's stdout isn't reentrant.
+            os.write(sys.stdout.fileno(), line)
             time.sleep(linger)
             sys.exit(0)
 
