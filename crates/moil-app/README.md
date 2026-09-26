@@ -71,7 +71,8 @@ Pages show text a service controls, so every page is escaped by maud, runs
 under a Content Security Policy that loads nothing and runs only its own
 nonce'd script and style, can't navigate away (web links open in the
 browser), and can only send the few messages its window understands.
-Characters that are invisible or reorder text are shown as `U+…` markers.
+Characters that are invisible or reorder text are shown as markers, the way
+`moil review` shows them (`␍`, `\u{202e}`).
 Approving sends the full bundle hash, and the review window refuses it unless
 it names the bundle shown.
 
