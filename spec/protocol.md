@@ -38,6 +38,10 @@ The key words MUST, SHOULD and MAY are used as in RFC 2119.
   `_ms`; sizes are integer bytes in fields ending in `_bytes`.
 - Optional fields are omitted when absent, never sent as `null`. Fields
   that carry arbitrary JSON (`params`, `payload`, `meta`) MAY be `null`.
+- Those fields carry JSON values, not bytes: every hop may re-encode them,
+  changing key order, whitespace and how numbers are written. Keep them
+  within I-JSON (RFC 7493): numbers must fit an IEEE 754 double, so send
+  larger integers, such as 64-bit IDs, as strings.
 - Receivers MUST ignore unknown fields in HTTP bodies and control
   messages, so that minor additions don't break older peers. Manifests
   (§5.3) are the exception: they are strict.
@@ -638,7 +642,7 @@ The script writes events to stdout as JSON objects, one per line:
 |---|---|---|
 | `progress` | `fraction` (0 to 1, optional), `message` (optional); at least one | yes |
 | `log` | `level` (`debug`, `info`, `warn`, `error`; default `info`), `message` | yes |
-| `data` | `payload` (any JSON) | yes, untouched |
+| `data` | `payload` (any JSON) | yes, as the same JSON value (§2) |
 | `result` | `files` (output names, default `[]`), `meta` (any JSON, optional) | folded into `done` |
 | `error` | `message`, `retryable` (default `false`) | folded into `done` |
 
