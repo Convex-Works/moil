@@ -9,11 +9,14 @@
 //!   anywhere and runs only the page's own script and style, which carry a
 //!   fresh nonce per render;
 //! - characters that are invisible or reorder text are shown as visible
-//!   markers, so what the owner reads is what runs.
+//!   markers, so what the owner reads is what runs. The markers read as
+//!   `moil review` writes them ([`moil_agent::review::reveal`]).
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use maud::{DOCTYPE, Escaper, Markup, PreEscaped, Render, html};
+use moil_agent::review::reveal;
 
 use crate::links::browser_url;
 
@@ -64,16 +67,22 @@ fn nonce() -> String {
 }
 
 /// Untrusted text, escaped, with every character that is invisible or
-/// changes the order text is displayed in replaced by a visible marker
-/// naming its code point.
+/// changes the order text is displayed in replaced by a visible marker:
+/// what [`reveal`] shows for it (`␍`, `\u{202e}`), set apart from the
+/// text around it, with the character's name on hover.
 pub fn visible(text: &str) -> Markup {
     let mut out = String::with_capacity(text.len());
     let mut run = 0;
     for (i, c) in text.char_indices() {
         if let Some(name) = hidden_char(c) {
             let _ = Escaper::new(&mut out).write_str(&text[run..i]);
-            let code = format!("U+{:04X}", c as u32);
-            html! { span.hc title={ (code) " " (name) } { (code) } }.render_to(&mut out);
+            let shown = match reveal(&text[i..i + c.len_utf8()]) {
+                Cow::Owned(shown) => shown,
+                // One the agent doesn't reveal, in the same notation.
+                Cow::Borrowed(_) => format!("\\u{{{:04x}}}", c as u32),
+            };
+            let title = format!("U+{:04X} {name}", c as u32);
+            html! { span.hc title=(title) { (shown) } }.render_to(&mut out);
             run = i + c.len_utf8();
         }
     }
@@ -97,7 +106,8 @@ pub fn is_hidden(c: char) -> bool {
 /// The name of a character that shouldn't pass unseen in code: controls,
 /// bidirectional formatting (the "Trojan Source" attack), zero-width and
 /// filler characters, and tag and variation selectors that can smuggle
-/// text. Tabs and line feeds are ordinary.
+/// text. Tabs and line feeds are ordinary. It covers every character
+/// [`reveal`] does, and more.
 fn hidden_char(c: char) -> Option<&'static str> {
     Some(match c {
         '\t' | '\n' => return None,
@@ -123,6 +133,7 @@ fn hidden_char(c: char) -> Option<&'static str> {
         '\u{202e}' => "RIGHT-TO-LEFT OVERRIDE",
         '\u{2060}' => "WORD JOINER",
         '\u{2061}'..='\u{2064}' => "INVISIBLE OPERATOR",
+        '\u{2065}' => "UNASSIGNED FORMATTING CHARACTER",
         '\u{2066}' => "LEFT-TO-RIGHT ISOLATE",
         '\u{2067}' => "RIGHT-TO-LEFT ISOLATE",
         '\u{2068}' => "FIRST STRONG ISOLATE",
@@ -278,7 +289,7 @@ pub(crate) mod tests {
         // "Trojan Source": the RLO makes the comment appear to end the line.
         let line = "access = \"user\u{202e} \u{2066}# admin only\u{2069} \u{2066}\"";
         let html = visible(line).into_string();
-        for code in ["U+202E", "U+2066", "U+2069"] {
+        for code in [r"\u{202e}", r"\u{2066}", r"\u{2069}"] {
             assert!(
                 html.contains(&format!(">{code}</span>")),
                 "{code} in {html}"
@@ -295,10 +306,26 @@ pub(crate) mod tests {
 
         assert_eq!(
             visible("a\u{200b}b\u{e0041}\u{7}").into_string(),
-            "a<span class=\"hc\" title=\"U+200B ZERO WIDTH SPACE\">U+200B</span>b\
-             <span class=\"hc\" title=\"U+E0041 TAG CHARACTER\">U+E0041</span>\
-             <span class=\"hc\" title=\"U+0007 CONTROL CHARACTER\">U+0007</span>"
+            "a<span class=\"hc\" title=\"U+200B ZERO WIDTH SPACE\">\\u{200b}</span>b\
+             <span class=\"hc\" title=\"U+E0041 TAG CHARACTER\">\\u{e0041}</span>\
+             <span class=\"hc\" title=\"U+0007 CONTROL CHARACTER\">␇</span>"
         );
+    }
+
+    #[test]
+    fn every_character_the_agent_reveals_is_marked_as_it_reveals_it() {
+        let mut buf = [0; 4];
+        let mut revealed = 0;
+        for c in char::MIN..=char::MAX {
+            let text = c.encode_utf8(&mut buf);
+            if let Cow::Owned(shown) = reveal(text) {
+                revealed += 1;
+                assert!(is_hidden(c), "U+{:04X} isn't marked", c as u32);
+                let marked = visible(text).into_string();
+                assert!(marked.contains(&format!(">{shown}</span>")), "{marked}");
+            }
+        }
+        assert!(revealed > 60);
     }
 
     #[test]

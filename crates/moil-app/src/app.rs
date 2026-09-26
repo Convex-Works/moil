@@ -33,8 +33,9 @@ use crate::unpair::{UnpairEffect, UnpairWindow};
 use crate::view::{Action, TrayView, ViewContext};
 
 /// How long quitting waits for the agent to report the running job and
-/// disconnect. The runtime gives a stopped script up to 10 seconds.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+/// disconnect: the runtime gives a stopped script up to 10 seconds, and the
+/// agent waits up to 5 more for services to acknowledge.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Everything that wakes the event loop, besides the platform's own events.
 #[derive(Debug)]
@@ -347,9 +348,7 @@ impl App {
         }
         let name = self
             .snapshot
-            .services
-            .iter()
-            .find(|s| s.id == service)
+            .service(&service)
             .map_or_else(|| service.to_string(), |s| s.name.clone());
         let flow = ReviewWindow::new(service.clone(), name, hash);
         let html = flow.render(SystemTime::now());
@@ -371,7 +370,7 @@ impl App {
         if self.focus(|c| matches!(c, Content::Unpair(u) if u.service() == service)) {
             return;
         }
-        let Some(status) = self.snapshot.services.iter().find(|s| s.id == *service) else {
+        let Some(status) = self.snapshot.service(service) else {
             return;
         };
         let flow = UnpairWindow::new(status);

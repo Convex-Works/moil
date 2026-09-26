@@ -100,8 +100,7 @@ fn main() -> ExitCode {
             let demo: Arc<dyn Backend> = Arc::new(demo::Demo::start());
             (Ok(demo), Box::new(DemoLoginItem::default()))
         } else {
-            let backend = backend::start_agent().map_err(|e| e.to_string());
-            (backend, Box::new(SystemLoginItem::new()))
+            (backend::start_agent(), Box::new(SystemLoginItem::new()))
         }
     };
     app::run(runtime, backend, login, options.links)

@@ -242,9 +242,7 @@ fn status(snapshot: &Snapshot) -> Label {
         Some(job) => {
             let what = job.title.as_deref().unwrap_or(&job.bundle_name);
             let service = snapshot
-                .services
-                .iter()
-                .find(|s| s.id == job.service)
+                .service(&job.service)
                 .map_or(job.service.as_str(), |s| &s.name);
             let label = Label::new(format!(
                 "Running “{}” for {}",

