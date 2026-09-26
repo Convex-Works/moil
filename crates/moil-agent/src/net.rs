@@ -21,7 +21,6 @@ pub(crate) struct Net {
     pub http: reqwest::Client,
     /// Verifies servers with the operating system's trust store, so
     /// certificates the owner trusts (e.g. a company CA) work.
-    #[allow(dead_code, reason = "the control channels will use it")]
     pub tls: Arc<rustls::ClientConfig>,
 }
 

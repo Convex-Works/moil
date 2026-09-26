@@ -77,7 +77,6 @@ impl PairingSession {
     }
 
     /// Runs `hook` once the pairing completes.
-    #[allow(dead_code, reason = "the agent will use it")]
     pub(crate) fn on_paired(mut self, hook: OnPaired) -> Self {
         self.on_paired = Some(hook);
         self

@@ -20,7 +20,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
-use moil_agent::{AgentHandle, FileSecrets, Home, Machine, MachineConfig, PairedService, Snapshot};
+use moil_agent::{
+    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, PairedService, Snapshot,
+};
 use moil_bundle::Bundle;
 use moil_proto::control::{BundleInfo, Hello, Resume, Welcome};
 use moil_proto::http::{
@@ -42,6 +44,17 @@ pub async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
     tokio::time::timeout(PATIENCE, future)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// Timings that keep tests fast: reconnects in milliseconds.
+pub fn fast() -> AgentOptions {
+    AgentOptions {
+        reconnect_min: Duration::from_millis(10),
+        reconnect_max: Duration::from_millis(40),
+        receive_timeout: Duration::from_secs(5),
+        shutdown_grace: Duration::from_secs(5),
+        ..AgentOptions::default()
+    }
 }
 
 /// Opens the machine whose home is `dir`, keeping tokens in a file there.

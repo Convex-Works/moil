@@ -22,7 +22,9 @@ pub mod review;
 pub mod secrets;
 pub mod services;
 
-pub use agent::{Agent, AgentHandle, BundleStatus, Connection, JobStatus, ServiceStatus, Snapshot};
+pub use agent::{
+    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobStatus, ServiceStatus, Snapshot,
+};
 pub use error::Error;
 pub use home::{Home, Settings};
 pub use machine::{Machine, MachineConfig};
