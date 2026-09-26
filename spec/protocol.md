@@ -315,7 +315,9 @@ After a lost channel the machine reconnects with exponential backoff
 ```
 
 - `state` is `idle` (can take a job), `busy` (running a job, for this
-  service or another) or `paused` (the owner paused the machine).
+  service or another) or `paused` (the owner paused the machine). A
+  machine paused while running a job reports `busy` until the job ends,
+  then `paused`.
 - `approved` lists every bundle hash the owner approved for this service.
 - `attempts` lists attempts for this service that the machine still holds:
   running, or finished with an unacknowledged `done` (§7.5).
@@ -470,14 +472,16 @@ Offering doesn't reserve a machine. A service SHOULD NOT offer a machine a
 second job while an offer to it is open.
 
 A machine bids only if it is idle, has approved the bundle for this
-service, and holds a verified copy of it. Otherwise it declines.
+service, and holds a verified copy of it. Otherwise it declines, giving the
+first reason that applies: `busy`, `paused`, `not_approved`.
 
 ### 7.2 Assignment
 
 On `assign` the machine re-checks that it is idle and that the bundle is
 approved, then starts the attempt and reports `state: busy` to every
 service it is connected to. If the checks fail it immediately sends a
-`done` with outcome `failed` and code `busy` or `not_approved`. Those two
+`done` with outcome `failed` and code `busy` (also when the machine is
+paused) or `not_approved`. Those two
 codes mean the attempt never started, so services SHOULD NOT count it
 toward their retry limit.
 
