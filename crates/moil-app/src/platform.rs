@@ -48,6 +48,31 @@ pub fn edit_shortcuts() -> Option<Menu> {
     None
 }
 
+/// Makes the digits in the tray's title all as wide as a figure space, so
+/// that [`format::fixed_percent`](crate::format::fixed_percent) keeps its
+/// width as the number changes. The menu bar's font has proportional
+/// digits, where a 1 is narrower than an 8.
+pub fn use_tabular_digits(icon: &tray_icon::TrayIcon) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSFont, NSFontWeightRegular};
+        let (Some(mtm), Some(item)) = (MainThreadMarker::new(), icon.ns_status_item()) else {
+            return;
+        };
+        let Some(button) = item.button(mtm) else {
+            return;
+        };
+        let size = NSFont::menuBarFontOfSize(0.0).pointSize();
+        // SAFETY: reads a constant AppKit defines.
+        let regular = unsafe { NSFontWeightRegular };
+        let font = NSFont::monospacedDigitSystemFontOfSize_weight(size, regular);
+        button.setFont(Some(&font));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = icon;
+}
+
 /// Opens a web page in the owner's browser. Only `http` and `https` URLs
 /// get here (see [`crate::links::browser_url`]).
 pub fn open_in_browser(url: &Url) {

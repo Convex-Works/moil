@@ -2378,6 +2378,8 @@ dependencies = [
  "moil-bundle",
  "moil-proto",
  "moil-runtime",
+ "objc2",
+ "objc2-app-kit",
  "open",
  "serde",
  "serde_json",

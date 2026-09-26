@@ -8,6 +8,7 @@ use tray_icon::menu::{
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::icon::{self, TRAY_SIZE};
+use crate::platform;
 use crate::view::{Action, Entry, IconState, Label, MenuModel, TrayView};
 
 /// The tray icon, showing the latest [`TrayView`].
@@ -37,6 +38,7 @@ impl Tray {
             .with_menu(Box::new(menu.menu.clone()))
             .build()
             .map_err(|e| format!("couldn't create the tray icon: {e}"))?;
+        platform::use_tabular_digits(&icon);
         icon.set_title(view.title.as_deref());
         Ok(Self {
             icon,
@@ -124,8 +126,12 @@ impl RealMenu {
                     append(&item);
                     self.items.push(RealItem::Text(item));
                 }
-                Entry::Item { label, action } => {
-                    let item = MenuItem::new("", true, None);
+                Entry::Item {
+                    label,
+                    action,
+                    enabled,
+                } => {
+                    let item = MenuItem::new("", *enabled, None);
                     set_label(&item, label);
                     append(&item);
                     self.actions.insert(item.id().clone(), action.clone());
@@ -167,8 +173,11 @@ impl RealMenu {
                 continue;
             }
             match (item, new) {
-                (RealItem::Text(item), Entry::Text(label))
-                | (RealItem::Item(item), Entry::Item { label, .. }) => set_label(item, label),
+                (RealItem::Text(item), Entry::Text(label)) => set_label(item, label),
+                (RealItem::Item(item), Entry::Item { label, enabled, .. }) => {
+                    set_label(item, label);
+                    item.set_enabled(*enabled);
+                }
                 (
                     RealItem::Check(item),
                     Entry::Check {

@@ -228,6 +228,7 @@ impl App {
             &self.snapshot,
             &ViewContext {
                 now: Instant::now(),
+                clock: SystemTime::now(),
                 open_at_login: self.login.enabled(),
                 quitting: self.quitting,
                 deferred: &self.deferred,
