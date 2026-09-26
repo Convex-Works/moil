@@ -263,7 +263,9 @@ fn chain(error: &reqwest::Error) -> String {
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
         let text = cause.to_string();
-        if !text.is_empty() && !message.contains(&text) {
+        // hyper's "client error (Connect)" only wraps the real cause.
+        let generic = text.starts_with("client error (");
+        if !text.is_empty() && !generic && !message.contains(&text) {
             if !message.is_empty() {
                 message.push_str(": ");
             }

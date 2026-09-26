@@ -6,6 +6,17 @@
 //! downloads inputs, runs `job.py`, turns its stdout into events, uploads
 //! outputs and decides the [`Outcome`].
 //!
+//! Where the spec leaves room, the runtime decides:
+//!
+//! - A job's time limit covers the whole attempt, preparation and transfers
+//!   included, since that is what bounds how long the service waits.
+//! - A `data` event whose payload is over 256 KiB is dropped with a
+//!   warning; a `result` whose meta is, is refused, so the attempt fails as
+//!   `no_result` rather than succeed without the meta the service expects.
+//! - Nothing the script starts outlives the attempt: when the script ends,
+//!   whatever is left in its process group is killed.
+//! - A redirect is followed only to a URL the policy of spec §3 allows.
+//!
 //! Unix only: scripts run in their own process group.
 
 use std::collections::BTreeMap;
@@ -293,11 +304,11 @@ impl Runtime {
             )
         })?;
         let manifest = bundle.manifest();
-        if let Some((file, dir)) = asset_layout_conflict(manifest) {
+        if let Some((file, nested)) = asset_layout_conflict(manifest) {
             return Err(JobError::new(
                 ErrorCode::Environment,
                 format!(
-                    "the bundle's assets {file:?} and {dir:?} can't both exist: {file:?} would have to be a file and a directory"
+                    "the bundle's assets {file:?} and {nested:?} can't both exist: {file:?} would have to be a file and a directory"
                 ),
             ));
         }
