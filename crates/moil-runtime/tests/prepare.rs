@@ -234,6 +234,54 @@ mod assets {
     }
 
     #[tokio::test]
+    async fn assets_follow_redirects_to_other_https_hosts_but_never_to_plain_http() {
+        // Like Hugging Face, whose `resolve` URLs answer 302 to a CDN on
+        // another host, with a certificate from another CA.
+        let cdn = Server::start().await;
+        let h = Harness::with(|c| c.extra_root_certificates.push(cdn.ca_pem.clone())).await;
+        let on_cdn = |path: &str| cdn.https_url(path).replace("127.0.0.1", "localhost");
+        // Several MiB, so it arrives in many chunks, each hashed as it's
+        // written to disk.
+        let weights: Vec<u8> = (0..4u32 << 20)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        cdn.serve("/cdn/model.safetensors", weights.clone());
+        h.server.reply(
+            "/org/model/resolve/main/model.safetensors",
+            Reply::Redirect(on_cdn("/cdn/model.safetensors")),
+        );
+        let bundle = asset_manifest(json!({
+            "url": h.server.https_url("/org/model/resolve/main/model.safetensors"),
+            "sha256": sha256(&weights),
+            "size_bytes": weights.len(),
+        }));
+        h.runtime.prepare(&bundle).await.unwrap();
+        let cached = h.runtime.config().assets_dir.join(sha256(&weights));
+        assert!(std::fs::read(cached).unwrap() == weights);
+
+        // A redirect from https to http on a host that isn't this machine
+        // is refused, like such a URL would be in the first place.
+        cdn.serve("/cdn/other.bin", "other");
+        let port = cdn.url("").rsplit(':').next().unwrap().to_owned();
+        h.server.reply(
+            "/org/model/resolve/main/other.bin",
+            Reply::Redirect(format!("http://0.0.0.0:{port}/cdn/other.bin")),
+        );
+        let bundle = asset_manifest(json!({
+            "url": h.server.https_url("/org/model/resolve/main/other.bin"),
+            "sha256": sha256(b"other"),
+        }));
+        let error = h.runtime.prepare(&bundle).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::AssetDownload);
+        assert!(
+            error.message.contains("redirected to a URL that uses http"),
+            "{}",
+            error.message
+        );
+        assert!(cdn.received("/cdn/other.bin").is_empty());
+    }
+
+    #[tokio::test]
     async fn assets_that_cant_all_be_laid_out_are_refused() {
         let h = Harness::new().await;
         let bundle = with_assets(
