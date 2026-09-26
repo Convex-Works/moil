@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -19,6 +20,9 @@ var (
 	// uvBin is what machines run as uv: the real uv, with a uv cache of
 	// the suite's own (see useUV).
 	uvBin string
+	// reaperGroup is the process group every process the tests start
+	// joins (see startReaper).
+	reaperGroup int
 )
 
 func TestMain(m *testing.M) {
@@ -51,7 +55,42 @@ func setUp() (cleanup func(), err error) {
 		os.RemoveAll(scratch)
 		return nil, err
 	}
-	return func() { os.RemoveAll(scratch) }, nil
+	stopReaper, err := startReaper()
+	if err != nil {
+		os.RemoveAll(scratch)
+		return nil, err
+	}
+	return func() {
+		stopReaper()
+		os.RemoveAll(scratch)
+	}, nil
+}
+
+// startReaper starts a process that kills every process the tests start
+// once this test binary exits, even if it dies before its cleanups run,
+// as when go test's -timeout fires. The processes join its process group
+// (see inReaperGroup), and it kills the group when its end of a pipe from
+// this process closes.
+func startReaper() (stop func(), err error) {
+	reaper := exec.Command("/bin/sh", "-c", "read _; kill -KILL 0")
+	reaper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	pipe, err := reaper.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := reaper.Start(); err != nil {
+		return nil, fmt.Errorf("starting the reaper: %w", err)
+	}
+	reaperGroup = reaper.Process.Pid
+	return func() {
+		pipe.Close()
+		reaper.Wait()
+	}, nil
+}
+
+// inReaperGroup makes cmd's process join the reaper's process group.
+func inReaperGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: reaperGroup}
 }
 
 // findUV finds the real uv: on PATH, or where its installer puts it.

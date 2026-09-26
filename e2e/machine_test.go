@@ -95,6 +95,7 @@ func (m *machine) command(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, moilBin, args...)
 	cmd.Env = m.env()
 	cmd.WaitDelay = 5 * time.Second
+	inReaperGroup(cmd)
 	return cmd
 }
 

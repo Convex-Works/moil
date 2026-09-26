@@ -93,6 +93,7 @@ func startExample(t *testing.T) *example {
 	cmd := exec.Command(bin, "-addr", addr, "-bundles", filepath.Join(repoRoot, "examples", "bundles", "echo"), "-data", t.TempDir())
 	cmd.Stdout, cmd.Stderr = log.writer("example"), log.writer("example")
 	cmd.WaitDelay = 5 * time.Second
+	inReaperGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

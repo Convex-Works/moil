@@ -13,7 +13,7 @@ cd e2e && go test -race ./... # once moil is built
 
 It needs cargo, Go and [uv](https://docs.astral.sh/uv/) (on `PATH` or in
 `~/.local/bin`); `TestMain` builds `moil` itself. The suite takes about
-fifteen seconds, its tests running in parallel.
+ten seconds, its tests running in parallel.
 
 ## What it covers
 
@@ -37,7 +37,9 @@ what must hold afterwards:
 | `TestTheExampleServiceWorksWithMoil` | `examples/service` with `examples/bundles/echo`, through its own pages |
 
 Every test also checks, when it ends, that no process of any attempt
-outlived the agent that ran it.
+outlived the agent that ran it. Should the test binary die before its
+cleanups run, as when `-timeout` fires, a reaper process kills the
+processes it started.
 
 ## How it's built
 
