@@ -1,0 +1,6 @@
+{
+  "moil": 1,
+  "name": "idna",
+  "version": "1",
+  "description": "Encodes a domain name with the idna package."
+}

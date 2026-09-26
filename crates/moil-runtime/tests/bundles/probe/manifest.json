@@ -1,0 +1,6 @@
+{
+  "moil": 1,
+  "name": "probe",
+  "version": "1",
+  "description": "Does whatever its params say, for testing the runtime."
+}

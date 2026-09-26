@@ -1,0 +1,6 @@
+{
+  "moil": 1,
+  "name": "echo",
+  "version": "1.0.0",
+  "description": "Echoes a text file back line by line: the example bundle, using every part of the script contract."
+}
