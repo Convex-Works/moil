@@ -34,9 +34,11 @@ pub trait Backend: Send + Sync + 'static {
     /// Approves exactly the reviewed bundle.
     fn approve(&self, review: Review) -> BoxFuture<'_, Result<()>>;
 
+    /// Withdraws an approval, stopping the running job if it runs that
+    /// bundle for that service.
     fn revoke(&self, service: ServiceId, hash: BundleHash) -> BoxFuture<'_, Result<()>>;
 
-    /// Disconnects from a service and forgets it.
+    /// Disconnects from a service and forgets it, stopping its running job.
     fn unpair(&self, service: ServiceId) -> BoxFuture<'_, Result<()>>;
 
     /// Stops or resumes taking new jobs. A running job carries on.

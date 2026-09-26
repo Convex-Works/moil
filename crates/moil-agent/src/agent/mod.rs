@@ -124,7 +124,8 @@ impl AgentHandle {
         })))
     }
 
-    /// Disconnects from a service and forgets it.
+    /// Disconnects from a service and forgets it, stopping its running
+    /// attempt, if any.
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
         self.machine.service(id)?;
         self.call(|done| Command::Disconnect(id.clone(), done))
@@ -146,7 +147,9 @@ impl AgentHandle {
         Ok(())
     }
 
-    /// Revokes an approval and tells the service.
+    /// Revokes an approval and tells the service. If an attempt of that
+    /// bundle for that service is running, it is stopped as
+    /// `interrupted`, which the service may retry elsewhere.
     pub async fn revoke(&self, id: &ServiceId, hash: BundleHash) -> Result<(), Error> {
         let service = Box::new(self.machine.revoke(id, hash)?);
         self.call(|done| Command::Approvals(service, None, done))
@@ -159,8 +162,9 @@ impl AgentHandle {
         self.send(Command::SetPaused(paused));
     }
 
-    /// Stops the running job, if any. The service may give it to another
-    /// machine.
+    /// Stops the running job, if any; the snapshot shows it
+    /// [`stopping`](JobStatus::stopping) until it has. The service may give
+    /// it to another machine.
     pub fn stop_job(&self) {
         self.send(Command::StopJob);
     }
