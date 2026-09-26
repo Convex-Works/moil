@@ -159,11 +159,6 @@ async fn check(dir: &Path) -> anyhow::Result<()> {
     }
 
     let mut problems = Vec::new();
-    if let Some((file, dir)) = moil_runtime::asset_layout_conflict(manifest) {
-        problems.push(format!(
-            "assets {file:?} and {dir:?} can't both exist: {file:?} would have to be a file and a directory"
-        ));
-    }
     for package in bundle.packages() {
         if let PackageSource::Path(path) = &package.source {
             problems.push(format!(

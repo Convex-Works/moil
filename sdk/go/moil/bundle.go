@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/url"
 	"slices"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
@@ -252,6 +253,9 @@ func ParseManifest(data []byte) (*Manifest, error) {
 		}
 		m.Assets[name] = asset
 	}
+	if file, nested, ok := assetLayoutConflict(m.Assets); ok {
+		return invalid("assets %q and %q can't both exist: %q would have to be a file and a directory", file, nested, file)
+	}
 	if raw.Resources.MemoryBytes != nil {
 		m.Resources.MemoryBytes = *raw.Resources.MemoryBytes
 	}
@@ -264,6 +268,24 @@ func ParseManifest(data []byte) (*Manifest, error) {
 		}
 	}
 	return m, nil
+}
+
+// assetLayoutConflict finds two assets that can't both be laid out on disk,
+// because one would have to be a file and a directory at once (a and a/b).
+func assetLayoutConflict(assets map[string]Asset) (file, nested string, ok bool) {
+	for name := range assets {
+		for dir := name; ; {
+			i := strings.LastIndexByte(dir, '/')
+			if i < 0 {
+				break
+			}
+			dir = dir[:i]
+			if _, clash := assets[dir]; clash {
+				return dir, name, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // A shape says which keys a JSON object may have. A nil *shape accepts any

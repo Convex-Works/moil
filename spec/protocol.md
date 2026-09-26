@@ -226,7 +226,7 @@ MUST NOT rely on a hash a service claims without recomputing it.
 | `name` | yes | Bundle name (§2). Versions of a bundle share a name. |
 | `version` | yes | Free-form version label, 1–32 characters. |
 | `description` | no | At most 500 characters. |
-| `assets` | no | Files the runtime downloads, verifies and hands to the script (§8.4), keyed by asset name. `url` MUST be `https`. `size_bytes` is optional. |
+| `assets` | no | Files the runtime downloads, verifies and hands to the script (§8.4), keyed by asset name. No name may be a directory of another (`a` and `a/b`). `url` MUST be `https`. `size_bytes` is optional. |
 | `resources` | no | Informational in v1, shown to the machine owner. `memory_bytes` is an integer; `gpu` is `none`, `optional` or `required`. |
 
 Manifests are strict: a manifest with unknown fields or duplicate keys, at
@@ -438,7 +438,8 @@ app may display. The machine answers with `bid` or `decline` before
 - `outputs` maps the file names the script may produce to URLs the runtime
   uploads them to, with `method` `PUT` (the default) or `POST`.
 - `headers` are optional in both.
-- `timeout_ms` is optional; without it the attempt has no time limit.
+- `timeout_ms` is optional; without it the attempt has no time limit. It
+  covers the whole attempt: preparation, transfers and the script.
 
 **ack** acknowledges a `done`.
 
@@ -573,7 +574,10 @@ prepares the bundle:
 
 The runtime runs uv with its own configuration only (`UV_NO_CONFIG=1`) and
 with uv-managed Python (`UV_MANAGED_PYTHON=1`), so the machine's own uv or
-Python setup doesn't change what runs.
+Python setup doesn't change what runs. It also sets `UV_SYSTEM_CERTS=1`, so
+package downloads trust the same certificate authorities as the machine.
+Downloads, of assets here and of inputs later, follow redirects across
+hosts, applying the URL policy of §3 to every hop.
 
 ### 8.2 Invocation
 
@@ -647,12 +651,18 @@ The runtime adds one event type of its own, which scripts can't send:
 `v` is optional and defaults to 1. The runtime is lenient with stdout, so a
 stray `print` or a chatty library can't break a job:
 
+- Blank lines are skipped.
 - A line that isn't a JSON object becomes a `log` event at level `info`,
   with the line (truncated to 4 KiB) as `message`.
-- An event with an unknown `type`, a `v` other than 1, or invalid fields
-  becomes a `log` event at level `warn` describing the problem.
-- A second `result`, or a `result` after an `error`, is ignored with a
-  warning.
+- An event without a `type`, with an unknown `type`, with a `v` other than
+  1, or with invalid fields becomes a `log` event at level `warn`
+  describing the problem.
+- A second `result` or `error`, or a `result` after an `error`, is ignored
+  with a warning: the first one counts.
+- A `data` event whose payload is over the limit (§10) is dropped with a
+  warning. A `result` whose `meta` is over the limit is refused, so the
+  attempt fails with `no_result` rather than succeeding without its meta.
+- `message` fields are truncated to 64 KiB.
 
 stderr is not forwarded. The runtime keeps its tail for error reports
 (§9); uv's own output lands there too.
@@ -675,7 +685,7 @@ rule that applies:
 4. The script sent `error`: `failed`, `script_error`, with the script's
    `message` and `retryable`.
 5. It exited with a nonzero status or was killed by a signal: `failed`,
-   `exit`.
+   `exit`. (uv reports a script killed by signal N as exit status 128+N.)
 6. It sent no `result`: `failed`, `no_result`.
 7. `result.files` names a file that isn't a declared output or isn't in
    `out/`: `failed`, `output_missing`.
@@ -689,7 +699,10 @@ the owner chose to keep it for debugging.
 ### 8.6 Stopping a process
 
 To stop a script the runtime sends `SIGTERM` to its process group, waits
-up to 10 seconds, then sends `SIGKILL` to the group. It records the
+up to 10 seconds, then sends `SIGKILL` to the group. uv forwards the
+`SIGTERM` it receives to the script, so a script can get it twice: signal
+handlers must tolerate that, and shouldn't print, since writing to stdout
+inside a handler can fail in Python. It records the
 process group of every running attempt so that it can clean up processes
 left over from a crash when it next starts.
 
@@ -731,6 +744,7 @@ A failed `done` carries `error`:
 | Control message | 1 MiB |
 | Script stdout line | 1 MiB; longer lines are dropped with a warning |
 | `data.payload`, `result.meta` | 256 KiB each when serialized |
+| Event `message` fields | 64 KiB |
 | Bundle, all three files | 8 MiB |
 | `stderr_tail` | 8 KiB |
 | Pending pairings per service | an SDK-chosen bound, to resist abuse |

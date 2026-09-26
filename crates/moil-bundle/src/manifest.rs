@@ -77,6 +77,10 @@ pub enum ManifestError {
     InvalidAssetUrl { name: String, url: String },
     #[error("asset {name:?} has an invalid sha256 (expected 64 lowercase hex characters)")]
     InvalidAssetHash { name: String },
+    #[error(
+        "assets {file:?} and {nested:?} can't both exist: {file:?} would have to be a file and a directory"
+    )]
+    AssetLayoutConflict { file: String, nested: String },
 }
 
 impl Manifest {
@@ -131,8 +135,30 @@ impl Manifest {
                 return Err(ManifestError::InvalidAssetHash { name: name.clone() });
             }
         }
+        if let Some((file, nested)) = layout_conflict(self.assets.keys().map(String::as_str)) {
+            return Err(ManifestError::AssetLayoutConflict {
+                file: file.to_owned(),
+                nested: nested.to_owned(),
+            });
+        }
         Ok(())
     }
+}
+
+/// Two asset names that can't both be laid out on disk, because one would
+/// have to be a file and a directory at once (`a` and `a/b`). `names` must
+/// be sorted, as a `BTreeMap`'s keys are.
+fn layout_conflict<'a>(names: impl Iterator<Item = &'a str>) -> Option<(&'a str, &'a str)> {
+    let names: Vec<&str> = names.collect();
+    // In sorted order a name's descendants come after it, possibly after
+    // names that merely share a prefix, like `a.bin` or `a-b`.
+    names.iter().enumerate().find_map(|(i, parent)| {
+        names[i + 1..]
+            .iter()
+            .take_while(|other| other.starts_with(parent))
+            .find(|other| other.as_bytes().get(parent.len()) == Some(&b'/'))
+            .map(|child| (*parent, *child))
+    })
 }
 
 /// Accepts any JSON without duplicate object keys, at any depth.
@@ -222,6 +248,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_asset_name_cant_be_both_a_file_and_a_directory() {
+        let conflicting = ["whisper", "whisper-x", "whisper.bin", "whisper/model.bin"];
+        assert_eq!(
+            layout_conflict(conflicting.into_iter()),
+            Some(("whisper", "whisper/model.bin"))
+        );
+        let fine = ["w", "whisper.bin", "whisper/model.bin", "whisper/vocab.txt"];
+        assert_eq!(layout_conflict(fine.into_iter()), None);
     }
 
     #[test]

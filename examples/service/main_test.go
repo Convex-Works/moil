@@ -61,7 +61,7 @@ func TestDemo(t *testing.T) {
 	if string(a.Params) != `{"loud":true}` {
 		t.Fatalf("params %s", a.Params)
 	}
-	text := a.Input("input.txt")
+	text := a.Input("text.txt")
 	a.Progress(0.5, "shouting")
 	a.Output("output.txt", []byte(strings.ToUpper(string(text))))
 	a.Succeed(map[string]int{"chars": len(text)})

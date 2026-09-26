@@ -8,7 +8,8 @@ rust-check:
 	cargo test --workspace
 
 go-check:
-	cd sdk/go && test -z "$$(gofmt -l .)" && go vet ./... && go test ./...
+	cd sdk/go && test -z "$$(gofmt -l .)" && go vet ./... && go test -race ./...
+	cd examples/service && test -z "$$(gofmt -l .)" && go vet ./... && go test ./...
 
 # The Go SDK against the real `moil` binary and real uv.
 e2e:

@@ -44,7 +44,6 @@ mod sys;
 pub mod uv;
 mod workdir;
 
-pub use assets::asset_layout_conflict;
 pub use uv::Uv;
 
 /// Where a running attempt's events go. Unbounded, so a slow consumer never
@@ -304,14 +303,6 @@ impl Runtime {
             )
         })?;
         let manifest = bundle.manifest();
-        if let Some((file, nested)) = asset_layout_conflict(manifest) {
-            return Err(JobError::new(
-                ErrorCode::Environment,
-                format!(
-                    "the bundle's assets {file:?} and {nested:?} can't both exist: {file:?} would have to be a file and a directory"
-                ),
-            ));
-        }
         let fetch_assets = async {
             if manifest.assets.is_empty() {
                 return Ok(());

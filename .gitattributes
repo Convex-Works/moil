@@ -1,1 +1,4 @@
 spec/vectors/** -text
+examples/bundles/** -text
+crates/*/tests/bundles/** -text
+e2e/testdata/** -text

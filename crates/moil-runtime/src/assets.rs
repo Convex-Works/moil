@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use moil_bundle::{Asset, Manifest};
+use moil_bundle::Asset;
 use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel};
 
 use crate::EventSink;
@@ -195,37 +195,9 @@ fn set_read_only(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
 }
 
-/// Two assets that can't both be laid out in an attempt's `assets/`, because
-/// one would have to be a file and a directory at once (`a` and `a/b`).
-pub fn asset_layout_conflict(manifest: &Manifest) -> Option<(&str, &str)> {
-    // In sorted order, a name's descendants come right after it, possibly
-    // after names that merely share a prefix, like `a.bin` or `a-b`.
-    let names: Vec<&str> = manifest.assets.keys().map(String::as_str).collect();
-    names.iter().enumerate().find_map(|(i, parent)| {
-        names[i + 1..]
-            .iter()
-            .take_while(|other| other.starts_with(parent))
-            .find(|other| other.as_bytes().get(parent.len()) == Some(&b'/'))
-            .map(|child| (*parent, *child))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn manifest(names: &[&str]) -> Manifest {
-        let assets: serde_json::Map<String, serde_json::Value> = names
-            .iter()
-            .map(|name| {
-                let asset =
-                    serde_json::json!({"url": "https://example.com/a", "sha256": "0".repeat(64)});
-                ((*name).to_owned(), asset)
-            })
-            .collect();
-        let text = serde_json::json!({"moil": 1, "name": "x", "version": "1", "assets": assets});
-        Manifest::parse(&text.to_string()).unwrap()
-    }
 
     #[test]
     fn only_abandoned_downloads_are_removed() {
@@ -248,16 +220,5 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, [".partial-downloading".to_owned(), "0".repeat(64)]);
-    }
-
-    #[test]
-    fn a_name_cant_be_both_a_file_and_a_directory() {
-        let conflicting = manifest(&["whisper", "whisper-x", "whisper.bin", "whisper/model.bin"]);
-        assert_eq!(
-            asset_layout_conflict(&conflicting),
-            Some(("whisper", "whisper/model.bin"))
-        );
-        let fine = manifest(&["whisper/model.bin", "whisper/vocab.txt", "whisper.bin", "w"]);
-        assert_eq!(asset_layout_conflict(&fine), None);
     }
 }

@@ -28,30 +28,31 @@ impl BundleStore {
     }
 
     /// Stores `bundle` and returns its directory. Storing a bundle that is
-    /// already there is a no-op; a damaged copy is replaced.
+    /// already there is a no-op, so an intact copy that attempts may be
+    /// running from is never touched; only a damaged copy is replaced.
     pub fn put(&self, bundle: &Bundle) -> io::Result<PathBuf> {
-        let dir = self.dir(&bundle.hash());
-        if self.get(&bundle.hash()).is_ok_and(|b| b.is_some()) {
+        let hash = bundle.hash();
+        let dir = self.dir(&hash);
+        if self.is_intact(&hash) {
             return Ok(dir);
         }
         std::fs::create_dir_all(&self.root)?;
         let staging = tempdir_in(&self.root)?;
-        bundle.write_to(&staging)?;
-        if dir.exists() {
+        let stored = bundle.write_to(&staging).and_then(|()| {
+            // Renaming onto an existing directory fails, so a copy another
+            // writer stored meanwhile survives; keep it if it's intact.
+            if std::fs::rename(&staging, &dir).is_ok() || self.is_intact(&hash) {
+                return Ok(());
+            }
             std::fs::remove_dir_all(&dir)?;
-        }
-        match std::fs::rename(&staging, &dir) {
-            Ok(()) => Ok(dir),
-            // Another process stored it first; keep theirs if it's intact.
-            Err(_) if self.get(&bundle.hash()).is_ok_and(|b| b.is_some()) => {
-                let _ = std::fs::remove_dir_all(&staging);
-                Ok(dir)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&staging);
-                Err(e)
-            }
-        }
+            std::fs::rename(&staging, &dir)
+        });
+        let _ = std::fs::remove_dir_all(&staging);
+        stored.map(|()| dir)
+    }
+
+    fn is_intact(&self, hash: &BundleHash) -> bool {
+        self.get(hash).is_ok_and(|b| b.is_some())
     }
 
     /// The stored bundle with this hash, or `None` if there is none. Fails if
@@ -123,6 +124,31 @@ mod tests {
         store.remove(&bundle.hash()).unwrap();
         assert!(store.get(&bundle.hash()).unwrap().is_none());
         store.remove(&bundle.hash()).unwrap();
+    }
+
+    #[test]
+    fn concurrent_puts_never_remove_a_stored_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BundleStore::new(root.path());
+        let bundle = minimal();
+        let dir = store.dir(&bundle.hash());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        store.put(&bundle).unwrap();
+                        // Once any put returns, the copy stays readable.
+                        assert!(dir.join(crate::SCRIPT).is_file());
+                    }
+                });
+            }
+        });
+        assert_eq!(store.get(&bundle.hash()).unwrap(), Some(bundle));
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no staging left behind"
+        );
     }
 
     #[test]

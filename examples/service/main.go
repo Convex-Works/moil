@@ -229,7 +229,7 @@ func (d *demo) submit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	input := d.addFile(&file{name: "input.txt", data: []byte(r.FormValue("text")), contentType: "text/plain; charset=utf-8"})
+	input := d.addFile(&file{name: "text.txt", data: []byte(r.FormValue("text")), contentType: "text/plain; charset=utf-8"})
 	j := &job{Title: r.FormValue("title"), Bundle: bundle, Created: time.Now(), Outputs: map[string]string{}}
 	outputs := map[string]moil.Upload{}
 	for _, name := range strings.FieldsFunc(r.FormValue("outputs"), func(c rune) bool { return c == ',' || c == ' ' }) {
@@ -242,7 +242,7 @@ func (d *demo) submit(w http.ResponseWriter, r *http.Request) {
 		Bundle:   bundle,
 		Title:    j.Title,
 		Params:   params,
-		Inputs:   map[string]moil.Download{"input.txt": {URL: d.fileURL(input)}},
+		Inputs:   map[string]moil.Download{"text.txt": {URL: d.fileURL(input)}},
 		Outputs:  outputs,
 		Eligible: moil.OwnedBy(owner), // only the demo user's own machines see the text
 	})
@@ -373,7 +373,7 @@ func (d *demo) putFile(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	f := d.files[r.PathValue("token")]
 	d.mu.Unlock()
-	if f == nil || f.name == "input.txt" {
+	if f == nil || f.name == "text.txt" {
 		http.NotFound(w, r)
 		return
 	}
