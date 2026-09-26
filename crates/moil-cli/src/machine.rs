@@ -407,13 +407,16 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
 }
 
 /// Tells the owner, once each, about bundles waiting for their review.
+/// Approving needs the machine's home, which the agent holds, so the owner
+/// stops the agent first.
 async fn announce_reviews(mut snapshots: tokio::sync::watch::Receiver<Snapshot>) {
     let mut announced = HashSet::new();
     loop {
         for (service, bundle) in snapshots.borrow_and_update().pending_reviews() {
             if announced.insert((service.id.clone(), bundle.info.hash)) {
                 tracing::info!(
-                    "{} offers {} {}, which you haven't approved; see it with `moil review {} {}`",
+                    "{} offers {} {}, which you haven't approved; to read and approve it, \
+                     stop the agent and run `moil approve {} {}`",
                     service.name,
                     bundle.info.name,
                     bundle.info.version,
