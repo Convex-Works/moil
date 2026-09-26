@@ -29,6 +29,11 @@ pub struct MachineConfig {
 /// This computer's moil state: settings, paired services, approvals and
 /// tokens. Opening it takes the home's lock, released when the last clone
 /// is dropped. Cheap to clone.
+///
+/// While an [`Agent`](crate::Agent) runs on a machine, pair, unpair,
+/// approve and revoke through its [`AgentHandle`](crate::AgentHandle),
+/// which also tells the services; changing them here alone leaves the
+/// agent unaware until it restarts.
 #[derive(Debug, Clone)]
 pub struct Machine {
     inner: Arc<Inner>,

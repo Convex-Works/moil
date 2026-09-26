@@ -38,6 +38,10 @@ impl Agent {
         executor: Arc<dyn Executor>,
         options: AgentOptions,
     ) -> AgentHandle {
+        // Detecting the hardware runs a few commands; better here than when
+        // the first hello is due.
+        let detect = machine.clone();
+        tokio::task::spawn_blocking(move || detect.info());
         let (inputs, receiver) = mpsc::unbounded_channel();
         let (snapshot, snapshot_receiver) = watch::channel(Snapshot::default());
         let coordinator =
@@ -110,7 +114,8 @@ impl AgentHandle {
     }
 
     /// Like [`Machine::pair`]; once the pairing completes, the agent
-    /// connects to the new service.
+    /// connects to the new service (to the same one again, with the new
+    /// token, if it was paired before).
     pub async fn pair(&self, base_url: &str) -> Result<PairingSession, Error> {
         let session = self.machine.pair(base_url).await?;
         let inputs = self.inputs.clone();
@@ -161,6 +166,11 @@ impl AgentHandle {
     }
 
     /// Stops the running job, reports it, and closes every connection.
+    ///
+    /// Waits for the executor to return (which it must do promptly once
+    /// stopped), then up to [`AgentOptions::shutdown_grace`] for services
+    /// to acknowledge what they were sent. Afterwards the handle's other
+    /// methods do nothing, or only what [`Machine`] does.
     pub async fn shutdown(&self) {
         self.call(Command::Shutdown).await;
     }
