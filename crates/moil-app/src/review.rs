@@ -605,7 +605,7 @@ mod tests {
 
     fn service(approved: &[&Bundle]) -> PairedService {
         PairedService {
-            id: demo::service_id("klisi.example.com"),
+            id: "klisi.example.com".parse().unwrap(),
             base_url: "https://klisi.example.com/moil".parse().unwrap(),
             name: "klisi".into(),
             machine_id: "m_7Hq2Xk9Lw3".into(),
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn loading_and_failure_pages_let_the_owner_leave() {
         let mut window = ReviewWindow::new(
-            demo::service_id("klisi.example.com"),
+            "klisi.example.com".parse().unwrap(),
             "klisi",
             demo::transcribe_0_3().hash(),
         );

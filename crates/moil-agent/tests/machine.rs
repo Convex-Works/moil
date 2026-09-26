@@ -331,6 +331,24 @@ async fn services_are_found_by_id_host_url_or_name() {
 }
 
 #[tokio::test]
+async fn a_service_file_naming_an_unsafe_id_is_skipped() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+
+    // Hand-edited, it would have the machine write outside its home.
+    let mut file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(format!("services/{}.json", paired.id))).unwrap(),
+    )
+    .unwrap();
+    file["id"] = "../../outside".into();
+    std::fs::write(dir.path().join("services/edited.json"), file.to_string()).unwrap();
+
+    assert_eq!(machine.services().unwrap(), [paired]);
+}
+
+#[tokio::test]
 async fn review_shows_the_verified_bundle() {
     let service = FakeService::start("klisi").await;
     let dir = tempfile::tempdir().unwrap();

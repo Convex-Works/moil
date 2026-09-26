@@ -450,7 +450,6 @@ mod tests {
     use moil_proto::{BundleInfo, JobId};
 
     use super::*;
-    use crate::demo::service_id;
 
     fn hash(c: char) -> BundleHash {
         c.to_string().repeat(64).parse().unwrap()
@@ -470,7 +469,7 @@ mod tests {
 
     fn klisi() -> ServiceStatus {
         ServiceStatus {
-            id: service_id("klisi.example.com"),
+            id: "klisi.example.com".parse().unwrap(),
             name: "klisi".into(),
             base_url: "https://klisi.example.com/moil".parse().unwrap(),
             connection: Connection::Connected,
@@ -484,7 +483,7 @@ mod tests {
 
     fn lab(now: Instant) -> ServiceStatus {
         ServiceStatus {
-            id: service_id("localhost-8787"),
+            id: "localhost-8787".parse().unwrap(),
             name: "lab".into(),
             base_url: "http://localhost:8787/moil".parse().unwrap(),
             connection: Connection::Disconnected {
@@ -498,7 +497,7 @@ mod tests {
 
     fn job(phase: Phase, fraction: Option<f64>) -> JobStatus {
         JobStatus {
-            service: service_id("klisi.example.com"),
+            service: "klisi.example.com".parse().unwrap(),
             job_id: JobId::new("j_42").unwrap(),
             attempt: 1,
             title: Some("Weekly sync".into()),
@@ -627,14 +626,14 @@ mod tests {
         assert_eq!(
             menu.action("Review transcribe 0.3.0…"),
             Some(&Action::Review {
-                service: service_id("klisi.example.com"),
+                service: "klisi.example.com".parse().unwrap(),
                 hash: hash('b')
             })
         );
         assert_eq!(
             menu.action("transcribe 0.2.0 — approved"),
             Some(&Action::Review {
-                service: service_id("klisi.example.com"),
+                service: "klisi.example.com".parse().unwrap(),
                 hash: hash('a')
             })
         );
@@ -643,7 +642,7 @@ mod tests {
         assert_eq!(menu.action("Stop Current Job"), None, "no job, no stop");
         assert_eq!(
             menu.action("Unpair klisi…"),
-            Some(&Action::Unpair(service_id("klisi.example.com")))
+            Some(&Action::Unpair("klisi.example.com".parse().unwrap()))
         );
         assert_eq!(menu.action("Quit moil"), Some(&Action::Quit));
     }
@@ -754,7 +753,7 @@ mod tests {
         }
 
         fx.deferred
-            .insert((service_id("klisi.example.com"), hash('b')));
+            .insert(("klisi.example.com".parse().unwrap(), hash('b')));
         assert!(!attention(&fx, vec![klisi()]), "put off with Not now");
         let menu = fx
             .view(&Snapshot {

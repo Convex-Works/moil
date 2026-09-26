@@ -33,4 +33,4 @@ pub use review::Review;
 #[cfg(target_os = "macos")]
 pub use secrets::KeychainSecrets;
 pub use secrets::{FileSecrets, MemorySecrets, SecretStore, default_secrets};
-pub use services::{Approval, PairedService, ServiceId};
+pub use services::{Approval, InvalidServiceId, PairedService, ServiceId};

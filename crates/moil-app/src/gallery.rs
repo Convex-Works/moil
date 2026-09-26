@@ -65,7 +65,7 @@ fn icons() -> String {
 fn klisi(approved: &[&Bundle]) -> PairedService {
     let now = SystemTime::now();
     PairedService {
-        id: demo::service_id("klisi.example.com"),
+        id: "klisi.example.com".parse().unwrap(),
         base_url: "https://klisi.example.com/moil".parse().unwrap(),
         name: "klisi".into(),
         machine_id: "m_7Hq2Xk9Lw3".into(),
@@ -185,9 +185,9 @@ fn gallery() {
             |_| {},
         ),
     );
-    let loading = ReviewWindow::new(demo::service_id("klisi.example.com"), "klisi", v3.hash());
+    let loading = ReviewWindow::new("klisi.example.com".parse().unwrap(), "klisi", v3.hash());
     write("review-loading", loading.render(SystemTime::now()));
-    let mut failed = ReviewWindow::new(demo::service_id("klisi.example.com"), "klisi", v3.hash());
+    let mut failed = ReviewWindow::new("klisi.example.com".parse().unwrap(), "klisi", v3.hash());
     failed.loaded(Err(format!("the service has no bundle {}", v3.hash())));
     write("review-failed", failed.render(SystemTime::now()));
 
@@ -234,7 +234,7 @@ fn gallery() {
     write("pair-paired", flow.render(now));
 
     let status = ServiceStatus {
-        id: demo::service_id("klisi.example.com"),
+        id: "klisi.example.com".parse().unwrap(),
         name: "klisi".into(),
         base_url: "https://klisi.example.com/moil".parse().unwrap(),
         connection: Connection::Connected,

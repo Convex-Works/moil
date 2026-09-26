@@ -59,13 +59,6 @@ fn minimal() -> Bundle {
     .expect("the spec's minimal bundle is valid")
 }
 
-/// A [`ServiceId`] for demo and test services. moil-agent keeps its
-/// constructor to itself, so this goes through the ID's serialized form.
-pub fn service_id(id: &str) -> ServiceId {
-    serde_json::from_value(serde_json::Value::String(id.to_owned()))
-        .expect("a service ID is a plain string")
-}
-
 /// How long the demo's simulated work takes.
 mod pace {
     use std::time::Duration;
@@ -113,17 +106,19 @@ impl Demo {
             version: bundle.manifest().version.clone(),
             approved_at: days_ago(days),
         };
+        let klisi_url: Url = "https://klisi.example.com/moil".parse().expect("a URL");
         let klisi = PairedService {
-            id: service_id("klisi.example.com"),
-            base_url: "https://klisi.example.com/moil".parse().expect("a URL"),
+            id: ServiceId::derive(&klisi_url, |_| false),
+            base_url: klisi_url,
             name: "klisi".into(),
             machine_id: "m_7Hq2Xk9Lw3".into(),
             paired_at: days_ago(64),
             approvals: vec![approval(&v2, 23)],
         };
+        let lab_url: Url = "https://lab.example.org/moil".parse().expect("a URL");
         let lab = PairedService {
-            id: service_id("lab.example.org"),
-            base_url: "https://lab.example.org/moil".parse().expect("a URL"),
+            id: ServiceId::derive(&lab_url, |_| false),
+            base_url: lab_url,
             name: "lab".into(),
             machine_id: "m_Qe2wBv0V8i".into(),
             paired_at: days_ago(9),
@@ -144,18 +139,15 @@ impl Demo {
             ],
             job: None,
         };
+        let (klisi_id, lab_id) = (klisi.id.clone(), lab.id.clone());
         let state = Arc::new(State {
             snapshot: watch::Sender::new(snapshot),
             paired: Mutex::new(vec![klisi, lab]),
             stop: watch::Sender::new(false),
             bundles: vec![v2, v3, minimal],
         });
-        tokio::spawn(state.clone().run_jobs());
-        tokio::spawn(
-            state
-                .clone()
-                .keep_reconnecting(service_id("lab.example.org")),
-        );
+        tokio::spawn(state.clone().run_jobs(klisi_id));
+        tokio::spawn(state.clone().keep_reconnecting(lab_id));
         Self(state)
     }
 }
@@ -183,22 +175,21 @@ impl State {
         }
     }
 
-    /// Runs a job for klisi now and then, while not paused.
-    async fn run_jobs(self: Arc<Self>) {
+    /// Runs a job for `klisi` now and then, while not paused.
+    async fn run_jobs(self: Arc<Self>, klisi: ServiceId) {
         let mut paused = self.snapshot.subscribe();
         for (n, meeting) in MEETINGS.iter().cycle().enumerate() {
             sleep(pace::IDLE).await;
             if paused.wait_for(|s| !s.paused).await.is_err() {
                 return;
             }
-            let klisi = service_id("klisi.example.com");
             let Some(bundle) = self.approved_bundles(&klisi).pop() else {
                 continue;
             };
             self.stop.send_replace(false);
             self.update(|s| {
                 s.job = Some(JobStatus {
-                    service: klisi,
+                    service: klisi.clone(),
                     job_id: JobId::new(format!("j_{}", 4100 + n)).expect("a job ID"),
                     attempt: 1,
                     title: Some((*meeting).into()),
@@ -312,20 +303,8 @@ impl State {
 
     fn add_service(&self, url: &Url, name: &str) -> PairedService {
         let mut paired = self.paired.lock().expect("the demo's state");
-        let base = match (url.host_str(), url.port()) {
-            (Some(host), Some(port)) => format!("{host}-{port}"),
-            (Some(host), None) => host.to_owned(),
-            _ => "service".to_owned(),
-        };
-        let id = (1..)
-            .map(|n| match n {
-                1 => base.clone(),
-                n => format!("{base}-{n}"),
-            })
-            .find(|id| paired.iter().all(|s| s.id.as_str() != id))
-            .expect("an unused ID");
         let service = PairedService {
-            id: service_id(&id),
+            id: ServiceId::derive(url, |id| paired.iter().any(|s| s.id.as_str() == id)),
             base_url: url.clone(),
             name: name.to_owned(),
             machine_id: "m_demo".into(),
@@ -629,6 +608,14 @@ mod tests {
                 .any(|s| s.id == service.id && s.connection == Connection::Connected)
         );
 
+        let loopback = demo.pair("http://[::1]:8787/moil".into()).await.unwrap();
+        let service = loopback.confirmed.await.unwrap();
+        assert_eq!(
+            service.id.as_str(),
+            "1-8787",
+            "IDs are derived as the agent does"
+        );
+
         let denied = demo.pair("https://deny.example.net/moil".into()).await;
         assert!(matches!(
             denied.unwrap().confirmed.await,
@@ -643,7 +630,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn approving_the_update_settles_the_review() {
         let demo = Demo::start();
-        let klisi = service_id("klisi.example.com");
+        let klisi: ServiceId = "klisi.example.com".parse().unwrap();
         let review = demo
             .review(klisi.clone(), transcribe_0_3().hash())
             .await
