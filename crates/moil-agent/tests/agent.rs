@@ -806,6 +806,64 @@ async fn approvals_through_the_agent_reach_the_service() {
 }
 
 #[tokio::test]
+async fn revoking_a_bundle_stops_its_running_attempt() {
+    let mut setup = Setup::build(&["klisi", "notes"], fast(), |_, _| {}).await;
+    let mut klisi = connect(&setup.services[0].0, &setup.bundle).await;
+    let mut notes = connect(&setup.services[1].0, &setup.bundle).await;
+    let (klisi_id, notes_id) = (
+        setup.services[0].1.id.clone(),
+        setup.services[1].1.id.clone(),
+    );
+    let hash = setup.hash();
+    klisi.send(assign("j1", 1, hash, 30_000));
+    assert_eq!(klisi.recv().await, state(MachineState::Busy));
+    assert_eq!(notes.recv().await, state(MachineState::Busy));
+    let mut run = setup.runs.next().await;
+
+    // Approving another bundle, or revoking this one for another service,
+    // leaves the attempt alone: approvals are per bundle and per service.
+    let v2 = bundle("transcribe", "2.0.0", "print('two')");
+    setup.services[0].0.host(&v2);
+    let review = setup.agent.review(&klisi_id, v2.hash()).await.unwrap();
+    setup.agent.approve(&review).await.unwrap();
+    let approved = |hashes: &[moil_proto::BundleHash]| MachineMessage::Approved {
+        hashes: hashes.to_vec(),
+    };
+    assert_eq!(klisi.recv().await, approved(&[hash, v2.hash()]));
+    setup.agent.revoke(&notes_id, hash).await.unwrap();
+    assert_eq!(notes.recv().await, approved(&[]));
+    run.emit(log("still running"));
+    assert_eq!(klisi.recv().await, event("j1", 1, 1, log("still running")));
+
+    setup.agent.revoke(&klisi_id, hash).await.unwrap();
+    assert_eq!(run.stopped().await, StopReason::Interrupted);
+    assert_eq!(klisi.recv().await, approved(&[v2.hash()]));
+    let (seq, error) = failure(klisi.recv().await);
+    assert_eq!(
+        (seq, error.code, error.retryable),
+        (2, ErrorCode::Interrupted, true),
+        "another machine may take the job"
+    );
+    assert_eq!(klisi.recv().await, state(MachineState::Idle));
+}
+
+#[tokio::test]
+async fn unpairing_stops_the_services_running_attempt() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let mut run = setup.runs.next().await;
+
+    setup.agent.unpair(&setup.paired().id).await.unwrap();
+    assert_eq!(run.stopped().await, StopReason::Interrupted);
+    // Nothing more is said: the service fails the attempt as `lost` when
+    // it removes the machine.
+    assert_eq!(conn.closed().await, Some(1000));
+    snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+}
+
+#[tokio::test]
 async fn pairing_through_the_agent_connects_to_the_new_service() {
     let dir = tempfile::tempdir().unwrap();
     let (executor, _runs) = fake_executor();

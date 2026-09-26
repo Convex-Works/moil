@@ -64,8 +64,8 @@ pub(super) enum Command {
     Paired(Box<PairedService>),
     /// Close the service's channel and forget its attempts.
     Disconnect(ServiceId, oneshot::Sender<()>),
-    /// The service's approvals changed; prepare the bundle if one was
-    /// approved.
+    /// The service's approvals changed: stop its running attempt if its
+    /// bundle is no longer approved, and prepare the bundle if one was.
     Approvals(Box<PairedService>, Option<Box<Bundle>>, oneshot::Sender<()>),
     SetPaused(bool),
     /// The owner stopped the running job.
@@ -216,6 +216,8 @@ impl Attempt {
 
 struct Running {
     key: AttemptKey,
+    /// The approved bundle it runs.
+    bundle: BundleHash,
     stopper: Stopper,
     status: JobStatus,
 }
@@ -341,6 +343,17 @@ impl Coordinator {
                 }
             }
             Command::Approvals(paired, approved, reply) => {
+                if let Some(running) = &mut self.running
+                    && running.key.service == paired.id
+                    && !paired.is_approved(&running.bundle)
+                {
+                    // The owner no longer consents to running it.
+                    tracing::info!(
+                        "stopping {}: its bundle's approval was revoked",
+                        running.key
+                    );
+                    running.stop(StopReason::Interrupted);
+                }
                 if let Some(service) = self.services.get_mut(&paired.id) {
                     service.paired = *paired;
                 }
@@ -570,6 +583,7 @@ impl Coordinator {
         self.attempts.insert(key.clone(), attempt);
         self.running = Some(Running {
             key: key.clone(),
+            bundle: bundle.hash(),
             stopper,
             status,
         });
