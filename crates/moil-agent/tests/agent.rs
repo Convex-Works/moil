@@ -690,6 +690,50 @@ async fn an_offline_attempt_keeps_its_newest_events_and_always_its_done() {
 }
 
 #[tokio::test]
+async fn a_chatty_attempt_is_relayed_as_briskly_as_a_quiet_one() {
+    // The fake service doesn't ping; a slow relay should fail the
+    // assertion below, not look like a dead channel.
+    let options = AgentOptions {
+        receive_timeout: Duration::from_secs(60),
+        ..fast()
+    };
+    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+
+    // The machine keeps an attempt's events until its done is
+    // acknowledged. When it looked through all of them for each one it
+    // sent, relaying these took about twenty seconds.
+    const EVENTS: u64 = 100_000;
+    let started = Instant::now();
+    for i in 1..=EVENTS {
+        run.emit(log(&format!("line {i}")));
+    }
+    run.finish(succeeded());
+    let mut seqs = 0;
+    loop {
+        match conn.recv().await {
+            MachineMessage::Event(e) => {
+                seqs += 1;
+                assert_eq!(e.seq, seqs, "events arrive in order");
+            }
+            MachineMessage::Done(d) => {
+                assert_eq!(d.seq, EVENTS + 1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "relaying {EVENTS} events took {took:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_removed_machine_stops_reconnecting() {
     let setup = Setup::new().await;
     let conn = setup.connect().await;

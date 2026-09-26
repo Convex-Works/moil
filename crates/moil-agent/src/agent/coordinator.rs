@@ -760,12 +760,16 @@ impl Coordinator {
             else {
                 continue;
             };
+            // Kept messages are in `seq` order, so the unsent ones are the
+            // newest: an attempt's every event isn't looked at again each
+            // round, however many it sends.
+            let unsent = attempt
+                .kept
+                .partition_point(|(seq, _)| *seq <= attempt.delivered);
             let mut sent = false;
-            for (seq, text) in &attempt.kept {
-                if *seq > attempt.delivered {
-                    let _ = link.outbox.send(text.clone());
-                    sent = true;
-                }
+            for (_, text) in attempt.kept.range(unsent..) {
+                let _ = link.outbox.send(text.clone());
+                sent = true;
             }
             if sent {
                 attempt.delivered = attempt.kept.back().map_or(0, |(seq, _)| *seq);
