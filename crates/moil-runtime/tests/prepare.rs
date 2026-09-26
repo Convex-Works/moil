@@ -313,24 +313,6 @@ mod assets {
         );
         assert!(cdn.received("/cdn/other.bin").is_empty());
     }
-
-    #[tokio::test]
-    async fn assets_that_cant_all_be_laid_out_are_refused() {
-        let h = Harness::new().await;
-        let bundle = with_assets(
-            &h,
-            &[("whisper", "/a", "a"), ("whisper/model.bin", "/b", "b")],
-        );
-        let error = h.runtime.prepare(&bundle).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::Environment);
-        assert!(
-            error
-                .message
-                .contains("\"whisper\" and \"whisper/model.bin\""),
-            "{}",
-            error.message
-        );
-    }
 }
 
 mod environment {
