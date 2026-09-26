@@ -168,11 +168,7 @@ fn start() -> Result<Arc<dyn Backend>, StartError> {
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
     })?;
     let uv = find_uv().ok_or(StartError::NoUv)?;
-    let settings = machine.settings();
-    let mut config = machine.home().runtime_config(uv);
-    config.allow_insecure_http = settings.allow_insecure_http;
-    config.keep_work_dirs = settings.keep_work_dirs;
-    let runtime = Runtime::new(config);
+    let runtime = Runtime::new(machine.runtime_config(uv));
     match runtime.reap_orphans() {
         Ok(0) => {}
         Ok(n) => tracing::info!("cleaned up {n} attempts left over from an earlier run"),

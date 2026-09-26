@@ -382,11 +382,7 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
         .init();
     let uv = moil_runtime::find_uv()
         .context("couldn't find uv; install it (https://docs.astral.sh/uv/) or set $MOIL_UV")?;
-    let settings = machine.settings();
-    let mut config = machine.home().runtime_config(uv);
-    config.allow_insecure_http = settings.allow_insecure_http;
-    config.keep_work_dirs = settings.keep_work_dirs;
-    let runtime = Runtime::new(config);
+    let runtime = Runtime::new(machine.runtime_config(uv));
     let reaped = runtime
         .reap_orphans()
         .context("couldn't clean up after an earlier crash")?;
@@ -397,7 +393,7 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
     if services.is_empty() {
         tracing::warn!("no paired services yet; pair one with `moil pair URL`");
     }
-    if settings.paused {
+    if machine.settings().paused {
         tracing::info!("paused: not taking new jobs");
     }
 

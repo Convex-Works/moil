@@ -103,7 +103,10 @@ impl Home {
         self.root.join("agent.lock")
     }
 
-    /// The runtime's configuration for this home, with `uv` as the uv binary.
+    /// The runtime's configuration for this home, with `uv` as the uv
+    /// binary and the runtime's defaults for everything else. See
+    /// [`Machine::runtime_config`](crate::Machine::runtime_config) for one
+    /// with the owner's settings applied.
     pub fn runtime_config(&self, uv: PathBuf) -> moil_runtime::RuntimeConfig {
         moil_runtime::RuntimeConfig::new(uv, &self.root)
     }

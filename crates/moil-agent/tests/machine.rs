@@ -76,6 +76,27 @@ fn a_damaged_settings_file_is_named() {
 }
 
 #[test]
+fn the_runtime_runs_by_the_owners_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let config = machine.runtime_config("/opt/uv".into());
+    assert_eq!(config.uv, std::path::Path::new("/opt/uv"));
+    assert_eq!(config.jobs_dir, dir.path().join("jobs"));
+    assert_eq!(config.bundles.root(), machine.home().bundles().root());
+    assert!(!config.allow_insecure_http && !config.keep_work_dirs);
+
+    machine
+        .update_settings(|s| {
+            s.allow_insecure_http = true;
+            s.keep_work_dirs = true;
+        })
+        .unwrap();
+    drop(machine);
+    let config = open_machine(dir.path()).runtime_config("/opt/uv".into());
+    assert!(config.allow_insecure_http && config.keep_work_dirs);
+}
+
+#[test]
 fn info_describes_this_machine() {
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
