@@ -52,7 +52,7 @@ impl UnpairWindow {
     }
 
     pub fn title(&self) -> String {
-        format!("Unpair {}", self.name)
+        format!("Unpair {}", format::one_line(&self.name, 32))
     }
 
     pub fn on_message(&mut self, message: ConfirmMessage) -> Option<UnpairEffect> {

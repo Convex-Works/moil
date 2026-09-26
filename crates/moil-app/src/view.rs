@@ -248,8 +248,8 @@ fn status(snapshot: &Snapshot) -> Label {
                 .map_or(job.service.as_str(), |s| &s.name);
             let label = Label::new(format!(
                 "Running “{}” for {}",
-                clean(what, 48),
-                clean(service, 32)
+                format::one_line(what, 48),
+                format::one_line(service, 32)
             ));
             match (job.phase, progress(job)) {
                 (_, Some(percent)) => label.with_detail(format!("{percent}%")),
@@ -280,9 +280,9 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
 
     let mut entries = vec![Text(status)];
     if let Some(job) = &snapshot.job {
-        let mut detail = clean(&job.bundle_name, 32);
+        let mut detail = format::one_line(&job.bundle_name, 32);
         if let Some(message) = &job.message {
-            detail = format!("{detail}: {}", clean(message, 48));
+            detail = format!("{detail}: {}", format::one_line(message, 48));
         }
         entries.push(Text(Label::quiet(detail)));
         if snapshot.paused {
@@ -303,7 +303,8 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
             entries.push(Separator);
         }
         entries.push(Submenu {
-            label: Label::new(clean(&service.name, 32)).with_detail(host(&service.base_url)),
+            label: Label::new(format::one_line(&service.name, 32))
+                .with_detail(host(&service.base_url)),
             entries: service_menu(service, cx.now),
         });
         entries.push(Text(Label::quiet(connection(&service.connection, cx.now))));
@@ -311,8 +312,8 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
             entries.push(Item {
                 label: Label::new(format!(
                     "Review {} {}…",
-                    clean(&bundle.info.name, 32),
-                    clean(&bundle.info.version, 16)
+                    format::one_line(&bundle.info.name, 32),
+                    format::one_line(&bundle.info.version, 16)
                 )),
                 action: Action::Review {
                     service: service.id.clone(),
@@ -322,7 +323,10 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         }
         if service.connection == Connection::Unpaired {
             entries.push(Item {
-                label: Label::new(format!("Pair with {} Again…", clean(&service.name, 32))),
+                label: Label::new(format!(
+                    "Pair with {} Again…",
+                    format::one_line(&service.name, 32)
+                )),
                 action: Action::PairAgain(service.base_url.clone()),
             });
         }
@@ -355,7 +359,10 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
 fn service_menu(service: &ServiceStatus, now: Instant) -> Vec<Entry> {
     use Entry::*;
     let mut entries = vec![
-        Text(Label::quiet(clean(service.base_url.as_str(), 64))),
+        Text(Label::quiet(format::one_line(
+            service.base_url.as_str(),
+            64,
+        ))),
         Text(Label::new(connection(&service.connection, now))),
     ];
     if service.insecure {
@@ -368,8 +375,8 @@ fn service_menu(service: &ServiceStatus, now: Instant) -> Vec<Entry> {
     for bundle in &service.bundles {
         let name = format!(
             "{} {}",
-            clean(&bundle.info.name, 32),
-            clean(&bundle.info.version, 16)
+            format::one_line(&bundle.info.name, 32),
+            format::one_line(&bundle.info.version, 16)
         );
         entries.push(Item {
             label: if bundle.approved {
@@ -385,7 +392,7 @@ fn service_menu(service: &ServiceStatus, now: Instant) -> Vec<Entry> {
     }
     entries.push(Separator);
     entries.push(Item {
-        label: Label::new(format!("Unpair {}…", clean(&service.name, 32))),
+        label: Label::new(format!("Unpair {}…", format::one_line(&service.name, 32))),
         action: Action::Unpair(service.id.clone()),
     });
     entries
@@ -396,7 +403,7 @@ fn connection(connection: &Connection, now: Instant) -> String {
         Connection::Connecting => "Connecting…".into(),
         Connection::Connected => "Connected".into(),
         Connection::Disconnected { error, retry_at } => {
-            let error = clean(error, 48);
+            let error = format::one_line(error, 48);
             match retry_at.checked_duration_since(now) {
                 Some(wait) if !wait.is_zero() => {
                     format!("Offline: {error}. Retrying in {}", format::wait(wait))
@@ -437,24 +444,6 @@ fn host(url: &Url) -> String {
         (Some(host), None) => host.to_owned(),
         _ => url.to_string(),
     }
-}
-
-/// Text from a service, made fit for a menu: one line, at most `max`
-/// characters, with no characters that are invisible or reorder text.
-fn clean(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut chars = text
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|&c| !crate::page::is_hidden(c));
-    for c in chars.by_ref().take(max) {
-        out.push(c);
-    }
-    if chars.next().is_some() {
-        out.truncate(out.trim_end().len());
-        out.push('…');
-    }
-    out
 }
 
 #[cfg(test)]

@@ -92,10 +92,15 @@ impl ReviewWindow {
                 let manifest = review.bundle.manifest();
                 format!(
                     "Review {} {} — {}",
-                    manifest.name, manifest.version, self.service_name
+                    manifest.name,
+                    format::one_line(&manifest.version, 32),
+                    format::one_line(&self.service_name, 32)
                 )
             }
-            _ => format!("Review a bundle from {}", self.service_name),
+            _ => format!(
+                "Review a bundle from {}",
+                format::one_line(&self.service_name, 32)
+            ),
         }
     }
 

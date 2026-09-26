@@ -80,6 +80,25 @@ pub fn count(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
+/// Text from a service, made fit for a menu or a window title: one line of
+/// at most `max` characters, without the characters that are invisible or
+/// reorder text (see [`crate::page`]).
+pub fn one_line(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut chars = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|&c| !crate::page::is_hidden(c));
+    for c in chars.by_ref().take(max) {
+        out.push(c);
+    }
+    if chars.next().is_some() {
+        out.truncate(out.trim_end().len());
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
