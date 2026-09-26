@@ -111,6 +111,7 @@ impl Machine {
         self.lock_settings().clone()
     }
 
+    /// Changes the settings and saves them, returning the new ones.
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<Settings, Error> {
         let mut settings = self.lock_settings();
         let mut changed = settings.clone();

@@ -55,8 +55,8 @@ impl Agent {
     }
 }
 
-/// How long the agent waits for things. The defaults are the spec's; tests
-/// shorten them.
+/// How the agent paces itself: how long it waits for things and how much
+/// it keeps. The defaults follow the spec; tests shrink them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentOptions {
     /// The first delay before reconnecting to a service (spec §6.1: 1 s).
