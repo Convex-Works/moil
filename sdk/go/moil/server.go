@@ -1,0 +1,436 @@
+package moil
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+
+	"git.convex.works/ConvexWorks/moil/sdk/go/internal/wire"
+)
+
+// Config configures a Server. Name, VerificationURL and Store are
+// required; zero durations and limits take the defaults shown.
+type Config struct {
+	// Name is how the service introduces itself to machines, e.g. "klisi".
+	Name string
+	// VerificationURL is the service's page where a signed-in user
+	// confirms a pairing code. Machines open it with ?code=XXXX-XXXX
+	// appended; the page calls PendingPairing, then ConfirmPairing or
+	// DenyPairing.
+	VerificationURL string
+	// Store keeps paired machines.
+	Store Store
+	// Logger receives the Server's logs. Nil discards them.
+	Logger *slog.Logger
+
+	// PairingTTL is how long a pairing code stays valid. Default 10 minutes.
+	PairingTTL time.Duration
+	// PairingInterval is how often a pairing machine may poll for its
+	// token; machines polling faster are told to slow down. Default 2s.
+	PairingInterval time.Duration
+	// MaxPendingPairings bounds the pairings waiting for confirmation, so
+	// that anonymous requests can't exhaust memory. Default 1000.
+	MaxPendingPairings int
+
+	// BidWindow is how long machines have to answer an offer. The Server
+	// decides as soon as every offered machine answered. Default 2s.
+	BidWindow time.Duration
+	// LeaseTTL is how long an attempt may go without word from its
+	// machine before it fails with CodeLeaseExpired. Default 30s.
+	LeaseTTL time.Duration
+	// MaxAttempts is how many attempts a job may use, not counting ones
+	// that never started. Default 3.
+	MaxAttempts int
+	// PingInterval is how often the Server pings each machine; a machine
+	// that doesn't answer before the next ping is disconnected. It also
+	// bounds how long a machine may take to say hello. Default 20s.
+	PingInterval time.Duration
+	// KeepFinished is how long a finished job stays known, for Run and
+	// for idempotent Submit. Default 1 hour.
+	KeepFinished time.Duration
+}
+
+func (c *Config) setDefaults() error {
+	if c.Name == "" {
+		return errors.New("moil: Config.Name is required")
+	}
+	if wire.Chars(c.Name) > 64 {
+		return errors.New("moil: Config.Name must be at most 64 characters")
+	}
+	u, err := url.Parse(c.VerificationURL)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return errors.New("moil: Config.VerificationURL must be an absolute URL, such as https://example.com/machines/pair")
+	}
+	if c.Store == nil {
+		return errors.New("moil: Config.Store is required; use NewMemoryStore for tests or NewFileStore for a small deployment")
+	}
+	if c.Logger == nil {
+		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	durations := []struct {
+		d   *time.Duration
+		def time.Duration
+	}{
+		{&c.PairingTTL, 10 * time.Minute},
+		{&c.PairingInterval, 2 * time.Second},
+		{&c.BidWindow, 2 * time.Second},
+		{&c.LeaseTTL, 30 * time.Second},
+		{&c.PingInterval, 20 * time.Second},
+		{&c.KeepFinished, time.Hour},
+	}
+	for _, d := range durations {
+		if *d.d < 0 {
+			return errors.New("moil: Config durations must not be negative")
+		}
+		if *d.d == 0 {
+			*d.d = d.def
+		}
+	}
+	if c.MaxPendingPairings <= 0 {
+		c.MaxPendingPairings = 1000
+	}
+	if c.MaxAttempts <= 0 {
+		c.MaxAttempts = 3
+	}
+	return nil
+}
+
+// A Server is the service side of moil: it pairs machines, keeps their
+// control channels, and schedules jobs onto them. Serve its Handler under
+// the service's moil base URL. Its methods are safe to call from any
+// goroutine.
+//
+// Machines persist in the Store; jobs live in memory (see Run).
+type Server struct {
+	cfg      Config
+	log      *slog.Logger
+	store    Store
+	pairings *pairings
+	handler  http.Handler
+
+	// Scheduler state is owned by one goroutine, which runs the
+	// functions sent on cmds in order.
+	cmds     chan func(*scheduler)
+	stop     chan struct{} // closed once the scheduler has shut down
+	loopDone chan struct{}
+
+	// baseCtx bounds connections that haven't said hello yet.
+	baseCtx    context.Context
+	cancelBase context.CancelFunc
+
+	connMu  sync.Mutex
+	closing bool
+	conns   sync.WaitGroup
+
+	reports     *queue[func(context.Context)]
+	reportsDone chan struct{}
+
+	closeOnce sync.Once
+}
+
+// NewServer starts a Server. Call Close to stop it.
+func NewServer(cfg Config) (*Server, error) {
+	if err := cfg.setDefaults(); err != nil {
+		return nil, err
+	}
+	s := &Server{
+		cfg:         cfg,
+		log:         cfg.Logger,
+		store:       cfg.Store,
+		pairings:    newPairings(),
+		cmds:        make(chan func(*scheduler)),
+		stop:        make(chan struct{}),
+		loopDone:    make(chan struct{}),
+		reports:     newQueue[func(context.Context)](),
+		reportsDone: make(chan struct{}),
+	}
+	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
+	s.handler = s.routes()
+	go s.loop(newScheduler(s))
+	go s.writeReports()
+	return s, nil
+}
+
+// Handler serves the moil endpoints (spec §3), with paths relative to the
+// service's moil base URL. Mount it with http.StripPrefix, e.g.
+//
+//	mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
+func (s *Server) Handler() http.Handler { return s.handler }
+
+// Close disconnects every machine and ends every unfinished Run with
+// ErrClosed. It waits for the Server's goroutines to finish.
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		s.connMu.Lock()
+		s.closing = true
+		s.connMu.Unlock()
+		s.cancelBase()
+		_ = s.call(func(sc *scheduler) { sc.shutdown() })
+		close(s.stop)
+		<-s.loopDone
+		s.conns.Wait()
+		s.reports.close()
+		<-s.reportsDone
+	})
+	return nil
+}
+
+func (s *Server) loop(sc *scheduler) {
+	defer close(s.loopDone)
+	for {
+		select {
+		case f := <-s.cmds:
+			f(sc)
+			sc.scheduleIfDirty()
+		case <-s.stop:
+			return
+		}
+	}
+}
+
+// post runs f on the scheduler goroutine without waiting for it. It
+// reports false if the Server is closed.
+func (s *Server) post(f func(*scheduler)) bool {
+	select {
+	case s.cmds <- f:
+		return true
+	case <-s.stop:
+		return false
+	}
+}
+
+// call runs f on the scheduler goroutine and waits until the scheduler has
+// acted on what f changed: when Submit returns, for example, the job's
+// offers are already queued.
+func (s *Server) call(f func(*scheduler)) error {
+	done := make(chan struct{})
+	if !s.post(func(sc *scheduler) {
+		defer close(done)
+		f(sc)
+		sc.scheduleIfDirty()
+	}) {
+		return ErrClosed
+	}
+	<-done
+	return nil
+}
+
+// saveReport persists what a machine reported, in the order the scheduler
+// saw the reports, without making the scheduler wait for the Store.
+func (s *Server) saveReport(id string, r MachineReport) {
+	s.reports.push(func(ctx context.Context) {
+		err := s.store.SaveReport(ctx, id, r)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			s.log.Error("moil: saving a machine's report", "machine", id, "err", err)
+		}
+	})
+}
+
+func (s *Server) writeReports() {
+	defer close(s.reportsDone)
+	for {
+		write, ok := s.reports.pop(nil)
+		if !ok {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		write(ctx)
+		cancel()
+	}
+}
+
+// AddBundle makes bundles available for jobs. Connected machines are told
+// at once, so their owners can review them; machines connecting later
+// learn of them in welcome. Adding a bundle twice does nothing.
+func (s *Server) AddBundle(bundles ...*Bundle) {
+	for _, b := range bundles {
+		if b == nil {
+			panic("moil: AddBundle(nil)")
+		}
+	}
+	_ = s.call(func(sc *scheduler) { sc.addBundles(bundles) })
+}
+
+// Bundles returns the bundles added so far, in the order they were added.
+func (s *Server) Bundles() []*Bundle {
+	var out []*Bundle
+	_ = s.call(func(sc *scheduler) { out = append(out, sc.bundles...) })
+	return out
+}
+
+// Machines returns the machines paired by owner, oldest first, with the
+// state of those that are connected.
+func (s *Server) Machines(ctx context.Context, owner string) ([]Machine, error) {
+	records, err := s.store.Machines(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Machine, len(records))
+	for i, r := range records {
+		out[i] = r.machine()
+	}
+	s.withLive(out)
+	return out, nil
+}
+
+// Machine returns one machine, or ErrNotFound. Before acting on a machine
+// for a user, check that it's theirs: moil doesn't know the service's
+// users.
+func (s *Server) Machine(ctx context.Context, id string) (Machine, error) {
+	r, err := s.store.Machine(ctx, id)
+	if err != nil {
+		return Machine{}, err
+	}
+	out := []Machine{r.machine()}
+	s.withLive(out)
+	return out[0], nil
+}
+
+// withLive overlays what connected machines reported since the Store last
+// saw them.
+func (s *Server) withLive(ms []Machine) {
+	_ = s.call(func(sc *scheduler) {
+		for i := range ms {
+			if lm := sc.machines[ms[i].ID]; lm != nil {
+				ms[i].MachineReport = lm.m.MachineReport.clone()
+				ms[i].State = lm.m.State
+			}
+		}
+	})
+}
+
+// RemoveMachine unpairs a machine: its token stops working, its control
+// channel closes with 4401, and an attempt it was running fails with
+// CodeLost, so its job can move on. It returns ErrNotFound for an unknown
+// machine.
+func (s *Server) RemoveMachine(ctx context.Context, id string) error {
+	if err := s.store.RemoveMachine(ctx, id); err != nil {
+		return err
+	}
+	s.log.Info("moil: machine removed", "machine", id)
+	_ = s.call(func(sc *scheduler) { sc.machineRemoved(id) })
+	return nil
+}
+
+// Submit queues a job and returns its Run. The job waits, without a time
+// limit, until a connected, idle, eligible machine that approved its bundle
+// bids for it.
+//
+// If a job with the same ID is already known, Submit returns its Run and
+// ignores job: the first submission's definition wins.
+func (s *Server) Submit(ctx context.Context, job Job) (*Run, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	j, err := s.newJob(job)
+	if err != nil {
+		return nil, err
+	}
+	var run *Run
+	var submitErr error
+	if err := s.call(func(sc *scheduler) { run, submitErr = sc.submit(j) }); err != nil {
+		return nil, err
+	}
+	return run, submitErr
+}
+
+// newJob checks a Job and converts it to the scheduler's form.
+func (s *Server) newJob(job Job) (*jobState, error) {
+	if job.Bundle == nil {
+		return nil, errors.New("moil: Job.Bundle is required")
+	}
+	if job.Eligible == nil {
+		return nil, errors.New("moil: Job.Eligible is required; use moil.OwnedBy(owner) or, if any machine owner may see the job's inputs, moil.AnyMachine")
+	}
+	if job.ID == "" {
+		job.ID = "j_" + randomID(16)
+	} else if !wire.IsJobID(job.ID) {
+		return nil, fmt.Errorf("moil: job ID %q must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", job.ID)
+	}
+	if wire.Chars(job.Title) > 200 {
+		return nil, errors.New("moil: Job.Title must be at most 200 characters")
+	}
+	if job.Timeout < 0 {
+		return nil, errors.New("moil: Job.Timeout must not be negative")
+	}
+	params, err := json.Marshal(job.Params)
+	if err != nil {
+		return nil, fmt.Errorf("moil: Job.Params: %w", err)
+	}
+	j := &jobState{
+		id:          job.ID,
+		bundle:      job.Bundle,
+		title:       job.Title,
+		params:      params,
+		inputs:      make(map[string]wire.Download, len(job.Inputs)),
+		outputs:     make(map[string]wire.Upload, len(job.Outputs)),
+		eligible:    job.Eligible,
+		prefer:      job.Prefer,
+		timeout:     job.Timeout,
+		maxAttempts: job.MaxAttempts,
+		skip:        map[string]uint64{},
+		failedOn:    map[string]bool{},
+	}
+	if j.maxAttempts <= 0 {
+		j.maxAttempts = s.cfg.MaxAttempts
+	}
+	for name, in := range job.Inputs {
+		if err := checkFile("input", name, in.URL); err != nil {
+			return nil, err
+		}
+		j.inputs[name] = wire.Download{URL: in.URL, Headers: in.Headers}
+	}
+	for name, out := range job.Outputs {
+		if err := checkFile("output", name, out.URL); err != nil {
+			return nil, err
+		}
+		method := out.Method
+		switch method {
+		case "":
+			method = http.MethodPut
+		case http.MethodPut, http.MethodPost:
+		default:
+			return nil, fmt.Errorf("moil: output %q: method must be PUT or POST, not %q", name, method)
+		}
+		j.outputs[name] = wire.Upload{URL: out.URL, Method: method, Headers: out.Headers}
+	}
+	// The assign message must fit in a control message (spec §10).
+	if data, err := wire.Encode(j.assign(1, s.cfg.LeaseTTL)); err != nil {
+		return nil, fmt.Errorf("moil: encoding the job: %w", err)
+	} else if len(data) > maxMessageBytes {
+		return nil, fmt.Errorf("moil: the job's params, inputs and outputs take %d bytes; a control message is limited to 1 MiB", len(data))
+	}
+	return j, nil
+}
+
+func checkFile(kind, name, rawURL string) error {
+	if !wire.IsFileName(name) {
+		return fmt.Errorf("moil: %s name %q must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", kind, name)
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return fmt.Errorf("moil: %s %q needs an absolute http or https URL", kind, name)
+	}
+	return nil
+}
+
+// Run returns the job with the given ID, if the Server knows it: it's
+// unfinished, or finished less than Config.KeepFinished ago.
+func (s *Server) Run(id string) (*Run, bool) {
+	var run *Run
+	_ = s.call(func(sc *scheduler) {
+		if j := sc.jobs[id]; j != nil {
+			run = j.run
+		}
+	})
+	return run, run != nil
+}
+
+// maxMessageBytes is the largest control message either side reads.
+const maxMessageBytes = 1 << 20
