@@ -14,11 +14,53 @@ use moil_proto::BundleInfo;
 
 use crate::backend::PairingCode;
 use crate::demo;
+use crate::icon;
 use crate::ipc::{PairMessage, ReviewMessage};
 use crate::page;
 use crate::pair::PairWindow;
 use crate::review::ReviewWindow;
 use crate::unpair::UnpairWindow;
+use crate::view::{Activity, IconState};
+
+/// The tray icon in every state, magnified and at menu-bar size, on light
+/// and dark bars.
+fn icons() -> String {
+    let mut cells = String::new();
+    for attention in [false, true] {
+        for activity in [Activity::Idle, Activity::Running, Activity::Paused] {
+            let image = icon::draw(
+                IconState {
+                    activity,
+                    attention,
+                },
+                icon::TRAY_SIZE,
+            );
+            let mut rects = String::new();
+            for y in 0..image.height {
+                for x in 0..image.width {
+                    let alpha = image.rgba[((y * image.width + x) * 4 + 3) as usize];
+                    if alpha > 0 {
+                        rects.push_str(&format!(
+                            r#"<rect x="{x}" y="{y}" width="1" height="1" fill-opacity="{:.3}"/>"#,
+                            f32::from(alpha) / 255.0
+                        ));
+                    }
+                }
+            }
+            for (bar, ink) in [("#f2f2f2", "#000"), ("#2b2b2b", "#fff")] {
+                cells.push_str(&format!(
+                    r#"<div style="background:{bar};padding:8px;display:inline-block;margin:4px">
+                    <svg width="144" height="144" viewBox="0 0 36 36" fill="{ink}" shape-rendering="crispEdges">{rects}</svg>
+                    <svg width="18" height="18" viewBox="0 0 36 36" fill="{ink}">{rects}</svg>
+                    <div style="font:11px system-ui;color:{ink}">{activity:?}{}</div></div>"#,
+                    if attention { " + attention" } else { "" }
+                ));
+            }
+        }
+        cells.push_str("<br>");
+    }
+    format!("<!DOCTYPE html><html><body style=\"margin:8px\">{cells}</body></html>")
+}
 
 fn klisi(approved: &[&Bundle]) -> PairedService {
     let now = SystemTime::now();
@@ -208,6 +250,7 @@ fn gallery() {
         insecure: false,
     };
     write("unpair", UnpairWindow::new(&status).render());
+    write("icons", icons());
     write(
         "notice",
         page::notice(

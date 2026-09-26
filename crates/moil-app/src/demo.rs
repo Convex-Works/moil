@@ -525,3 +525,138 @@ impl Backend for Demo {
         .boxed()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(demo: &Demo) -> Snapshot {
+        demo.subscribe().borrow().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn starts_with_an_update_to_review_and_a_service_offline() {
+        let demo = Demo::start();
+        let snapshot = snapshot(&demo);
+        let [klisi, lab] = &snapshot.services[..] else {
+            panic!("two services: {snapshot:?}");
+        };
+        assert_eq!(klisi.connection, Connection::Connected);
+        assert!(matches!(lab.connection, Connection::Disconnected { .. }));
+        let pending: Vec<_> = snapshot
+            .pending_reviews()
+            .map(|(s, b)| (s.name.as_str(), b.info.hash))
+            .collect();
+        assert_eq!(pending, [("klisi", transcribe_0_3().hash())]);
+
+        let review = demo
+            .review(klisi.id.clone(), transcribe_0_3().hash())
+            .await
+            .unwrap();
+        assert!(!review.approved);
+        assert_eq!(
+            review.previous.as_ref().map(Bundle::hash),
+            Some(transcribe_0_2().hash())
+        );
+        assert!(
+            review.diff().unwrap().iter().all(|d| !d.is_unchanged()),
+            "every file changed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jobs_go_through_every_phase() {
+        let demo = Demo::start();
+        let mut snapshots = demo.subscribe();
+        let (mut phases, mut fractions) = (Vec::new(), Vec::new());
+        loop {
+            snapshots.changed().await.unwrap();
+            let Some(job) = snapshots.borrow_and_update().job.clone() else {
+                if phases.is_empty() {
+                    continue;
+                }
+                break;
+            };
+            if phases.last() != Some(&job.phase) {
+                phases.push(job.phase);
+            }
+            fractions.extend(job.fraction.filter(|_| job.phase == Phase::Running));
+        }
+        assert_eq!(
+            phases,
+            [
+                Phase::Preparing,
+                Phase::Downloading,
+                Phase::Running,
+                Phase::Uploading
+            ]
+        );
+        assert!(fractions.is_sorted() && fractions.first() == Some(&0.0));
+        assert_eq!(fractions.last(), Some(&1.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_ends_the_job_and_pausing_holds_off_the_next() {
+        let demo = Demo::start();
+        let mut snapshots = demo.subscribe();
+        snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
+        demo.stop_job();
+        snapshots.wait_for(|s| s.job.is_none()).await.unwrap();
+
+        demo.set_paused(true);
+        sleep(Duration::from_secs(600)).await;
+        assert!(snapshot(&demo).job.is_none(), "no job while paused");
+
+        demo.set_paused(false);
+        snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pairing_shows_a_code_then_adds_the_service() {
+        let demo = Demo::start();
+        let pairing = demo.pair("notes.example.net/moil".into()).await.unwrap();
+        assert_eq!(pairing.code.user_code, "WDJB-MJHT");
+        assert_eq!(
+            pairing.code.verification_uri_complete,
+            "https://notes.example.net/machines/pair?code=WDJB-MJHT"
+        );
+        let service = pairing.confirmed.await.unwrap();
+        assert_eq!(service.name, "notes");
+        assert!(
+            snapshot(&demo)
+                .services
+                .iter()
+                .any(|s| s.id == service.id && s.connection == Connection::Connected)
+        );
+
+        let denied = demo.pair("https://deny.example.net/moil".into()).await;
+        assert!(matches!(
+            denied.unwrap().confirmed.await,
+            Err(Error::PairingDenied)
+        ));
+        assert!(matches!(
+            demo.pair("http://klisi.example.com/moil".into()).await,
+            Err(Error::InsecureUrl(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approving_the_update_settles_the_review() {
+        let demo = Demo::start();
+        let klisi = service_id("klisi.example.com");
+        let review = demo
+            .review(klisi.clone(), transcribe_0_3().hash())
+            .await
+            .unwrap();
+        demo.approve(review).await.unwrap();
+        assert_eq!(snapshot(&demo).pending_reviews().count(), 0);
+        let again = demo
+            .review(klisi.clone(), transcribe_0_3().hash())
+            .await
+            .unwrap();
+        assert!(again.approved);
+
+        demo.revoke(klisi, transcribe_0_3().hash()).await.unwrap();
+        assert_eq!(snapshot(&demo).pending_reviews().count(), 1);
+    }
+}
