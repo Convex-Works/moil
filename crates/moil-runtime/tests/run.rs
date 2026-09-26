@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use moil_proto::{ErrorCode, FileInfo, JobEvent, LogLevel, Outcome, Phase, UploadMethod};
-use moil_runtime::StopReason;
+use moil_runtime::{Executor, StopReason};
 use serde_json::json;
 
 #[tokio::test]
@@ -456,6 +456,69 @@ mod stopping {
         assert_eq!((error.exit_code, &error.stderr_tail), (None, &None));
         assert_eq!(run.phases().last(), Some(&Phase::Downloading));
         assert!(!work_dir.exists());
+    }
+
+    /// Stops `running` and waits for its outcome, failing if that takes
+    /// more than a few seconds.
+    async fn stop_promptly(running: Running, reason: StopReason) -> Run {
+        running.stop(reason);
+        tokio::time::timeout(Duration::from_secs(5), running.finish())
+            .await
+            .expect("the attempt didn't return promptly after being stopped")
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_uploading_ends_the_attempt_promptly() {
+        let h = Harness::new().await;
+        h.server.reply("/out/a.txt", Reply::Hang);
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"write": "a.txt", "text": "alpha"},
+                {"emit": {"type": "result", "files": ["a.txt"]}},
+            ])),
+        );
+        job.outputs.extend([output(&h.server, "a.txt")]);
+        let mut running = h.start(job);
+        running.phase(Phase::Uploading).await;
+        let run = stop_promptly(running, StopReason::Cancelled).await;
+        assert_eq!(run.outcome, Outcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_fetching_an_asset_ends_the_attempt_promptly() {
+        let h = Harness::new().await;
+        h.server.reply("/model.bin", Reply::Hang);
+        let bundle = probe_with_manifest(json!({
+            "moil": 1, "name": "probe", "version": "1",
+            "assets": {"model.bin": {"url": h.server.https_url("/model.bin"), "sha256": sha256(b"x")}},
+        }));
+        let mut running = h.start(h.job(&bundle, steps(json!([]))));
+        running.log("downloading asset model.bin").await;
+        let run = stop_promptly(running, StopReason::Interrupted).await;
+        assert_eq!(run.error().code, ErrorCode::Interrupted);
+        let assets_dir = &h.runtime.config().assets_dir;
+        assert!(is_empty_dir(assets_dir), "the partial download was removed");
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_another_preparation_holds_the_bundle_is_prompt() {
+        let h = Harness::new().await;
+        h.server.reply("/model.bin", Reply::Hang);
+        let bundle = probe_with_manifest(json!({
+            "moil": 1, "name": "probe", "version": "1",
+            "assets": {"model.bin": {"url": h.server.https_url("/model.bin"), "sha256": sha256(b"x")}},
+        }));
+        // The preparation that followed approval, stuck on a slow download.
+        let background = {
+            let (runtime, bundle) = (h.runtime.clone(), bundle.clone());
+            tokio::spawn(async move { runtime.prepare(&bundle).await })
+        };
+        let mut running = h.start(h.job(&bundle, steps(json!([]))));
+        running.phase(Phase::Preparing).await;
+        let run = stop_promptly(running, StopReason::Cancelled).await;
+        assert_eq!(run.outcome, Outcome::Cancelled);
+        background.abort();
     }
 
     #[tokio::test]

@@ -225,6 +225,39 @@ mod assets {
     }
 
     #[tokio::test]
+    async fn unusable_extra_roots_are_reported_up_front() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = moil_runtime::RuntimeConfig::new(uv(), home.path());
+        config.extra_root_certificates = vec!["-----BEGIN CERTIFICATE-----\nnope\n".into()];
+        let error = Runtime::try_new(config.clone()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("couldn't set up HTTPS: extra root certificate 1"),
+            "{error}"
+        );
+
+        config.extra_root_certificates = vec!["just some text".into()];
+        let error = Runtime::try_new(config.clone()).unwrap_err();
+        assert!(
+            error.to_string().contains("holds no PEM certificate"),
+            "{error}"
+        );
+
+        // Runtime::new accepts the config, and fails the attempts that need
+        // HTTPS instead.
+        let h = Harness::new().await;
+        let bundle = with_assets(&h, &[("model.bin", "/model.bin", "weights")]);
+        let error = Runtime::new(config).prepare(&bundle).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            error.message.contains("holds no PEM certificate"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
     async fn assets_need_a_certificate_the_machine_trusts() {
         let h = Harness::with(|c| c.extra_root_certificates.clear()).await;
         let bundle = with_assets(&h, &[("model.bin", "/model.bin", "weights")]);
@@ -302,6 +335,40 @@ mod assets {
 
 mod environment {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn preparing_and_running_a_fresh_bundle_can_overlap() {
+        // As when an assignment arrives while the preparation that started
+        // with the owner's approval is still going, on other threads.
+        let h = Harness::new().await;
+        h.server.serve("/model.bin", "weights");
+        let idna = bundle("idna");
+        let manifest = json!({
+            "moil": 1, "name": "idna", "version": "1",
+            "assets": {"model.bin": {"url": h.server.https_url("/model.bin"), "sha256": sha256(b"weights")}},
+        });
+        let bundle = Bundle::new(idna.script(), idna.lockfile(), manifest.to_string()).unwrap();
+        let prepare = || {
+            let (runtime, bundle) = (h.runtime.clone(), bundle.clone());
+            tokio::spawn(async move { runtime.prepare(&bundle).await })
+        };
+        let (first, second) = (prepare(), prepare());
+        let run = h
+            .run(h.job(&bundle, json!({"name": "bücher.example"})))
+            .await;
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(
+            run.result().meta,
+            Some(json!({"encoded": "xn--bcher-kva.example"}))
+        );
+        assert_eq!(h.server.received("/model.bin").len(), 1);
+        assert_eq!(
+            h.runtime.config().bundles.get(&bundle.hash()).unwrap(),
+            Some(bundle)
+        );
+    }
 
     #[tokio::test]
     async fn dependencies_are_installed_from_the_lockfile() {

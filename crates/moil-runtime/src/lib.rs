@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use moil_bundle::{Bundle, BundleStore};
+use moil_bundle::{Bundle, BundleHash, BundleStore};
 use moil_proto::control::Assign;
 use moil_proto::job::{Download, Upload};
 use moil_proto::{ErrorCode, FileName, JobError, JobEvent, JobId, Outcome};
@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, watch};
 mod assets;
 mod attempt;
 mod http;
+mod locks;
 mod orphans;
 mod outcome;
 mod process;
@@ -58,10 +59,18 @@ pub trait Executor: Send + Sync + 'static {
 pub struct Job {
     pub id: JobId,
     pub attempt: u32,
+    /// The approved bundle. The attempt runs the copy in
+    /// [`RuntimeConfig::bundles`], storing it there first if needed.
     pub bundle: Bundle,
+    /// Handed to the script untouched.
     pub params: serde_json::Value,
+    /// Downloaded into `in/` before the script starts.
     pub inputs: BTreeMap<FileName, Download>,
+    /// The outputs the script may produce; those its result names are
+    /// uploaded from `out/` after it succeeds.
     pub outputs: BTreeMap<FileName, Upload>,
+    /// The attempt's time limit, counted from when [`Executor::run`] starts
+    /// until the outcome is known: preparation and transfers count too.
     pub timeout: Option<Duration>,
 }
 
@@ -204,6 +213,9 @@ pub struct Runtime {
     /// that needs it.
     http: Result<http::Http, ConfigError>,
     assets: assets::AssetCache,
+    /// Held while a bundle is stored and its environment synced, by hash:
+    /// preparing it after approval and for an attempt may overlap.
+    preparing: locks::KeyedLocks<BundleHash>,
 }
 
 impl Runtime {
@@ -215,6 +227,7 @@ impl Runtime {
         Self {
             assets: assets::AssetCache::new(config.assets_dir.clone()),
             http,
+            preparing: locks::KeyedLocks::default(),
             config,
         }
     }
@@ -268,6 +281,7 @@ impl Runtime {
         bundle: &Bundle,
         events: Option<&EventSink>,
     ) -> Result<PathBuf, JobError> {
+        let _preparing = self.preparing.lock(&bundle.hash()).await;
         let dir = self.config.bundles.put(bundle).map_err(|e| {
             JobError::new(
                 ErrorCode::Internal,

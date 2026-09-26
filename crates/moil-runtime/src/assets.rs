@@ -1,16 +1,16 @@
 //! The asset cache (spec §8.1, §8.4): files named by their SHA-256,
 //! downloaded once, verified, and shared by every bundle.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use moil_bundle::{Asset, Manifest};
 use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel};
 
 use crate::EventSink;
 use crate::http::{DownloadError, Http};
+use crate::locks::KeyedLocks;
 
 /// A directory of verified assets, each named by its SHA-256.
 ///
@@ -20,17 +20,16 @@ use crate::http::{DownloadError, Http};
 #[derive(Debug)]
 pub(crate) struct AssetCache {
     dir: PathBuf,
-    /// One lock per hash being fetched, so concurrent attempts in this
-    /// process download each asset once. Entries are never removed; there
-    /// are only as many as the distinct assets this process has fetched.
-    fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while an asset is fetched, by hash, so concurrent attempts in
+    /// this process download each asset once.
+    fetching: KeyedLocks<String>,
 }
 
 impl AssetCache {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
-            fetching: Mutex::default(),
+            fetching: KeyedLocks::default(),
         }
     }
 
@@ -52,14 +51,7 @@ impl AssetCache {
         if is_cached(&path, asset) {
             return Ok(());
         }
-        let lock = self
-            .fetching
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(asset.sha256.clone())
-            .or_default()
-            .clone();
-        let _fetching = lock.lock().await;
+        let _fetching = self.fetching.lock(&asset.sha256).await;
         if is_cached(&path, asset) {
             return Ok(());
         }
