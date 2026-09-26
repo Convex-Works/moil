@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -252,5 +254,151 @@ func TestEventStreamReplaysAndNeverBlocksTheServer(t *testing.T) {
 	}
 	if got != 1 {
 		t.Fatalf("got %d events from a queued job, want its queued event", got)
+	}
+}
+
+// Prepare makes fresh files for every attempt, as the attempt is
+// assigned, so pre-signed URLs don't expire while a job waits or between
+// attempts.
+func TestPrepareMakesFilesPerAttempt(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	storage := newFileServer(t, map[string][]byte{"/in": []byte("audio")})
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	var calls []moil.Assignment
+	run := submit(t, srv, moil.Job{
+		Bundle:   bundle,
+		Eligible: moil.OwnedBy("alice"),
+		Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+			calls = append(calls, a) // one attempt at a time: no lock needed
+			sig := fmt.Sprintf("?sig=%d", a.Attempt)
+			return map[string]moil.Download{"in.ogg": {URL: storage.URL + "/in" + sig}},
+				map[string]moil.Upload{"out.txt": {URL: storage.URL + "/out" + sig}}, nil
+		},
+	})
+	first := m.NextAttempt()
+	if first.Inputs["in.ogg"].URL != storage.URL+"/in?sig=1" || first.Outputs["out.txt"].URL != storage.URL+"/out?sig=1" {
+		t.Fatalf("attempt 1 files %+v %+v", first.Inputs, first.Outputs)
+	}
+	first.Fail(moil.CodeOutputUpload, "the URL expired")
+	second := m.NextAttempt()
+	if second.Outputs["out.txt"].URL != storage.URL+"/out?sig=2" || second.Outputs["out.txt"].Method != "PUT" {
+		t.Fatalf("attempt 2 files %+v", second.Outputs)
+	}
+	second.Output("out.txt", second.Input("in.ogg"))
+	second.Succeed(nil)
+	succeeded(t, run)
+	if len(calls) != 2 || calls[0].JobID != run.ID() || calls[1].Attempt != 2 || calls[1].Machine.ID != m.ID() || calls[1].Machine.Owner != "alice" {
+		t.Fatalf("Prepare calls %+v", calls)
+	}
+}
+
+func TestPrepareErrorsEndTheJob(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	errNoCredentials := errors.New("no S3 credentials")
+	for _, prepare := range []func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error){
+		func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+			return nil, nil, errNoCredentials
+		},
+		func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+			return map[string]moil.Download{"../x": {URL: "https://e.com"}}, nil, nil
+		},
+		func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+			panic("bug")
+		},
+	} {
+		run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: prepare})
+		if _, err := wait(t, run); err == nil || run.State() != moil.Failed {
+			t.Fatalf("err %v, state %s", err, run.State())
+		}
+	}
+	m.Sync()
+	for _, o := range m.Offers() {
+		if o.Answer != moiltest.Bid {
+			t.Fatalf("offers %+v", m.Offers())
+		}
+	}
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		return nil, nil, errNoCredentials
+	}})
+	if _, err := wait(t, run); !errors.Is(err, errNoCredentials) {
+		t.Fatalf("Wait = %v, want the error from Prepare", err)
+	}
+	if _, err := srv.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine,
+		Inputs: map[string]moil.Download{"a": {URL: "https://e.com"}},
+		Prepare: func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+			return nil, nil, nil
+		},
+	}); err == nil {
+		t.Fatal("a job with both Inputs and Prepare was accepted")
+	}
+}
+
+// While Prepare runs, the machine is held for the job; if the job is
+// cancelled, Prepare's context ends, and if the machine leaves, the job is
+// offered again.
+func TestPrepareIsInterruptible(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+
+	started, stopped := make(chan struct{}), make(chan struct{})
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+		return nil, nil, ctx.Err()
+	}})
+	<-started
+	other := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	m.Sync()
+	if n := len(m.Offers()); n != 1 {
+		t.Fatalf("a held machine was offered another job: %d offers", n)
+	}
+	run.Cancel()
+	if _, err := wait(t, run); !errors.Is(err, moil.ErrCancelled) {
+		t.Fatalf("err %v", err)
+	}
+	<-stopped
+	m.NextAttempt().Succeed(nil) // the machine is free again
+	succeeded(t, other)
+
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	moved := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		if a.Machine.ID == m.ID() {
+			<-release
+		}
+		return nil, nil, nil
+	}})
+	m.NextOffer()
+	m.NextOffer()
+	if o := m.NextOffer(); o.JobID != moved.ID() || o.Answer != moiltest.Bid {
+		t.Fatalf("offer %+v", o)
+	}
+	m.Disconnect()
+	eventually(t, "the machine to go offline", func() bool { return !machine(t, srv, m.ID()).Online() })
+	close(release)
+	replacement := moiltest.Pair(t, srv, "alice")
+	replacement.Approve(bundle)
+	replacement.Connect()
+	a := replacement.NextAttempt()
+	a.Succeed(nil)
+	if res := succeeded(t, moved); res.Machine != replacement.ID() || res.Attempt != 2 {
+		t.Fatalf("result from %s attempt %d", res.Machine, res.Attempt)
 	}
 }

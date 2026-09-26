@@ -1,6 +1,7 @@
 package moil
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,9 +32,10 @@ type scheduler struct {
 	machines map[string]*liveMachine // connected machines by ID
 	removed  map[string]bool         // machines removed while this Server ran
 
-	jobs    map[string]*jobState // known jobs by ID, finished ones included
-	queue   []*jobState          // unfinished jobs, in submission order
-	running map[string]*jobState // machine ID → the job whose current attempt it holds
+	jobs      map[string]*jobState // known jobs by ID, finished ones included
+	queue     []*jobState          // unfinished jobs, in submission order
+	running   map[string]*jobState // machine ID → the job whose current attempt it holds
+	preparing map[string]*jobState // machine ID → the job whose next attempt Job.Prepare is making for it
 }
 
 // A liveMachine is a machine with an open control channel.
@@ -53,9 +55,10 @@ type liveMachine struct {
 type jobPhase int
 
 const (
-	phaseQueued   jobPhase = iota // waiting for a machine
-	phaseOffering                 // offers are out
-	phaseRunning                  // an attempt is assigned
+	phaseQueued    jobPhase = iota // waiting for a machine
+	phaseOffering                  // offers are out
+	phasePreparing                 // Job.Prepare is making the next attempt's files
+	phaseRunning                   // an attempt is assigned
 	phaseDone
 )
 
@@ -70,6 +73,7 @@ type jobState struct {
 	outputs     map[string]wire.Upload
 	eligible    func(Machine) bool
 	prefer      func(Machine) int
+	prepare     func(context.Context, Assignment) (map[string]Download, map[string]Upload, error)
 	timeout     time.Duration
 	maxAttempts int
 
@@ -77,6 +81,7 @@ type jobState struct {
 	attempts int // attempts assigned so far
 	counted  int // attempts that count toward maxAttempts
 	round    *offerRound
+	prep     *preparation
 	cur      *attemptState
 	// cancelled says the service asked to cancel the job.
 	cancelled bool
@@ -95,6 +100,14 @@ type offerRound struct {
 	pending  int
 	bids     []string // machines that bid, in order
 	timer    *time.Timer
+}
+
+// A preparation is Job.Prepare making an attempt's files, while the
+// machine that won the attempt is held for it.
+type preparation struct {
+	n       int
+	machine string
+	cancel  context.CancelFunc
 }
 
 type attemptState struct {
@@ -116,6 +129,7 @@ func newScheduler(s *Server) *scheduler {
 		removed:      map[string]bool{},
 		jobs:         map[string]*jobState{},
 		running:      map[string]*jobState{},
+		preparing:    map[string]*jobState{},
 	}
 }
 
@@ -392,6 +406,7 @@ func (sc *scheduler) schedule() {
 func (sc *scheduler) canTake(j *jobState, lm *liveMachine) bool {
 	return lm.m.State == Idle &&
 		sc.running[lm.m.ID] == nil &&
+		sc.preparing[lm.m.ID] == nil &&
 		lm.approved[j.bundle.Hash()] &&
 		sc.isEligible(j, lm.m)
 }
@@ -467,8 +482,7 @@ func (sc *scheduler) decide(j *jobState) {
 	if len(bidders) == 0 {
 		return
 	}
-	winner := sc.pick(j, bidders)
-	sc.assign(j, sc.machines[winner])
+	sc.start(j, sc.machines[sc.pick(j, bidders)])
 }
 
 // closeRound ends a job's offer round, releasing the machines it holds.
@@ -522,29 +536,94 @@ func pick(bidders []Machine, failedOn map[string]bool, score func(Machine) int) 
 	return bidders[best].ID
 }
 
-func (sc *scheduler) assign(j *jobState, lm *liveMachine) {
+// start begins the job's next attempt on a machine: at once, or once
+// Job.Prepare has made the attempt's files.
+func (sc *scheduler) start(j *jobState, lm *liveMachine) {
 	j.attempts++
-	a := &attemptState{n: j.attempts, machine: lm.m.ID}
+	if j.prepare == nil {
+		sc.assign(j, lm, j.attempts, j.inputs, j.outputs)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &preparation{n: j.attempts, machine: lm.m.ID, cancel: cancel}
+	j.prep, j.phase = p, phasePreparing
+	sc.preparing[p.machine] = j
+	a := Assignment{JobID: j.id, Attempt: p.n, Machine: lm.m}
+	a.Machine.MachineReport = a.Machine.MachineReport.clone()
+	go func() {
+		inputs, outputs, err := callPrepare(ctx, j.prepare, a)
+		sc.s.post(func(sc *scheduler) { sc.prepared(j, p, inputs, outputs, err) })
+	}()
+}
+
+func callPrepare(ctx context.Context, prepare func(context.Context, Assignment) (map[string]Download, map[string]Upload, error), a Assignment) (inputs map[string]Download, outputs map[string]Upload, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("Job.Prepare panicked: %v", p)
+		}
+	}()
+	return prepare(ctx, a)
+}
+
+// prepared assigns an attempt whose files Job.Prepare made, if its
+// machine can still take it.
+func (sc *scheduler) prepared(j *jobState, p *preparation, inputs map[string]Download, outputs map[string]Upload, err error) {
+	if j.prep != p {
+		return // the job ended meanwhile
+	}
+	sc.endPreparation(j)
+	var ins map[string]wire.Download
+	var outs map[string]wire.Upload
+	if err == nil {
+		ins, outs, err = wireFiles(inputs, outputs)
+	}
+	if err == nil {
+		err = checkSize(j.assign(p.n, sc.cfg.LeaseTTL, ins, outs))
+	}
+	if err != nil {
+		sc.finish(j, Failed, nil, fmt.Errorf("moil: preparing attempt %d of job %s: %w", p.n, j.id, err))
+		return
+	}
+	lm := sc.machines[p.machine]
+	if lm == nil || !sc.canTake(j, lm) {
+		return // the machine left or changed meanwhile; offer the job again
+	}
+	sc.assign(j, lm, p.n, ins, outs)
+}
+
+func (sc *scheduler) endPreparation(j *jobState) {
+	p := j.prep
+	j.prep = nil
+	j.phase = phaseQueued
+	p.cancel()
+	if sc.preparing[p.machine] == j {
+		delete(sc.preparing, p.machine)
+	}
+	sc.dirty = true
+}
+
+func (sc *scheduler) assign(j *jobState, lm *liveMachine, n int, inputs map[string]wire.Download, outputs map[string]wire.Upload) {
+	a := &attemptState{n: n, machine: lm.m.ID}
 	j.cur = a
 	j.phase = phaseRunning
 	sc.running[lm.m.ID] = j
 	sc.renew(a)
 	a.timer = time.AfterFunc(sc.cfg.LeaseTTL, func() { sc.s.post(func(sc *scheduler) { sc.checkLease(j, a) }) })
-	lm.sess.send(j.assign(a.n, sc.cfg.LeaseTTL))
+	lm.sess.send(j.assign(a.n, sc.cfg.LeaseTTL, inputs, outputs))
 	j.run.setState(Running)
 	j.run.emit(Event{Kind: EventAssigned, Time: time.Now(), Attempt: a.n, Machine: a.machine})
 	sc.log.Info("moil: attempt assigned", "job", j.id, "attempt", a.n, "machine", a.machine)
 }
 
-func (j *jobState) assign(n int, lease time.Duration) wire.Assign {
+func (j *jobState) assign(n int, lease time.Duration, inputs map[string]wire.Download, outputs map[string]wire.Upload) wire.Assign {
 	return wire.Assign{
 		JobID:      j.id,
 		Attempt:    n,
 		BundleHash: j.bundle.Hash(),
 		Title:      j.title,
 		Params:     j.params,
-		Inputs:     j.inputs,
-		Outputs:    j.outputs,
+		Inputs:     inputs,
+		Outputs:    outputs,
 		LeaseMS:    max(1, lease.Milliseconds()),
 		TimeoutMS:  j.timeout.Milliseconds(),
 	}
@@ -657,6 +736,9 @@ func (sc *scheduler) cancel(j *jobState) {
 func (sc *scheduler) finish(j *jobState, state RunState, res *Result, err error) {
 	if j.round != nil {
 		sc.closeRound(j)
+	}
+	if j.prep != nil {
+		sc.endPreparation(j)
 	}
 	if j.cur != nil {
 		sc.endAttempt(j)

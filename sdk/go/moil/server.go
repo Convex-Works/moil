@@ -359,6 +359,9 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 	if job.Timeout < 0 {
 		return nil, errors.New("moil: Job.Timeout must not be negative")
 	}
+	if job.Prepare != nil && (len(job.Inputs) > 0 || len(job.Outputs) > 0) {
+		return nil, errors.New("moil: set Job.Inputs and Job.Outputs, or Job.Prepare, not both")
+	}
 	params, err := json.Marshal(job.Params)
 	if err != nil {
 		return nil, fmt.Errorf("moil: Job.Params: %w", err)
@@ -368,10 +371,9 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 		bundle:      job.Bundle,
 		title:       job.Title,
 		params:      params,
-		inputs:      make(map[string]wire.Download, len(job.Inputs)),
-		outputs:     make(map[string]wire.Upload, len(job.Outputs)),
 		eligible:    job.Eligible,
 		prefer:      job.Prefer,
+		prepare:     job.Prepare,
 		timeout:     job.Timeout,
 		maxAttempts: job.MaxAttempts,
 		skip:        map[string]uint64{},
@@ -380,15 +382,29 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 	if j.maxAttempts <= 0 {
 		j.maxAttempts = s.cfg.MaxAttempts
 	}
-	for name, in := range job.Inputs {
-		if err := checkFile("input", name, in.URL); err != nil {
-			return nil, err
-		}
-		j.inputs[name] = wire.Download{URL: in.URL, Headers: in.Headers}
+	if j.inputs, j.outputs, err = wireFiles(job.Inputs, job.Outputs); err != nil {
+		return nil, err
 	}
-	for name, out := range job.Outputs {
+	if err := checkSize(j.assign(1, s.cfg.LeaseTTL, j.inputs, j.outputs)); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+// wireFiles checks a job's inputs and outputs and converts them for
+// assign.
+func wireFiles(inputs map[string]Download, outputs map[string]Upload) (map[string]wire.Download, map[string]wire.Upload, error) {
+	ins := make(map[string]wire.Download, len(inputs))
+	outs := make(map[string]wire.Upload, len(outputs))
+	for name, in := range inputs {
+		if err := checkFile("input", name, in.URL); err != nil {
+			return nil, nil, err
+		}
+		ins[name] = wire.Download{URL: in.URL, Headers: in.Headers}
+	}
+	for name, out := range outputs {
 		if err := checkFile("output", name, out.URL); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		method := out.Method
 		switch method {
@@ -396,17 +412,11 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 			method = http.MethodPut
 		case http.MethodPut, http.MethodPost:
 		default:
-			return nil, fmt.Errorf("moil: output %q: method must be PUT or POST, not %q", name, method)
+			return nil, nil, fmt.Errorf("moil: output %q: method must be PUT or POST, not %q", name, method)
 		}
-		j.outputs[name] = wire.Upload{URL: out.URL, Method: method, Headers: out.Headers}
+		outs[name] = wire.Upload{URL: out.URL, Method: method, Headers: out.Headers}
 	}
-	// The assign message must fit in a control message (spec §10).
-	if data, err := wire.Encode(j.assign(1, s.cfg.LeaseTTL)); err != nil {
-		return nil, fmt.Errorf("moil: encoding the job: %w", err)
-	} else if len(data) > maxMessageBytes {
-		return nil, fmt.Errorf("moil: the job's params, inputs and outputs take %d bytes; a control message is limited to 1 MiB", len(data))
-	}
-	return j, nil
+	return ins, outs, nil
 }
 
 func checkFile(kind, name, rawURL string) error {
@@ -416,6 +426,19 @@ func checkFile(kind, name, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return fmt.Errorf("moil: %s %q needs an absolute http or https URL", kind, name)
+	}
+	return nil
+}
+
+// checkSize makes sure an assign message fits in a control message (spec
+// §10).
+func checkSize(msg wire.Assign) error {
+	data, err := wire.Encode(msg)
+	if err != nil {
+		return fmt.Errorf("moil: encoding the job: %w", err)
+	}
+	if len(data) > maxMessageBytes {
+		return fmt.Errorf("moil: the job's params, inputs and outputs take %d bytes; a control message is limited to 1 MiB", len(data))
 	}
 	return nil
 }

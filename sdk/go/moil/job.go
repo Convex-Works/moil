@@ -33,6 +33,13 @@ type Job struct {
 	// Outputs are the files the script may produce and where the runtime
 	// uploads them, by file name.
 	Outputs map[string]Upload
+	// Prepare, if set, makes each attempt's inputs and outputs as the
+	// attempt is assigned, instead of Inputs and Outputs. Use it for
+	// pre-signed URLs, which could expire while the job waits for a
+	// machine or between attempts. It runs on its own goroutine before the
+	// machine hears of the attempt; ctx ends if the job does. An error
+	// ends the job, and Run.Wait returns it.
+	Prepare func(ctx context.Context, a Assignment) (inputs map[string]Download, outputs map[string]Upload, err error)
 	// Eligible is the service's policy for which machines may run the
 	// job, for example OwnedBy(room.OwnerID). It is required: machine
 	// owners can see a job's inputs, and only the service knows who may.
@@ -52,6 +59,13 @@ type Job struct {
 	Timeout time.Duration
 	// MaxAttempts overrides Config.MaxAttempts for this job when positive.
 	MaxAttempts int
+}
+
+// An Assignment is an attempt about to be sent to a machine.
+type Assignment struct {
+	JobID   string
+	Attempt int
+	Machine Machine
 }
 
 // A Download is where the runtime fetches an input from, with GET. URLs are
@@ -278,8 +292,9 @@ func (r *Run) Events(ctx context.Context) iter.Seq[Event] {
 func (r *Run) Done() <-chan struct{} { return r.done }
 
 // Wait blocks until the run ends or ctx is done. A succeeded job returns
-// its Result. A failed one returns a *JobError, a cancelled one
-// ErrCancelled, and one the Server gave up on when closing ErrClosed.
+// its Result. A failed one returns a *JobError, or the error from
+// Job.Prepare; a cancelled one ErrCancelled, and one the Server gave up on
+// when closing ErrClosed.
 func (r *Run) Wait(ctx context.Context) (*Result, error) {
 	select {
 	case <-r.done:
