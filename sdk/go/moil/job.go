@@ -138,6 +138,7 @@ type JobError struct {
 	Attempt int
 }
 
+// Error describes the failure with the attempt and machine it happened on.
 func (e *JobError) Error() string {
 	return fmt.Sprintf("moil: attempt %d on machine %s failed: %s: %s", e.Attempt, e.Machine, e.Code, e.Message)
 }

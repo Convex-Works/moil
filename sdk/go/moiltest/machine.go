@@ -238,6 +238,7 @@ type PairingError struct {
 	Code string
 }
 
+// Error names the RFC 8628 error code.
 func (e *PairingError) Error() string { return "moiltest: pairing: " + e.Code }
 
 // FinishPairing polls for the token once (POST /v1/pair/token) and fails
