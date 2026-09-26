@@ -322,3 +322,33 @@ func TestCloseEndsRunsAndConnections(t *testing.T) {
 		t.Errorf("Submit after Close: %v", err)
 	}
 }
+
+// Control messages are limited to 1 MiB (spec §10); a machine that sends
+// a bigger one is disconnected rather than buffered.
+func TestOversizedMessagesAreRefused(t *testing.T) {
+	srv := newServer(t)
+	m := moiltest.Pair(t, srv, "alice")
+	m.Connect()
+	m.Send(map[string]any{"type": "telemetry", "blob": strings.Repeat("x", 1<<20)})
+	if code := m.WaitClosed(); code != int(websocket.StatusMessageTooBig) {
+		t.Fatalf("closed with %d, want %d", code, websocket.StatusMessageTooBig)
+	}
+}
+
+// A connection that never says hello doesn't stay open.
+func TestSilentConnectionsAreClosed(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.PingInterval = 50 * time.Millisecond })
+	m := moiltest.Pair(t, srv, "alice")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, moiltest.Serve(t, srv)+"/v1/connect", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + m.Token()}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	if _, _, err := conn.Read(ctx); ctx.Err() != nil {
+		t.Fatalf("the connection stayed open without a hello: %v", err)
+	}
+}
