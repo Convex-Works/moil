@@ -14,6 +14,8 @@ is an object with one of these keys:
   {"junk": "text"}                     a line on stdout that isn't JSON
   {"stderr": "text"}                   a line on stderr
   {"copy": "input", "to": "output"}    copy an input file to an output
+  {"reveal": true}                     send what the script can see: its
+                                       environment and the job context
   {"spawn": true}                      start a grandchild that ignores
                                        SIGTERM, then send the pids of uv,
                                        the script and the grandchild
@@ -60,6 +62,8 @@ def step(action, job):
             data = f.read()
         with open(os.path.join(job["output_dir"], action["to"]), "wb") as f:
             f.write(data)
+    elif "reveal" in action:
+        emit("data", payload={"environ": dict(os.environ), "context": job})
     elif "spawn" in action:
         stubborn = (
             "import signal, time\n"

@@ -25,6 +25,7 @@ what must hold afterwards:
 | `TestAJobRunsOnAPairedMachine` | Pair, approve, run: phases, progress and data arrive in order and intact, the input comes down and the output goes up with the headers the job gave, and the result describes the uploaded bytes |
 | `TestMachinesRunOnlyWhatTheirOwnerApproved` | A job for an unapproved bundle never reaches the machine; the owner follows the agent's hint, approves, and the job runs |
 | `TestTamperedBundlesAreRefused` | A bundle altered on its way is refused by `moil review` and `moil approve`, and never runs |
+| `TestScriptsSeeOnlyTheirJob` | The script sees its files, but not the machine's token, the service's URLs or the agent's settings |
 | `TestFailuresReachTheService` | Script errors (retried up to the limit, or not), exiting without a result, a nonzero exit, the time limit |
 | `TestCancellingAJobStopsEverythingItStarted` | Cancel ends the script and a grandchild that ignores SIGTERM |
 | `TestAJobSurvivesItsMachineCrashing` | SIGKILL the agent: the lease runs out, the next agent kills the orphans, the job completes on attempt 2 |
@@ -49,8 +50,8 @@ outlived the agent that ran it.
   proxy that can be cut and remembers what the service said.
 - `probe_test.go` and `testdata/bundles/probe`: the bundle the tests run.
   Its params list steps (progress, data, junk output, copying an input to
-  an output, spawning a SIGTERM-proof grandchild, waiting for a file,
-  failing, exiting…), which tests spell out with `do`:
+  an output, revealing what it sees, spawning a SIGTERM-proof grandchild,
+  waiting for a file, failing, exiting…), which tests spell out with `do`:
   `probe(do.Spawn(), do.WaitFor(gate))`.
 
 Tests wait for conditions with deadlines, never for fixed times, except

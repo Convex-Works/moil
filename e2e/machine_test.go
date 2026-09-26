@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -189,6 +193,20 @@ func (m *machine) ApproveHash(hash string) {
 	if !strings.Contains(out, "Approved: "+hash) {
 		m.t.Fatalf("moil approve didn't approve %s:\n%s", hash, out)
 	}
+}
+
+// tokens returns the machine tokens the machine keeps.
+func (m *machine) tokens() []string {
+	m.t.Helper()
+	data, err := os.ReadFile(filepath.Join(m.home, "secrets.json"))
+	if err != nil {
+		m.t.Fatalf("reading the machine's tokens: %v", err)
+	}
+	var secrets map[string]string
+	if err := json.Unmarshal(data, &secrets); err != nil || len(secrets) == 0 {
+		m.t.Fatalf("the machine keeps no tokens: %v, %s", err, data)
+	}
+	return slices.Collect(maps.Values(secrets))
 }
 
 // Start runs `moil agent` and waits until it's connected to the service.

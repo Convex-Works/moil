@@ -73,6 +73,10 @@ func (actions) Stderr(line string) step { return step{"stderr": line} }
 // Copy copies an input file to an output file.
 func (actions) Copy(input, output string) step { return step{"copy": input, "to": output} }
 
+// Reveal sends what the script can see: its environment and the job
+// context (see awaitRevealed).
+func (actions) Reveal() step { return step{"reveal": true} }
+
 // Spawn starts a grandchild that ignores SIGTERM, and sends the pids of
 // the processes running the attempt (see awaitPids).
 func (actions) Spawn() step { return step{"spawn": true} }

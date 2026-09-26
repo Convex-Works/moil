@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -126,6 +127,48 @@ func TestTamperedBundlesAreRefused(t *testing.T) {
 	succeed(t, svc.Submit(moil.Job{Bundle: echo, Params: map[string]any{"text": "hi"}}))
 	if m.link.Heard(waiting.ID()) || waiting.State() != moil.Queued {
 		t.Fatalf("a job for the tampered bundle reached the machine; it is %s", waiting.State())
+	}
+}
+
+// A script sees its job and nothing of what brought it there: not the
+// machine's token, not the service's address or the URLs of its files,
+// not the credentials those need, and none of the agent's settings.
+func TestScriptsSeeOnlyTheirJob(t *testing.T) {
+	t.Parallel()
+	svc, m := lentMachine(t)
+	audio := svc.Serve([]byte("hello"))
+	transcript := svc.Receive()
+	run := svc.Submit(moil.Job{
+		Params:  probe(do.Reveal(), do.Result(nil)),
+		Inputs:  map[string]moil.Download{"audio.ogg": audio},
+		Outputs: map[string]moil.Upload{"transcript.json": transcript.Upload},
+	})
+	var seen struct {
+		Environ map[string]string `json:"environ"`
+		Context struct {
+			Inputs  map[string]string `json:"inputs"`
+			Outputs []string          `json:"outputs"`
+		} `json:"context"`
+	}
+	revealed := awaitEvent(t, run, "the script to reveal what it sees", func(ev moil.Event) bool {
+		return ev.Kind == moil.EventData && json.Unmarshal(ev.Data, &seen) == nil && seen.Environ != nil
+	})
+	succeed(t, run)
+
+	secrets := append(m.tokens(), svc.url, m.link.URL(), "/moil/v1", audio.URL, audio.Headers["Authorization"], transcript.URL)
+	for _, secret := range secrets {
+		if strings.Contains(string(revealed.Data), secret) {
+			t.Errorf("the script can see %q", secret)
+		}
+	}
+	for name := range seen.Environ {
+		if strings.HasPrefix(name, "MOIL_") {
+			t.Errorf("the script's environment has the agent's setting %s", name)
+		}
+	}
+	// It does see its own files.
+	if path := seen.Context.Inputs["audio.ogg"]; !strings.HasPrefix(path, "/") || !slices.Equal(seen.Context.Outputs, []string{"transcript.json"}) {
+		t.Errorf("the script sees the inputs %v and the outputs %v", seen.Context.Inputs, seen.Context.Outputs)
 	}
 }
 
