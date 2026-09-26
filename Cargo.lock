@@ -1079,12 +1079,18 @@ name = "moil-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "futures",
  "moil-agent",
  "moil-bundle",
  "moil-proto",
  "moil-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -17,8 +17,14 @@ moil-bundle.workspace = true
 moil-runtime.workspace = true
 moil-agent.workspace = true
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 
 [lints]
 workspace = true
