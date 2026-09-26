@@ -474,3 +474,369 @@ mod stopping {
         assert_eq!(h.run(job).await.error().code, ErrorCode::Timeout);
     }
 }
+
+mod stdout {
+    use super::*;
+
+    #[tokio::test]
+    async fn stray_output_becomes_logs_and_bad_events_become_warnings() {
+        let h = Harness::new().await;
+        let long = "x".repeat(5000);
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"print": "hello there"},
+                    {"print": "[1, 2]"},
+                    {"print": long},
+                    {"raw": [0xff, 0xfe, 0x0a]},
+                    {"print": ""},
+                    {"emit": {"type": "shout"}},
+                    {"emit": {"v": 2, "type": "log", "message": "from the future"}},
+                    {"emit": {"type": "progress", "fraction": "half"}},
+                    {"emit": {"type": "progress"}},
+                    {"emit": {"type": "progress", "fraction": 1.5}},
+                    {"emit": {"type": "phase", "phase": "uploading"}},
+                    {"emit": {"answer": 42}},
+                    {"emit": {"type": "log", "level": "fatal", "message": "x"}},
+                    {"emit": {"type": "result", "meta": 1}},
+                    {"emit": {"type": "result", "meta": 2}},
+                    {"emit": {"type": "log", "message": "still listening"}},
+                ])),
+            ))
+            .await;
+
+        assert_eq!(run.result().meta, Some(json!(1)), "the first result counts");
+        assert_eq!(
+            run.logs(LogLevel::Info),
+            [
+                "hello there",
+                "[1, 2]",
+                &"x".repeat(4096),
+                "\u{fffd}\u{fffd}",
+                "still listening"
+            ]
+        );
+        let warnings = run.logs(LogLevel::Warn);
+        let expected = [
+            (6, "unknown event type \"shout\""),
+            (7, "event version 2 isn't supported"),
+            (8, "invalid progress event"),
+            (9, "needs a fraction or a message"),
+            (10, "isn't between 0 and 1"),
+            (11, "scripts can't send phase events"),
+            (12, "a JSON object without a \"type\""),
+            (13, "invalid log event"),
+            (15, "a second result"),
+        ];
+        assert_eq!(warnings.len(), expected.len(), "{warnings:#?}");
+        for (warning, (line, why)) in warnings.iter().zip(expected) {
+            assert!(
+                warning.starts_with(&format!("ignored stdout line {line}: "))
+                    && warning.contains(why),
+                "expected line {line} to be ignored as {why:?}, got {warning:?}"
+            );
+        }
+        assert_eq!(
+            run.phases(),
+            [
+                Phase::Preparing,
+                Phase::Downloading,
+                Phase::Running,
+                Phase::Uploading
+            ],
+            "the script's phase event wasn't forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_over_one_mebibyte_is_dropped_and_reading_goes_on() {
+        let h = Harness::new().await;
+        let huge = "y".repeat(1 << 20);
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "log", "message": huge}},
+                    {"emit": {"type": "result", "meta": "after"}},
+                ])),
+            ))
+            .await;
+        assert_eq!(run.result().meta, Some(json!("after")));
+        assert_eq!(
+            run.logs(LogLevel::Warn),
+            ["dropped stdout line 1: it is longer than the 1 MiB limit"]
+        );
+        assert!(run.logs(LogLevel::Info).is_empty());
+    }
+
+    #[tokio::test]
+    async fn payloads_over_256_kib_are_refused() {
+        let h = Harness::new().await;
+        let big = "z".repeat(300 << 10);
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "data", "payload": big}},
+                    {"emit": {"type": "data", "payload": "small"}},
+                    {"emit": {"type": "result", "meta": big}},
+                ])),
+            ))
+            .await;
+        // An oversized data event is dropped; an oversized result can't be
+        // passed on, so the attempt fails rather than succeeding without
+        // the meta the service expects.
+        let data: Vec<_> = run
+            .script_events()
+            .into_iter()
+            .filter(|e| matches!(e, JobEvent::Data { .. }))
+            .collect();
+        assert_eq!(
+            data,
+            [JobEvent::Data {
+                payload: json!("small")
+            }]
+        );
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::NoResult);
+        assert_eq!(
+            error.message,
+            format!(
+                "the script's result was refused: the result's meta is {} bytes, over the 256 KiB limit",
+                (300 << 10) + 2
+            )
+        );
+        assert_eq!(run.logs(LogLevel::Warn).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_result_after_an_error_is_ignored() {
+        let h = Harness::new().await;
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "error", "message": "first"}},
+                    {"emit": {"type": "result"}},
+                    {"emit": {"type": "error", "message": "second"}},
+                ])),
+            ))
+            .await;
+        assert_eq!(run.error().code, ErrorCode::ScriptError);
+        assert_eq!(run.error().message, "first");
+        assert_eq!(
+            run.logs(LogLevel::Warn),
+            [
+                "ignored stdout line 2: a result after an error",
+                "ignored stdout line 3: a second error"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn failures_carry_the_last_lines_of_stderr() {
+    let h = Harness::new().await;
+    let run = h
+        .run(h.job(
+            &probe(),
+            steps(json!([
+                {"stderr": "noise noise noise", "times": 2000},
+                {"stderr": "the last words"},
+                {"exit": 2},
+            ])),
+        ))
+        .await;
+    let error = run.error();
+    assert_eq!((error.code, error.exit_code), (ErrorCode::Exit, Some(2)));
+    let tail = error.stderr_tail.as_deref().unwrap();
+    assert!(tail.len() <= 8 << 10, "{} bytes", tail.len());
+    let lines: Vec<_> = tail.lines().collect();
+    assert_eq!(lines.last(), Some(&"the last words"));
+    assert!(lines.len() > 100);
+    assert!(
+        lines[..lines.len() - 1]
+            .iter()
+            .all(|l| *l == "noise noise noise")
+    );
+}
+
+mod transfers {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_missing_input_is_a_retryable_input_download() {
+        let h = Harness::new().await;
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.inputs.insert(
+            "gone.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/gone.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(error.retryable);
+        assert!(error.message.contains("404"), "{}", error.message);
+        assert_eq!(run.phases().last(), Some(&Phase::Downloading));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_input_is_input_download() {
+        let h = Harness::new().await;
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: format!("http://{closed}/a.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(
+            run.error().message.contains("connect"),
+            "{}",
+            run.error().message
+        );
+    }
+
+    #[tokio::test]
+    async fn inputs_come_over_https_with_their_headers() {
+        let h = Harness::new().await;
+        h.server.serve("/in/secret.txt", "classified");
+        let mut job = h.job(
+            &probe(),
+            steps(json!([{"input": "secret.txt"}, {"emit": {"type": "result"}}])),
+        );
+        job.inputs.insert(
+            "secret.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.https_url("/in/secret.txt"),
+                headers: [("Authorization".into(), "Bearer presigned".into())].into(),
+            },
+        );
+        let run = h.run(job).await;
+        run.result();
+        assert_eq!(run.data("input"), "classified");
+        let [request] = &h.server.received("/in/secret.txt")[..] else {
+            panic!()
+        };
+        assert_eq!(request.header("authorization"), Some("Bearer presigned"));
+    }
+
+    #[tokio::test]
+    async fn http_to_other_hosts_is_refused_before_anything_runs() {
+        let h = Harness::new().await;
+        // 0.0.0.0 reaches the test server, but it isn't a loopback address.
+        let port = h.server.url("").rsplit(':').next().unwrap().to_owned();
+        let elsewhere = |path: &str| format!("http://0.0.0.0:{port}{path}");
+        h.server.serve("/in/a.txt", "a");
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: elsewhere("/in/a.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(
+            run.error().message.contains("only https is allowed"),
+            "{}",
+            run.error().message
+        );
+        assert!(run.phases().is_empty(), "nothing was prepared");
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        let (name, mut upload) = output(&h.server, "b.txt");
+        upload.url = elsewhere("/out/b.txt");
+        job.outputs.insert(name, upload);
+        let run = h.run(job).await;
+        assert_eq!(run.error().code, ErrorCode::OutputUpload);
+        assert!(run.phases().is_empty(), "the script didn't run");
+
+        assert!(h.server.received("/in/a.txt").is_empty());
+    }
+
+    #[tokio::test]
+    async fn allow_insecure_http_lets_any_host_through() {
+        let h = Harness::with(|c| c.allow_insecure_http = true).await;
+        let port = h.server.url("").rsplit(':').next().unwrap().to_owned();
+        let elsewhere = |path: &str| format!("http://0.0.0.0:{port}{path}");
+        h.server.serve("/in/a.txt", "a");
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"input": "a.txt"},
+                {"write": "b.txt", "text": "b"},
+                {"emit": {"type": "result", "files": ["b.txt"]}},
+            ])),
+        );
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: elsewhere("/in/a.txt"),
+                headers: Default::default(),
+            },
+        );
+        let (name, mut upload) = output(&h.server, "b.txt");
+        upload.url = elsewhere("/out/b.txt");
+        job.outputs.insert(name, upload);
+        h.run(job).await.result();
+        assert_eq!(h.server.received("/out/b.txt")[0].body, b"b");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_held_to_the_url_policy() {
+        let h = Harness::new().await;
+        let port = h.server.url("").rsplit(':').next().unwrap().to_owned();
+        h.server.serve("/in/real.txt", "real");
+        h.server
+            .reply("/in/a.txt", Reply::Redirect(h.server.url("/in/real.txt")));
+        h.server.reply(
+            "/in/b.txt",
+            Reply::Redirect(format!("http://0.0.0.0:{port}/in/real.txt")),
+        );
+
+        let mut job = h.job(
+            &probe(),
+            steps(json!([{"input": "a.txt"}, {"emit": {"type": "result"}}])),
+        );
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/a.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        assert_eq!(run.data("input"), "real", "an allowed redirect is followed");
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.inputs.insert(
+            "b.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/b.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(
+            run.error().message.contains("redirected"),
+            "{}",
+            run.error().message
+        );
+        assert_eq!(h.server.received("/in/real.txt").len(), 1);
+    }
+}

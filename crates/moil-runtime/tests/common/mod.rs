@@ -320,6 +320,8 @@ pub enum Reply {
     Body(Vec<u8>),
     /// This status, with a short body.
     Status(u16),
+    /// `302` to this URL.
+    Redirect(String),
     /// Never answers.
     Hang,
 }
@@ -446,6 +448,9 @@ async fn handle(
         Some(Reply::Body(body)) => Body::from(body).into_response(),
         Some(Reply::Status(code)) => {
             (StatusCode::from_u16(code).unwrap(), "no luck").into_response()
+        }
+        Some(Reply::Redirect(to)) => {
+            (StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
         }
         Some(Reply::Hang) => std::future::pending().await,
         None if method == Method::GET => StatusCode::NOT_FOUND.into_response(),
