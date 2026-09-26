@@ -1,5 +1,9 @@
 //! The little that differs between platforms.
 
+use std::io;
+use std::path::Path;
+use std::process::Command;
+
 use tao::event_loop::EventLoop;
 use tray_icon::menu::Menu;
 use url::Url;
@@ -46,6 +50,57 @@ pub fn edit_shortcuts() -> Option<Menu> {
     }
     #[cfg(not(target_os = "macos"))]
     None
+}
+
+/// Makes the digits in the tray's title all as wide as a figure space, so
+/// that [`format::fixed_percent`](crate::format::fixed_percent) keeps its
+/// width as the number changes. The menu bar's font has proportional
+/// digits, where a 1 is narrower than an 8.
+pub fn use_tabular_digits(icon: &tray_icon::TrayIcon) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSFont, NSFontWeightRegular};
+        let (Some(mtm), Some(item)) = (MainThreadMarker::new(), icon.ns_status_item()) else {
+            return;
+        };
+        let Some(button) = item.button(mtm) else {
+            return;
+        };
+        let size = NSFont::menuBarFontOfSize(0.0).pointSize();
+        // SAFETY: reads a constant AppKit defines.
+        let regular = unsafe { NSFontWeightRegular };
+        let font = NSFont::monospacedDigitSystemFontOfSize_weight(size, regular);
+        button.setFont(Some(&font));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = icon;
+}
+
+/// Shows a file in the file manager: selected in a Finder window on macOS,
+/// its folder elsewhere. A file that is gone shows its folder.
+pub fn reveal(path: &Path) {
+    let path = path.to_owned();
+    // Waits for `open` to hand the request to Finder, so off the event loop.
+    std::thread::spawn(move || {
+        let revealed = if cfg!(target_os = "macos") && path.exists() {
+            Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .status()
+                .and_then(|status| {
+                    status
+                        .success()
+                        .then_some(())
+                        .ok_or_else(|| io::Error::other(format!("open -R answered {status}")))
+                })
+        } else {
+            open::that_detached(path.parent().unwrap_or(&path))
+        };
+        if let Err(e) = revealed {
+            tracing::warn!("couldn't show {}: {e}", path.display());
+        }
+    });
 }
 
 /// Opens a web page in the owner's browser. Only `http` and `https` URLs

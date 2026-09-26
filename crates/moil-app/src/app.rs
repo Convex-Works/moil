@@ -6,6 +6,7 @@
 //! for, on the main thread for windows and on Tokio for the agent.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -40,7 +41,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 /// Everything that wakes the event loop, besides the platform's own events.
 #[derive(Debug)]
 pub enum AppEvent {
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     Menu(MenuId),
     /// A page posted a message.
     Ipc {
@@ -73,12 +74,14 @@ pub enum AppEvent {
 }
 
 /// Runs the app until the owner quits. `backend` is the agent, or why it
-/// couldn't start; `links` are `moil://` links from the command line.
+/// couldn't start; `links` are `moil://` links from the command line;
+/// `log_file` is where the app logs, if it keeps a file.
 pub fn run(
     runtime: tokio::runtime::Runtime,
     backend: Result<Arc<dyn Backend>, String>,
     login: Box<dyn LoginItem>,
     links: Vec<String>,
+    log_file: Option<PathBuf>,
 ) -> ! {
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     platform::configure(&mut event_loop);
@@ -96,6 +99,7 @@ pub fn run(
         runtime,
         proxy,
         login,
+        log_file,
         tray: None,
         snapshot: Snapshot::default(),
         deferred: HashSet::new(),
@@ -135,6 +139,7 @@ struct App {
     runtime: tokio::runtime::Runtime,
     proxy: EventLoopProxy<AppEvent>,
     login: Box<dyn LoginItem>,
+    log_file: Option<PathBuf>,
     tray: Option<Tray>,
     snapshot: Snapshot,
     /// Reviews the owner closed without approving.
@@ -210,7 +215,7 @@ impl App {
         let proxy = self.proxy.clone();
         self.runtime.spawn(async move {
             while snapshots.changed().await.is_ok() {
-                let snapshot = snapshots.borrow_and_update().clone();
+                let snapshot = Box::new(snapshots.borrow_and_update().clone());
                 if proxy.send_event(AppEvent::Snapshot(snapshot)).is_err() {
                     break;
                 }
@@ -228,7 +233,9 @@ impl App {
             &self.snapshot,
             &ViewContext {
                 now: Instant::now(),
+                clock: SystemTime::now(),
                 open_at_login: self.login.enabled(),
+                has_log: self.log_file.is_some(),
                 quitting: self.quitting,
                 deferred: &self.deferred,
             },
@@ -247,7 +254,7 @@ impl App {
     fn handle(&mut self, event: AppEvent, target: &EventLoopWindowTarget<AppEvent>) {
         match event {
             AppEvent::Snapshot(snapshot) => {
-                self.snapshot = snapshot;
+                self.snapshot = *snapshot;
                 self.refresh_tray();
             }
             AppEvent::Menu(id) => {
@@ -322,6 +329,11 @@ impl App {
                     self.open(target, frame, &html, Content::Notice { quit: false });
                 }
                 self.refresh_tray();
+            }
+            Action::ShowLog => {
+                if let Some(path) = &self.log_file {
+                    platform::reveal(path);
+                }
             }
             Action::Quit => self.quit(),
         }

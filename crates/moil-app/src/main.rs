@@ -15,6 +15,7 @@ mod gallery;
 mod icon;
 mod ipc;
 mod links;
+mod log;
 mod login;
 mod page;
 mod pair;
@@ -61,14 +62,6 @@ impl Options {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .init();
-
     let options = match Options::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(e) => {
@@ -80,6 +73,12 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    let log_dir = if options.demo {
+        Some(log::demo_dir())
+    } else {
+        log::default_dir()
+    };
+    let log_file = log::init(log_dir.as_deref());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -103,7 +102,7 @@ fn main() -> ExitCode {
             (backend::start_agent(), Box::new(SystemLoginItem::new()))
         }
     };
-    app::run(runtime, backend, login, options.links)
+    app::run(runtime, backend, login, options.links, log_file)
 }
 
 #[cfg(test)]

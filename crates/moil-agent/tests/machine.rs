@@ -76,6 +76,27 @@ fn a_damaged_settings_file_is_named() {
 }
 
 #[test]
+fn the_runtime_runs_by_the_owners_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let config = machine.runtime_config("/opt/uv".into());
+    assert_eq!(config.uv, std::path::Path::new("/opt/uv"));
+    assert_eq!(config.jobs_dir, dir.path().join("jobs"));
+    assert_eq!(config.bundles.root(), machine.home().bundles().root());
+    assert!(!config.allow_insecure_http && !config.keep_work_dirs);
+
+    machine
+        .update_settings(|s| {
+            s.allow_insecure_http = true;
+            s.keep_work_dirs = true;
+        })
+        .unwrap();
+    drop(machine);
+    let config = open_machine(dir.path()).runtime_config("/opt/uv".into());
+    assert!(config.allow_insecure_http && config.keep_work_dirs);
+}
+
+#[test]
 fn info_describes_this_machine() {
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
@@ -328,6 +349,24 @@ async fn services_are_found_by_id_host_url_or_name() {
         Err(Error::AmbiguousService { .. })
     ));
     assert!(matches!(found("nothing"), Err(Error::UnknownService(_))));
+}
+
+#[tokio::test]
+async fn a_service_file_naming_an_unsafe_id_is_skipped() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+
+    // Hand-edited, it would have the machine write outside its home.
+    let mut file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(format!("services/{}.json", paired.id))).unwrap(),
+    )
+    .unwrap();
+    file["id"] = "../../outside".into();
+    std::fs::write(dir.path().join("services/edited.json"), file.to_string()).unwrap();
+
+    assert_eq!(machine.services().unwrap(), [paired]);
 }
 
 #[tokio::test]

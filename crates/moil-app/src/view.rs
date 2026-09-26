@@ -3,9 +3,11 @@
 //! The `tray` module makes it real; everything here is pure.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use moil_agent::{Connection, JobStatus, ServiceId, ServiceStatus, Snapshot};
+use moil_agent::{
+    Connection, JobOutcome, JobReport, JobStatus, ServiceId, ServiceStatus, Snapshot,
+};
 use moil_proto::{BundleHash, Phase};
 use url::Url;
 
@@ -15,12 +17,12 @@ use crate::format;
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrayView {
     pub icon: IconState,
-    /// Beside the icon: the running job's progress.
+    /// Beside the icon: the running job's progress, always as wide.
     pub title: Option<String>,
     pub tooltip: String,
     pub menu: MenuModel,
     /// When the view goes stale without a new snapshot, such as a
-    /// reconnection countdown ticking.
+    /// reconnection countdown ticking or the last job growing older.
     pub refresh_at: Option<Instant>,
 }
 
@@ -28,8 +30,12 @@ pub struct TrayView {
 #[derive(Debug, Clone)]
 pub struct ViewContext<'a> {
     pub now: Instant,
+    /// The time of day `now` is, for saying how long ago things happened.
+    pub clock: SystemTime,
     /// Whether moil opens at login; `None` where that can't be changed.
     pub open_at_login: Option<bool>,
+    /// Whether the app keeps a log file to show the owner.
+    pub has_log: bool,
     /// The app is shutting the agent down.
     pub quitting: bool,
     /// Reviews the owner put off with "Not now". They stay in the menu but
@@ -63,10 +69,11 @@ pub struct MenuModel {
 pub enum Entry {
     /// Text that can't be clicked, such as the status line.
     Text(Label),
-    /// Something to do.
+    /// Something to do, unless disabled for now.
     Item {
         label: Label,
         action: Action,
+        enabled: bool,
     },
     /// A setting that is on or off. Disabled where it can't be changed.
     Check {
@@ -104,6 +111,8 @@ pub enum Action {
     },
     Unpair(ServiceId),
     ToggleOpenAtLogin,
+    /// Show the log file in Finder.
+    ShowLog,
     Quit,
 }
 
@@ -126,6 +135,17 @@ impl Label {
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
+    }
+}
+
+impl Entry {
+    /// An item that can be clicked.
+    pub fn item(label: Label, action: Action) -> Self {
+        Self::Item {
+            label,
+            action,
+            enabled: true,
+        }
     }
 }
 
@@ -179,7 +199,7 @@ impl MenuModel {
     #[cfg(test)]
     pub fn action(&self, text: &str) -> Option<&Action> {
         self.flatten().into_iter().find_map(|entry| match entry {
-            Entry::Item { label, action } | Entry::Check { label, action, .. }
+            Entry::Item { label, action, .. } | Entry::Check { label, action, .. }
                 if label.to_string() == text =>
             {
                 Some(action)
@@ -197,11 +217,12 @@ impl TrayView {
             title: snapshot
                 .job
                 .as_ref()
+                .filter(|job| !job.stopping)
                 .and_then(progress)
-                .map(|percent| format!("{percent}%")),
+                .map(format::fixed_percent),
             tooltip: format!("moil: {status}"),
             menu: menu(snapshot, cx, status),
-            refresh_at: refresh_at(snapshot, cx.now),
+            refresh_at: refresh_at(snapshot, cx),
         }
     }
 }
@@ -236,19 +257,27 @@ fn progress(job: &JobStatus) -> Option<u8> {
     }
 }
 
+/// A job as the owner knows it: its title, else its bundle's name.
+fn job_name(title: Option<&str>, bundle_name: &str) -> String {
+    format::one_line(title.unwrap_or(bundle_name), 48)
+}
+
+/// What a service is called in the menu, or its ID once it's gone.
+fn service_name(snapshot: &Snapshot, id: &ServiceId) -> String {
+    let name = snapshot.service(id).map_or(id.as_str(), |s| &s.name);
+    format::one_line(name, 32)
+}
+
 /// The first line of the menu.
 fn status(snapshot: &Snapshot) -> Label {
     match &snapshot.job {
         Some(job) => {
-            let what = job.title.as_deref().unwrap_or(&job.bundle_name);
-            let service = snapshot
-                .service(&job.service)
-                .map_or(job.service.as_str(), |s| &s.name);
-            let label = Label::new(format!(
-                "Running “{}” for {}",
-                format::one_line(what, 48),
-                format::one_line(service, 32)
-            ));
+            let what = job_name(job.title.as_deref(), &job.bundle_name);
+            let service = service_name(snapshot, &job.service);
+            if job.stopping {
+                return Label::new(format!("Stopping “{what}” for {service}…"));
+            }
+            let label = Label::new(format!("Running “{what}” for {service}"));
             match (job.phase, progress(job)) {
                 (_, Some(percent)) => label.with_detail(format!("{percent}%")),
                 (Phase::Preparing, _) => label.with_detail("preparing"),
@@ -260,6 +289,27 @@ fn status(snapshot: &Snapshot) -> Label {
         None if snapshot.paused => Label::new("Paused").with_detail("taking no new jobs"),
         None if snapshot.services.is_empty() => Label::new("Idle"),
         None => Label::new("Idle").with_detail("waiting for jobs"),
+    }
+}
+
+/// How the job that ran last ended, and when.
+fn last_job(snapshot: &Snapshot, report: &JobReport, clock: SystemTime) -> Label {
+    let what = job_name(report.title.as_deref(), &report.bundle_name);
+    let when = format::ago(report.ended_at, clock);
+    match &report.outcome {
+        JobOutcome::Succeeded => Label::new(format!("Last: “{what}” finished {when}")),
+        JobOutcome::Failed { code, message } => {
+            let reason = match format::one_line(message, 64) {
+                reason if reason.trim().is_empty() => code.to_string(),
+                reason => reason,
+            };
+            Label::new(format!("Last: “{what}” failed {when}")).with_detail(reason)
+        }
+        JobOutcome::Cancelled => {
+            let service = service_name(snapshot, &report.service);
+            Label::new(format!("Last: “{what}” was cancelled by {service} {when}"))
+        }
+        JobOutcome::Interrupted => Label::new(format!("Last: “{what}” was stopped {when}")),
     }
 }
 
@@ -289,7 +339,11 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         entries.push(Item {
             label: Label::new("Stop Current Job"),
             action: Action::StopJob,
+            enabled: !job.stopping,
         });
+    }
+    if let Some(report) = &snapshot.last_job {
+        entries.push(Text(last_job(snapshot, report, cx.clock)));
     }
 
     entries.push(Separator);
@@ -307,38 +361,38 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         });
         entries.push(Text(Label::quiet(connection(&service.connection, cx.now))));
         for bundle in service.bundles.iter().filter(|b| !b.approved) {
-            entries.push(Item {
-                label: Label::new(format!(
+            entries.push(Entry::item(
+                Label::new(format!(
                     "Review {} {}…",
                     format::one_line(&bundle.info.name, 32),
                     format::one_line(&bundle.info.version, 16)
                 )),
-                action: Action::Review {
+                Action::Review {
                     service: service.id.clone(),
                     hash: bundle.info.hash,
                 },
-            });
+            ));
         }
         if service.connection == Connection::Unpaired {
-            entries.push(Item {
-                label: Label::new(format!(
+            entries.push(Entry::item(
+                Label::new(format!(
                     "Pair with {} Again…",
                     format::one_line(&service.name, 32)
                 )),
-                action: Action::PairAgain(service.base_url.clone()),
-            });
+                Action::PairAgain(service.base_url.clone()),
+            ));
         }
     }
 
     entries.push(Separator);
-    entries.push(Item {
-        label: Label::new(if snapshot.paused { "Resume" } else { "Pause" }),
-        action: Action::SetPaused(!snapshot.paused),
-    });
-    entries.push(Item {
-        label: Label::new("Pair with a Service…"),
-        action: Action::Pair,
-    });
+    entries.push(Entry::item(
+        Label::new(if snapshot.paused { "Resume" } else { "Pause" }),
+        Action::SetPaused(!snapshot.paused),
+    ));
+    entries.push(Entry::item(
+        Label::new("Pair with a Service…"),
+        Action::Pair,
+    ));
     entries.push(Separator);
     entries.push(Check {
         label: Label::new("Open at Login"),
@@ -346,10 +400,13 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         enabled: cx.open_at_login.is_some(),
         action: Action::ToggleOpenAtLogin,
     });
-    entries.push(Item {
-        label: Label::new("Quit moil"),
-        action: Action::Quit,
-    });
+    if cx.has_log {
+        entries.push(Entry::item(
+            Label::new("Show Log in Finder"),
+            Action::ShowLog,
+        ));
+    }
+    entries.push(Entry::item(Label::new("Quit moil"), Action::Quit));
     MenuModel { entries }
 }
 
@@ -376,23 +433,23 @@ fn service_menu(service: &ServiceStatus, now: Instant) -> Vec<Entry> {
             format::one_line(&bundle.info.name, 32),
             format::one_line(&bundle.info.version, 16)
         );
-        entries.push(Item {
-            label: if bundle.approved {
+        entries.push(Entry::item(
+            if bundle.approved {
                 Label::new(name).with_detail("approved")
             } else {
                 Label::new(format!("Review {name}…"))
             },
-            action: Action::Review {
+            Action::Review {
                 service: service.id.clone(),
                 hash: bundle.info.hash,
             },
-        });
+        ));
     }
     entries.push(Separator);
-    entries.push(Item {
-        label: Label::new(format!("Unpair {}…", format::one_line(&service.name, 32))),
-        action: Action::Unpair(service.id.clone()),
-    });
+    entries.push(Entry::item(
+        Label::new(format!("Unpair {}…", format::one_line(&service.name, 32))),
+        Action::Unpair(service.id.clone()),
+    ));
     entries
 }
 
@@ -414,25 +471,30 @@ fn connection(connection: &Connection, now: Instant) -> String {
     }
 }
 
-/// When the countdown to the next reconnection shows a different number.
-fn refresh_at(snapshot: &Snapshot, now: Instant) -> Option<Instant> {
-    snapshot
+/// When a countdown to the next reconnection shows a different number, or
+/// the last job's age may read differently.
+fn refresh_at(snapshot: &Snapshot, cx: &ViewContext<'_>) -> Option<Instant> {
+    let countdowns = snapshot
         .services
         .iter()
         .filter_map(|s| match s.connection {
-            Connection::Disconnected { retry_at, .. } => retry_at.checked_duration_since(now),
+            Connection::Disconnected { retry_at, .. } => retry_at.checked_duration_since(cx.now),
             _ => None,
         })
         .filter(|wait| !wait.is_zero())
         .map(|wait| {
             let tick = wait.subsec_nanos();
-            now + if tick == 0 {
+            if tick == 0 {
                 Duration::from_secs(1)
             } else {
                 Duration::from_nanos(tick.into())
             }
-        })
-        .min()
+        });
+    let last_job = snapshot
+        .last_job
+        .as_ref()
+        .map(|report| format::ago_changes_in(report.ended_at, cx.clock));
+    countdowns.chain(last_job).min().map(|wait| cx.now + wait)
 }
 
 /// The host (and port, if unusual) the owner would recognize.
@@ -447,10 +509,9 @@ fn host(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use moil_agent::BundleStatus;
-    use moil_proto::{BundleInfo, JobId};
+    use moil_proto::{BundleInfo, ErrorCode, JobId};
 
     use super::*;
-    use crate::demo::service_id;
 
     fn hash(c: char) -> BundleHash {
         c.to_string().repeat(64).parse().unwrap()
@@ -470,7 +531,7 @@ mod tests {
 
     fn klisi() -> ServiceStatus {
         ServiceStatus {
-            id: service_id("klisi.example.com"),
+            id: "klisi.example.com".parse().unwrap(),
             name: "klisi".into(),
             base_url: "https://klisi.example.com/moil".parse().unwrap(),
             connection: Connection::Connected,
@@ -484,7 +545,7 @@ mod tests {
 
     fn lab(now: Instant) -> ServiceStatus {
         ServiceStatus {
-            id: service_id("localhost-8787"),
+            id: "localhost-8787".parse().unwrap(),
             name: "lab".into(),
             base_url: "http://localhost:8787/moil".parse().unwrap(),
             connection: Connection::Disconnected {
@@ -498,7 +559,7 @@ mod tests {
 
     fn job(phase: Phase, fraction: Option<f64>) -> JobStatus {
         JobStatus {
-            service: service_id("klisi.example.com"),
+            service: "klisi.example.com".parse().unwrap(),
             job_id: JobId::new("j_42").unwrap(),
             attempt: 1,
             title: Some("Weekly sync".into()),
@@ -507,13 +568,36 @@ mod tests {
             fraction,
             message: Some("diarizing".into()),
             started_at: Instant::now(),
+            stopping: false,
+        }
+    }
+
+    /// How "Design review" ended, `ago` before `clock`.
+    fn report(outcome: JobOutcome, clock: SystemTime, ago: Duration) -> JobReport {
+        JobReport {
+            service: "klisi.example.com".parse().unwrap(),
+            job_id: JobId::new("j_41").unwrap(),
+            attempt: 2,
+            title: Some("Design review".into()),
+            bundle_name: "transcribe".into(),
+            outcome,
+            ended_at: clock - ago,
+        }
+    }
+
+    fn out_of_memory() -> JobOutcome {
+        JobOutcome::Failed {
+            code: ErrorCode::ScriptError,
+            message: "CUDA out of memory".into(),
         }
     }
 
     struct Fixture {
         now: Instant,
+        clock: SystemTime,
         deferred: HashSet<(ServiceId, BundleHash)>,
         open_at_login: Option<bool>,
+        has_log: bool,
         quitting: bool,
     }
 
@@ -521,8 +605,10 @@ mod tests {
         fn new() -> Self {
             Self {
                 now: Instant::now(),
+                clock: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
                 deferred: HashSet::new(),
                 open_at_login: Some(true),
+                has_log: true,
                 quitting: false,
             }
         }
@@ -532,7 +618,9 @@ mod tests {
                 snapshot,
                 &ViewContext {
                     now: self.now,
+                    clock: self.clock,
                     open_at_login: self.open_at_login,
+                    has_log: self.has_log,
                     quitting: self.quitting,
                     deferred: &self.deferred,
                 },
@@ -546,7 +634,10 @@ mod tests {
                 let indent = "  ".repeat(depth);
                 match entry {
                     Entry::Text(label) => out.push(format!("{indent}{label}")),
-                    Entry::Item { label, .. } => out.push(format!("{indent}[{label}]")),
+                    Entry::Item { label, enabled, .. } => out.push(format!(
+                        "{indent}[{label}]{}",
+                        if *enabled { "" } else { " (disabled)" }
+                    )),
                     Entry::Check {
                         label,
                         checked,
@@ -577,6 +668,7 @@ mod tests {
             paused: false,
             services: vec![klisi(), lab(fx.now)],
             job: Some(job(Phase::Running, Some(0.42))),
+            last_job: Some(report(out_of_memory(), fx.clock, Duration::from_secs(300))),
         };
         assert_eq!(
             lines(&fx.view(&snapshot).menu),
@@ -584,6 +676,7 @@ mod tests {
                 "Running “Weekly sync” for klisi — 42%",
                 "transcribe: diarizing",
                 "[Stop Current Job]",
+                "Last: “Design review” failed 5 minutes ago — CUDA out of memory",
                 "---",
                 "klisi — klisi.example.com ▸",
                 "  https://klisi.example.com/moil",
@@ -610,6 +703,7 @@ mod tests {
                 "[Pair with a Service…]",
                 "---",
                 "[✓ Open at Login]",
+                "[Show Log in Finder]",
                 "[Quit moil]",
             ]
         );
@@ -622,19 +716,20 @@ mod tests {
             paused: true,
             services: vec![klisi()],
             job: None,
+            last_job: None,
         };
         let menu = fx.view(&snapshot).menu;
         assert_eq!(
             menu.action("Review transcribe 0.3.0…"),
             Some(&Action::Review {
-                service: service_id("klisi.example.com"),
+                service: "klisi.example.com".parse().unwrap(),
                 hash: hash('b')
             })
         );
         assert_eq!(
             menu.action("transcribe 0.2.0 — approved"),
             Some(&Action::Review {
-                service: service_id("klisi.example.com"),
+                service: "klisi.example.com".parse().unwrap(),
                 hash: hash('a')
             })
         );
@@ -643,8 +738,18 @@ mod tests {
         assert_eq!(menu.action("Stop Current Job"), None, "no job, no stop");
         assert_eq!(
             menu.action("Unpair klisi…"),
-            Some(&Action::Unpair(service_id("klisi.example.com")))
+            Some(&Action::Unpair("klisi.example.com".parse().unwrap()))
         );
+        assert_eq!(menu.action("Show Log in Finder"), Some(&Action::ShowLog));
+        assert_eq!(menu.action("Quit moil"), Some(&Action::Quit));
+    }
+
+    #[test]
+    fn the_log_is_offered_only_when_there_is_one() {
+        let mut fx = Fixture::new();
+        fx.has_log = false;
+        let menu = fx.view(&Snapshot::default()).menu;
+        assert_eq!(menu.action("Show Log in Finder"), None);
         assert_eq!(menu.action("Quit moil"), Some(&Action::Quit));
     }
 
@@ -657,6 +762,7 @@ mod tests {
                     paused,
                     services: vec![klisi()],
                     job,
+                    last_job: None,
                 })
                 .menu,
             )[0]
@@ -697,6 +803,7 @@ mod tests {
             paused: true,
             services: vec![klisi()],
             job: Some(job(Phase::Running, Some(0.5))),
+            last_job: None,
         });
         assert!(lines(&paused.menu).contains(&"Paused: no new jobs after this one".to_owned()));
         assert_eq!(
@@ -714,16 +821,135 @@ mod tests {
                 paused: false,
                 services: vec![],
                 job,
+                last_job: None,
             })
             .title
         };
         assert_eq!(
             title(Some(job(Phase::Running, Some(0.42)))),
-            Some("42%".into())
+            Some("\u{2007}42%".into()),
+            "as wide as 100%"
+        );
+        assert_eq!(
+            title(Some(job(Phase::Running, Some(0.07)))),
+            Some("\u{2007}\u{2007}7%".into())
         );
         assert_eq!(title(Some(job(Phase::Running, None))), None);
         assert_eq!(title(Some(job(Phase::Preparing, None))), None);
         assert_eq!(title(None), None);
+    }
+
+    #[test]
+    fn the_last_job_says_how_it_ended() {
+        let fx = Fixture::new();
+        let line = |outcome, ago: u64| {
+            let snapshot = Snapshot {
+                services: vec![klisi()],
+                last_job: Some(report(outcome, fx.clock, Duration::from_secs(ago))),
+                ..Snapshot::default()
+            };
+            lines(&fx.view(&snapshot).menu)[1].clone()
+        };
+        assert_eq!(
+            line(out_of_memory(), 5),
+            "Last: “Design review” failed just now — CUDA out of memory"
+        );
+        assert_eq!(
+            line(JobOutcome::Succeeded, 2 * 3600),
+            "Last: “Design review” finished 2 hours ago"
+        );
+        assert_eq!(
+            line(JobOutcome::Cancelled, 60),
+            "Last: “Design review” was cancelled by klisi 1 minute ago"
+        );
+        assert_eq!(
+            line(JobOutcome::Interrupted, 60),
+            "Last: “Design review” was stopped 1 minute ago"
+        );
+        let silent = JobOutcome::Failed {
+            code: ErrorCode::NoResult,
+            message: " \n".into(),
+        };
+        assert_eq!(
+            line(silent, 5),
+            "Last: “Design review” failed just now — no_result",
+            "an empty message still says something"
+        );
+
+        let untitled = Snapshot {
+            last_job: Some(JobReport {
+                title: None,
+                ..report(JobOutcome::Succeeded, fx.clock, Duration::ZERO)
+            }),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            lines(&fx.view(&untitled).menu)[1],
+            "Last: “transcribe” finished just now"
+        );
+        assert!(
+            !lines(&fx.view(&Snapshot::default()).menu)
+                .iter()
+                .any(|l| l.starts_with("Last:")),
+            "nothing ran yet"
+        );
+    }
+
+    #[test]
+    fn a_long_failure_message_stays_on_one_short_line() {
+        let fx = Fixture::new();
+        let rambling = JobOutcome::Failed {
+            code: ErrorCode::ScriptError,
+            message: format!(
+                "Traceback (most recent call last):\n{}",
+                "  File x\n".repeat(50)
+            ),
+        };
+        let snapshot = Snapshot {
+            last_job: Some(report(rambling, fx.clock, Duration::ZERO)),
+            ..Snapshot::default()
+        };
+        let menu = fx.view(&snapshot).menu;
+        let Entry::Text(label) = &menu.entries[1] else {
+            panic!("{menu:?}");
+        };
+        let detail = label.detail.as_deref().unwrap();
+        assert!(
+            !detail.contains('\n') && detail.chars().count() <= 64,
+            "{detail:?}"
+        );
+    }
+
+    #[test]
+    fn a_stopping_job_says_so_and_cant_be_stopped_again() {
+        let fx = Fixture::new();
+        let running = Snapshot {
+            services: vec![klisi()],
+            job: Some(job(Phase::Running, Some(0.42))),
+            ..Snapshot::default()
+        };
+        let mut stopping = running.clone();
+        stopping.job.as_mut().unwrap().stopping = true;
+        let (before, after) = (fx.view(&running), fx.view(&stopping));
+
+        assert_eq!(
+            lines(&after.menu)[..3],
+            [
+                "Stopping “Weekly sync” for klisi…",
+                "transcribe: diarizing",
+                "[Stop Current Job] (disabled)",
+            ]
+        );
+        assert_eq!(after.title, None, "no progress while it stops");
+        assert_eq!(
+            after.icon.activity,
+            Activity::Running,
+            "until it has stopped"
+        );
+        assert!(
+            before.menu.same_shape(&after.menu),
+            "the open menu updates in place"
+        );
     }
 
     #[test]
@@ -734,6 +960,7 @@ mod tests {
                 paused: false,
                 services,
                 job: None,
+                last_job: None,
             })
             .icon
             .attention
@@ -754,13 +981,14 @@ mod tests {
         }
 
         fx.deferred
-            .insert((service_id("klisi.example.com"), hash('b')));
+            .insert(("klisi.example.com".parse().unwrap(), hash('b')));
         assert!(!attention(&fx, vec![klisi()]), "put off with Not now");
         let menu = fx
             .view(&Snapshot {
                 paused: false,
                 services: vec![klisi()],
                 job: None,
+                last_job: None,
             })
             .menu;
         assert!(
@@ -777,6 +1005,7 @@ mod tests {
                 paused,
                 services: vec![],
                 job,
+                last_job: None,
             })
             .icon
             .activity
@@ -799,6 +1028,7 @@ mod tests {
                 paused: false,
                 services: vec![service],
                 job: None,
+                last_job: None,
             })
             .menu;
         assert!(lines(&menu).contains(&"Removed this Mac; pair again to use it".to_owned()));
@@ -838,6 +1068,7 @@ mod tests {
             paused: false,
             services: vec![klisi()],
             job: Some(job(Phase::Running, Some(0.3))),
+            last_job: None,
         });
         assert_eq!(lines(&view.menu), ["Stopping the job and quitting…"]);
     }
@@ -850,6 +1081,7 @@ mod tests {
                 paused: false,
                 services,
                 job: Some(job(Phase::Running, Some(fraction))),
+                last_job: None,
             })
             .menu
         };
@@ -874,13 +1106,15 @@ mod tests {
             paused: false,
             services: vec![klisi(), lab(fx.now)],
             job: None,
+            last_job: None,
         });
         assert_eq!(view.refresh_at, Some(fx.now + Duration::from_millis(400)));
         assert!(
             fx.view(&Snapshot {
                 paused: false,
                 services: vec![klisi()],
-                job: None
+                job: None,
+                last_job: None,
             })
             .refresh_at
             .is_none()
@@ -895,9 +1129,29 @@ mod tests {
             paused: false,
             services: vec![due],
             job: None,
+            last_job: None,
         });
         assert_eq!(view.refresh_at, None);
         assert!(lines(&view.menu).contains(&"Offline: timed out. Retrying now".to_owned()));
+    }
+
+    #[test]
+    fn the_last_jobs_age_refreshes_on_the_minute() {
+        let fx = Fixture::new();
+        let ended = |ago| Snapshot {
+            last_job: Some(report(JobOutcome::Succeeded, fx.clock, ago)),
+            ..Snapshot::default()
+        };
+        let view = fx.view(&ended(Duration::from_secs(90)));
+        assert_eq!(view.refresh_at, Some(fx.now + Duration::from_secs(30)));
+
+        // A reconnection countdown ticks sooner.
+        let mut both = ended(Duration::from_secs(90));
+        both.services = vec![lab(fx.now)];
+        assert_eq!(
+            fx.view(&both).refresh_at,
+            Some(fx.now + Duration::from_millis(400))
+        );
     }
 
     #[test]
@@ -911,6 +1165,7 @@ mod tests {
                 paused: false,
                 services: vec![service],
                 job: None,
+                last_job: None,
             })
             .menu;
         let lines = lines(&menu);

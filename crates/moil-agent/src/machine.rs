@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -121,6 +122,17 @@ impl Machine {
             *settings = changed;
         }
         Ok(settings.clone())
+    }
+
+    /// The runtime's configuration for this machine: its home's
+    /// directories, `uv` as the uv binary, and the owner's settings
+    /// (`allow_insecure_http`, `keep_work_dirs`) as they are now.
+    pub fn runtime_config(&self, uv: PathBuf) -> moil_runtime::RuntimeConfig {
+        let settings = self.settings();
+        let mut config = self.inner.home.runtime_config(uv);
+        config.allow_insecure_http = settings.allow_insecure_http;
+        config.keep_work_dirs = settings.keep_work_dirs;
+        config
     }
 
     fn lock_settings(&self) -> MutexGuard<'_, Settings> {

@@ -23,7 +23,8 @@ pub mod secrets;
 pub mod services;
 
 pub use agent::{
-    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobStatus, ServiceStatus, Snapshot,
+    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobOutcome, JobReport, JobStatus,
+    ServiceStatus, Snapshot,
 };
 pub use error::Error;
 pub use home::{Home, Settings};
@@ -33,4 +34,4 @@ pub use review::Review;
 #[cfg(target_os = "macos")]
 pub use secrets::KeychainSecrets;
 pub use secrets::{FileSecrets, MemorySecrets, SecretStore, default_secrets};
-pub use services::{Approval, PairedService, ServiceId};
+pub use services::{Approval, InvalidServiceId, PairedService, ServiceId};

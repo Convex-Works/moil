@@ -32,7 +32,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tray-icon = "0.25"
 wry = "0.57"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSButton",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSResponder",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }
+
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

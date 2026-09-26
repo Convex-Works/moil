@@ -14,10 +14,16 @@ cargo run -p moil-app              # the real agent, on $MOIL_HOME or ~/Library/
 
 The demo has two services: klisi, connected, offering `transcribe 0.3.0` to
 replace an approved 0.2.0 (so the review opens with a diff), and lab, which
-keeps failing to connect. Jobs for klisi come and go through every phase.
+keeps failing to connect. Jobs for klisi come and go through every phase,
+and one in three runs out of GPU memory, so the menu has a failure to show.
 Pairing with any address succeeds after a few seconds with the code
 `WDJB-MJHT`; hosts starting with `deny` are refused, and hosts ending in
 `.invalid` aren't moil services.
+
+The app logs to stderr and to `~/Library/Logs/moil/moil.log` (the demo to
+`$TMPDIR/moil-demo/moil.log`), which starts over past 4 MB, keeping the
+previous one as `moil.log.1`. "Show Log in Finder" in the menu finds it;
+`RUST_LOG` sets the level.
 
 Outside the app bundle the real agent needs uv on `PATH` or in `MOIL_UV`,
 and Open at Login is unavailable.
@@ -58,6 +64,7 @@ events to them and carries out what they ask for.
 | Module | What |
 |---|---|
 | `backend` | `Backend`, what the UI needs from the agent; its implementation for `AgentHandle`, and real-mode startup |
+| `log` | the log on stderr and in a file that starts over past a size |
 | `demo` | `Demo`, the simulated agent behind `--demo`, and the demo bundles in `demo/` |
 | `view` | `TrayView::new`: a `Snapshot` becomes the menu model, the icon's state and the title |
 | `tray` | makes a `TrayView` real with tray-icon and muda, relabelling in place when only text changed |

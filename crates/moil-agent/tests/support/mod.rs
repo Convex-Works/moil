@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -687,6 +688,7 @@ pub struct FakeRun {
     events: EventSink,
     stop: StopSignal,
     finish: Option<oneshot::Sender<Outcome>>,
+    linger: Arc<AtomicBool>,
 }
 
 impl FakeRun {
@@ -700,9 +702,15 @@ impl FakeRun {
     }
 
     /// Waits until the agent asks the attempt to stop, and says why. The
-    /// run then ends as a real runtime's would.
+    /// run then ends as a real runtime's would, unless it lingers.
     pub async fn stopped(&mut self) -> StopReason {
         within("the agent to stop the attempt", self.stop.stopped()).await
+    }
+
+    /// Makes the run carry on after the agent stops it, until the test
+    /// finishes it, like a script that takes its time to exit.
+    pub fn linger(&self) {
+        self.linger.store(true, Ordering::SeqCst);
     }
 }
 
@@ -714,19 +722,28 @@ impl Executor for FakeExecutor {
 
     fn run(&self, job: Job, events: EventSink, stop: StopSignal) -> BoxFuture<'_, Outcome> {
         let (finish, finished) = oneshot::channel();
-        let mut stopped = stop.clone();
+        let mut signal = stop.clone();
+        let linger = Arc::new(AtomicBool::new(false));
         let _ = self.runs.send(FakeRun {
             job,
             events,
             stop,
             finish: Some(finish),
+            linger: linger.clone(),
         });
+        let stopped = async move {
+            let reason = signal.stopped().await;
+            if linger.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            reason
+        };
         Box::pin(async move {
             tokio::select! {
                 outcome = finished => outcome.unwrap_or_else(|_| {
                     Outcome::failed(JobError::new(ErrorCode::Internal, "the test dropped the run"))
                 }),
-                reason = stopped.stopped() => match reason {
+                reason = stopped => match reason {
                     StopReason::Cancelled => Outcome::Cancelled,
                     StopReason::Interrupted => Outcome::failed(JobError::new(
                         ErrorCode::Interrupted,

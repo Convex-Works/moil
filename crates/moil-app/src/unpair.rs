@@ -121,7 +121,6 @@ mod tests {
     use moil_proto::BundleInfo;
 
     use super::*;
-    use crate::demo;
     use crate::page::tests::assert_locked_down;
 
     fn klisi() -> ServiceStatus {
@@ -135,7 +134,7 @@ mod tests {
             approved,
         };
         ServiceStatus {
-            id: demo::service_id("klisi.example.com"),
+            id: "klisi.example.com".parse().unwrap(),
             name: "klisi".into(),
             base_url: "https://klisi.example.com/moil".parse().unwrap(),
             connection: Connection::Connected,
@@ -162,7 +161,7 @@ mod tests {
         let mut window = UnpairWindow::new(&klisi());
         assert_eq!(
             window.on_message(ConfirmMessage::Confirm {}),
-            Some(UnpairEffect::Unpair(demo::service_id("klisi.example.com")))
+            Some(UnpairEffect::Unpair("klisi.example.com".parse().unwrap()))
         );
         assert_eq!(window.on_message(ConfirmMessage::Confirm {}), None);
         assert!(

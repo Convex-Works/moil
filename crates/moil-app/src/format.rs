@@ -43,13 +43,21 @@ pub fn percent(fraction: f64) -> Option<u8> {
         .then(|| (fraction.clamp(0.0, 1.0) * 100.0).floor() as u8)
 }
 
+/// A percentage padded with figure spaces to the width of `100%`:
+/// `\u{2007}\u{2007}7%`, `\u{2007}42%`. In a font with tabular digits,
+/// where a figure space is as wide as a digit, its width never changes.
+pub fn fixed_percent(percent: u8) -> String {
+    format!("{percent:\u{2007}>3}%")
+}
+
+const MINUTE: u64 = 60;
+const HOUR: u64 = 60 * MINUTE;
+const DAY: u64 = 24 * HOUR;
+
 /// How long ago `then` was, coarsely: `just now`, `5 minutes ago`,
 /// `3 weeks ago`. A time in the future (a skewed clock) is `just now`.
 pub fn ago(then: SystemTime, now: SystemTime) -> String {
     let secs = now.duration_since(then).unwrap_or_default().as_secs();
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
     let (count, unit) = match secs {
         s if s < MINUTE => return "just now".to_owned(),
         s if s < HOUR => (s / MINUTE, "minute"),
@@ -61,6 +69,15 @@ pub fn ago(then: SystemTime, now: SystemTime) -> String {
         s => (s / (365 * DAY), "year"),
     };
     format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
+
+/// How long until [`ago`] may read differently: it only changes a whole
+/// number of minutes after `then`.
+pub fn ago_changes_in(then: SystemTime, now: SystemTime) -> Duration {
+    let elapsed = now.duration_since(then).unwrap_or_default();
+    let minute = Duration::from_secs(MINUTE);
+    let into_minute = elapsed.as_nanos() % minute.as_nanos();
+    minute - Duration::from_nanos(into_minute as u64)
 }
 
 /// A short wait, rounded up so that it never reads zero before it's over:
@@ -146,6 +163,60 @@ mod tests {
         assert_eq!(ago(before(21 * 86400), now), "3 weeks ago");
         assert_eq!(ago(before(100 * 86400), now), "3 months ago");
         assert_eq!(ago(before(800 * 86400), now), "2 years ago");
+    }
+
+    #[test]
+    fn fixed_percentages_are_all_as_wide_as_100() {
+        assert_eq!(fixed_percent(7), "\u{2007}\u{2007}7%");
+        assert_eq!(fixed_percent(42), "\u{2007}42%");
+        assert_eq!(fixed_percent(100), "100%");
+        for percent in 0..=100 {
+            let text = fixed_percent(percent);
+            assert_eq!(text.chars().count(), 4, "{text:?}");
+            let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+            assert_eq!(
+                digits,
+                percent.to_string(),
+                "padded with figure spaces only"
+            );
+            assert!(
+                text.trim_start_matches('\u{2007}')
+                    .starts_with(|c: char| c.is_ascii_digit())
+            );
+        }
+    }
+
+    #[test]
+    fn ago_is_refreshed_on_the_minutes_after_the_moment() {
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let changes_in = |elapsed: Duration| ago_changes_in(then, then + elapsed);
+        assert_eq!(changes_in(Duration::ZERO), Duration::from_secs(60));
+        assert_eq!(
+            changes_in(Duration::from_millis(59_500)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(changes_in(Duration::from_secs(61)), Duration::from_secs(59));
+        assert_eq!(
+            changes_in(Duration::from_secs(3 * 3600 + 10)),
+            Duration::from_secs(50)
+        );
+        assert_eq!(
+            ago_changes_in(then + Duration::from_secs(90), then),
+            Duration::from_secs(60),
+            "a skewed clock still refreshes"
+        );
+        // Every change of `ago` falls on one of those refreshes.
+        let mut at = Duration::ZERO;
+        while at < Duration::from_secs(3 * DAY) {
+            let next = at + changes_in(at);
+            let later = |d: Duration| ago(then, then + d);
+            assert_eq!(
+                later(at),
+                later(next - Duration::from_millis(1)),
+                "at {at:?}"
+            );
+            at = next;
+        }
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! It simulates two services: klisi, connected, which offers transcribe
 //! 0.3.0 to replace the approved 0.2.0 (so the review shows a diff), and
 //! lab, which keeps failing to connect. Jobs for klisi come and go through
-//! every phase; pairing with any address succeeds after a few seconds with
-//! the code WDJB-MJHT, unless its host starts with `deny`.
+//! every phase, and one in three runs out of GPU memory; stopping one
+//! takes a moment, as a real script's would. Pairing with any address
+//! succeeds after a few seconds with the code WDJB-MJHT, unless its host
+//! starts with `deny`.
 //!
 //! The transcribe bundles are real: their lockfiles come from
 //! `uv lock --script`, and their assets' hashes from Hugging Face.
@@ -16,11 +18,11 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use moil_agent::{
-    Approval, BundleStatus, Connection, Error, JobStatus, PairedService, Review, ServiceId,
-    ServiceStatus, Snapshot,
+    Approval, BundleStatus, Connection, Error, JobOutcome, JobReport, JobStatus, PairedService,
+    Review, ServiceId, ServiceStatus, Snapshot,
 };
 use moil_bundle::Bundle;
-use moil_proto::{BundleHash, BundleInfo, JobId, Phase};
+use moil_proto::{BundleHash, BundleInfo, ErrorCode, JobId, Phase};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use url::Url;
@@ -59,13 +61,6 @@ fn minimal() -> Bundle {
     .expect("the spec's minimal bundle is valid")
 }
 
-/// A [`ServiceId`] for demo and test services. moil-agent keeps its
-/// constructor to itself, so this goes through the ID's serialized form.
-pub fn service_id(id: &str) -> ServiceId {
-    serde_json::from_value(serde_json::Value::String(id.to_owned()))
-        .expect("a service ID is a plain string")
-}
-
 /// How long the demo's simulated work takes.
 mod pace {
     use std::time::Duration;
@@ -76,6 +71,8 @@ mod pace {
     /// Between progress reports: 100 of them make a 25-second job.
     pub const PROGRESS: Duration = Duration::from_millis(250);
     pub const UPLOADING: Duration = Duration::from_millis(1500);
+    /// For a stopped script to exit.
+    pub const STOPPING: Duration = Duration::from_millis(1500);
     pub const FETCH: Duration = Duration::from_millis(600);
     pub const CONTACT: Duration = Duration::from_millis(800);
     pub const CONFIRM: Duration = Duration::from_secs(5);
@@ -85,7 +82,13 @@ mod pace {
     pub const SHUTDOWN: Duration = Duration::from_millis(400);
 }
 
-const MEETINGS: [&str; 3] = ["Weekly sync", "Design review", "1:1 Ada / Grace"];
+/// The demo's jobs, in turn: a meeting, and the percentage at which its
+/// script runs out of GPU memory, if it does.
+const MEETINGS: [(&str, Option<u32>); 3] = [
+    ("Weekly sync", None),
+    ("Design review", Some(72)),
+    ("1:1 Ada / Grace", None),
+];
 
 /// A simulated agent. See the module docs. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -98,6 +101,8 @@ struct State {
     paired: Mutex<Vec<PairedService>>,
     /// Set to stop the running job.
     stop: watch::Sender<bool>,
+    /// The bundle the running job runs.
+    running: Mutex<Option<BundleHash>>,
     bundles: Vec<Bundle>,
 }
 
@@ -113,17 +118,19 @@ impl Demo {
             version: bundle.manifest().version.clone(),
             approved_at: days_ago(days),
         };
+        let klisi_url: Url = "https://klisi.example.com/moil".parse().expect("a URL");
         let klisi = PairedService {
-            id: service_id("klisi.example.com"),
-            base_url: "https://klisi.example.com/moil".parse().expect("a URL"),
+            id: ServiceId::derive(&klisi_url, |_| false),
+            base_url: klisi_url,
             name: "klisi".into(),
             machine_id: "m_7Hq2Xk9Lw3".into(),
             paired_at: days_ago(64),
             approvals: vec![approval(&v2, 23)],
         };
+        let lab_url: Url = "https://lab.example.org/moil".parse().expect("a URL");
         let lab = PairedService {
-            id: service_id("lab.example.org"),
-            base_url: "https://lab.example.org/moil".parse().expect("a URL"),
+            id: ServiceId::derive(&lab_url, |_| false),
+            base_url: lab_url,
             name: "lab".into(),
             machine_id: "m_Qe2wBv0V8i".into(),
             paired_at: days_ago(9),
@@ -143,19 +150,26 @@ impl Demo {
                 ),
             ],
             job: None,
+            last_job: Some(JobReport {
+                service: klisi.id.clone(),
+                job_id: JobId::new("j_4099").expect("a job ID"),
+                attempt: 1,
+                title: Some(MEETINGS[2].0.into()),
+                bundle_name: v2.manifest().name.clone(),
+                outcome: JobOutcome::Succeeded,
+                ended_at: now - Duration::from_secs(2 * 3600),
+            }),
         };
+        let (klisi_id, lab_id) = (klisi.id.clone(), lab.id.clone());
         let state = Arc::new(State {
             snapshot: watch::Sender::new(snapshot),
             paired: Mutex::new(vec![klisi, lab]),
             stop: watch::Sender::new(false),
+            running: Mutex::new(None),
             bundles: vec![v2, v3, minimal],
         });
-        tokio::spawn(state.clone().run_jobs());
-        tokio::spawn(
-            state
-                .clone()
-                .keep_reconnecting(service_id("lab.example.org")),
-        );
+        tokio::spawn(state.clone().run_jobs(klisi_id));
+        tokio::spawn(state.clone().keep_reconnecting(lab_id));
         Self(state)
     }
 }
@@ -183,47 +197,63 @@ impl State {
         }
     }
 
-    /// Runs a job for klisi now and then, while not paused.
-    async fn run_jobs(self: Arc<Self>) {
+    /// Stops the running job, if any. It shows as stopping until it ends.
+    fn stop_job(&self) {
+        self.update_job(|job| job.stopping = true);
+        self.stop.send_replace(true);
+    }
+
+    /// Runs a job for `klisi` now and then, while not paused.
+    async fn run_jobs(self: Arc<Self>, klisi: ServiceId) {
         let mut paused = self.snapshot.subscribe();
-        for (n, meeting) in MEETINGS.iter().cycle().enumerate() {
+        for (n, (meeting, fails_at)) in MEETINGS.into_iter().cycle().enumerate() {
             sleep(pace::IDLE).await;
             if paused.wait_for(|s| !s.paused).await.is_err() {
                 return;
             }
-            let klisi = service_id("klisi.example.com");
             let Some(bundle) = self.approved_bundles(&klisi).pop() else {
                 continue;
             };
             self.stop.send_replace(false);
+            *self.running.lock().expect("the demo's state") = Some(bundle.hash());
             self.update(|s| {
                 s.job = Some(JobStatus {
-                    service: klisi,
+                    service: klisi.clone(),
                     job_id: JobId::new(format!("j_{}", 4100 + n)).expect("a job ID"),
                     attempt: 1,
-                    title: Some((*meeting).into()),
+                    title: Some(meeting.into()),
                     bundle_name: bundle.manifest().name.clone(),
                     phase: Phase::Preparing,
                     fraction: None,
                     message: None,
                     started_at: Instant::now(),
+                    stopping: false,
                 })
             });
-            self.run_job().await;
-            self.update(|s| s.job = None);
+            let outcome = self.run_job(fails_at).await;
+            *self.running.lock().expect("the demo's state") = None;
+            self.update(|s| s.last_job = s.job.take().map(|job| job.ended(outcome)));
         }
     }
 
-    async fn run_job(&self) {
+    /// Takes the job through its phases, unless its script fails at
+    /// `fails_at` percent or the job is stopped.
+    async fn run_job(&self, fails_at: Option<u32>) -> JobOutcome {
         if !self.work(pace::PREPARING).await {
-            return;
+            return self.wind_down().await;
         }
         self.update_job(|job| job.phase = Phase::Downloading);
         if !self.work(pace::DOWNLOADING).await {
-            return;
+            return self.wind_down().await;
         }
         self.update_job(|job| job.phase = Phase::Running);
         for percent in 0..=100u32 {
+            if fails_at == Some(percent) {
+                return JobOutcome::Failed {
+                    code: ErrorCode::ScriptError,
+                    message: "CUDA out of memory".into(),
+                };
+            }
             let message = match percent {
                 0..5 => "loading model",
                 5..60 => "transcribing",
@@ -235,11 +265,20 @@ impl State {
                 job.message = Some(message.into());
             });
             if !self.work(pace::PROGRESS).await {
-                return;
+                return self.wind_down().await;
             }
         }
         self.update_job(|job| job.phase = Phase::Uploading);
-        self.work(pace::UPLOADING).await;
+        if !self.work(pace::UPLOADING).await {
+            return self.wind_down().await;
+        }
+        JobOutcome::Succeeded
+    }
+
+    /// A stopped script takes a moment to exit.
+    async fn wind_down(&self) -> JobOutcome {
+        sleep(pace::STOPPING).await;
+        JobOutcome::Interrupted
     }
 
     /// Fails to connect to `service` forever, backing off like the agent.
@@ -312,20 +351,8 @@ impl State {
 
     fn add_service(&self, url: &Url, name: &str) -> PairedService {
         let mut paired = self.paired.lock().expect("the demo's state");
-        let base = match (url.host_str(), url.port()) {
-            (Some(host), Some(port)) => format!("{host}-{port}"),
-            (Some(host), None) => host.to_owned(),
-            _ => "service".to_owned(),
-        };
-        let id = (1..)
-            .map(|n| match n {
-                1 => base.clone(),
-                n => format!("{base}-{n}"),
-            })
-            .find(|id| paired.iter().all(|s| s.id.as_str() != id))
-            .expect("an unused ID");
         let service = PairedService {
-            id: service_id(&id),
+            id: ServiceId::derive(url, |id| paired.iter().any(|s| s.id.as_str() == id)),
             base_url: url.clone(),
             name: name.to_owned(),
             machine_id: "m_demo".into(),
@@ -373,10 +400,23 @@ impl State {
         Ok(())
     }
 
+    /// Withdraws an approval, stopping the running job if it runs that
+    /// bundle for that service, as the agent does.
     fn revoke(&self, id: &ServiceId, hash: BundleHash) -> Result<()> {
         self.change_service(id, |service| service.approvals.retain(|a| a.hash != hash))?;
         self.set_approved(id, hash, false);
+        let runs_it =
+            *self.running.lock().expect("the demo's state") == Some(hash) && self.running_for(id);
+        if runs_it {
+            self.stop_job();
+        }
         Ok(())
+    }
+
+    /// Whether the running job is `id`'s.
+    fn running_for(&self, id: &ServiceId) -> bool {
+        let snapshot = self.snapshot.borrow();
+        snapshot.job.as_ref().is_some_and(|job| job.service == *id)
     }
 
     fn unpair(&self, id: &ServiceId) {
@@ -384,14 +424,8 @@ impl State {
             .lock()
             .expect("the demo's state")
             .retain(|s| s.id != *id);
-        let running_for_it = self
-            .snapshot
-            .borrow()
-            .job
-            .as_ref()
-            .is_some_and(|job| job.service == *id);
-        if running_for_it {
-            self.stop.send_replace(true);
+        if self.running_for(id) {
+            self.stop_job();
         }
         self.update(|s| s.services.retain(|s| s.id != *id));
     }
@@ -514,7 +548,7 @@ impl Backend for Demo {
     }
 
     fn stop_job(&self) {
-        self.0.stop.send_replace(true);
+        self.0.stop_job();
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
@@ -562,6 +596,8 @@ mod tests {
             review.diff().unwrap().iter().all(|d| !d.is_unchanged()),
             "every file changed"
         );
+        let last = snapshot.last_job.expect("a job ran before");
+        assert_eq!(last.outcome, JobOutcome::Succeeded);
     }
 
     #[tokio::test(start_paused = true)]
@@ -593,6 +629,34 @@ mod tests {
         );
         assert!(fractions.is_sorted() && fractions.first() == Some(&0.0));
         assert_eq!(fractions.last(), Some(&1.0));
+        let last = snapshots.borrow().last_job.clone().unwrap();
+        assert_eq!(
+            (last.title.as_deref(), last.outcome),
+            (Some("Weekly sync"), JobOutcome::Succeeded)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_second_job_runs_out_of_memory() {
+        let demo = Demo::start();
+        let mut snapshots = demo.subscribe();
+        let snapshot = snapshots
+            .wait_for(|s| {
+                s.last_job
+                    .as_ref()
+                    .is_some_and(|j| j.title.as_deref() == Some("Design review"))
+            })
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(
+            snapshot.last_job.unwrap().outcome,
+            JobOutcome::Failed {
+                code: ErrorCode::ScriptError,
+                message: "CUDA out of memory".into()
+            }
+        );
+        assert!(snapshot.job.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -601,7 +665,15 @@ mod tests {
         let mut snapshots = demo.subscribe();
         snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
         demo.stop_job();
-        snapshots.wait_for(|s| s.job.is_none()).await.unwrap();
+        assert!(snapshot(&demo).job.unwrap().stopping, "at once");
+        sleep(pace::STOPPING / 2).await;
+        assert!(snapshot(&demo).job.is_some(), "the script takes a moment");
+        let ended = snapshots.wait_for(|s| s.job.is_none()).await.unwrap();
+        assert_eq!(
+            ended.last_job.clone().unwrap().outcome,
+            JobOutcome::Interrupted
+        );
+        drop(ended); // before changing the snapshot
 
         demo.set_paused(true);
         sleep(Duration::from_secs(600)).await;
@@ -629,6 +701,14 @@ mod tests {
                 .any(|s| s.id == service.id && s.connection == Connection::Connected)
         );
 
+        let loopback = demo.pair("http://[::1]:8787/moil".into()).await.unwrap();
+        let service = loopback.confirmed.await.unwrap();
+        assert_eq!(
+            service.id.as_str(),
+            "1-8787",
+            "IDs are derived as the agent does"
+        );
+
         let denied = demo.pair("https://deny.example.net/moil".into()).await;
         assert!(matches!(
             denied.unwrap().confirmed.await,
@@ -643,7 +723,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn approving_the_update_settles_the_review() {
         let demo = Demo::start();
-        let klisi = service_id("klisi.example.com");
+        let klisi: ServiceId = "klisi.example.com".parse().unwrap();
         let review = demo
             .review(klisi.clone(), transcribe_0_3().hash())
             .await
@@ -658,5 +738,27 @@ mod tests {
 
         demo.revoke(klisi, transcribe_0_3().hash()).await.unwrap();
         assert_eq!(snapshot(&demo).pending_reviews().count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revoking_the_running_bundle_stops_its_job() {
+        let demo = Demo::start();
+        let klisi: ServiceId = "klisi.example.com".parse().unwrap();
+        let mut snapshots = demo.subscribe();
+        snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
+
+        // Not the bundle it runs: it carries on.
+        demo.revoke(klisi.clone(), transcribe_0_3().hash())
+            .await
+            .unwrap();
+        assert!(!snapshot(&demo).job.unwrap().stopping);
+
+        demo.revoke(klisi, transcribe_0_2().hash()).await.unwrap();
+        assert!(snapshot(&demo).job.unwrap().stopping);
+        let ended = snapshots.wait_for(|s| s.job.is_none()).await.unwrap();
+        assert_eq!(
+            ended.last_job.clone().unwrap().outcome,
+            JobOutcome::Interrupted
+        );
     }
 }

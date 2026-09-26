@@ -29,7 +29,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::connection::{self, LinkEvent};
-use super::{AgentOptions, BundleStatus, Connection, JobStatus, ServiceStatus, Snapshot};
+use super::{
+    AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
+};
 use crate::{Machine, PairedService, ServiceId};
 
 /// Everything the coordinator reacts to.
@@ -64,8 +66,8 @@ pub(super) enum Command {
     Paired(Box<PairedService>),
     /// Close the service's channel and forget its attempts.
     Disconnect(ServiceId, oneshot::Sender<()>),
-    /// The service's approvals changed; prepare the bundle if one was
-    /// approved.
+    /// The service's approvals changed: stop its running attempt if its
+    /// bundle is no longer approved, and prepare the bundle if one was.
     Approvals(Box<PairedService>, Option<Box<Bundle>>, oneshot::Sender<()>),
     SetPaused(bool),
     /// The owner stopped the running job.
@@ -111,6 +113,8 @@ pub(super) struct Coordinator {
     attempts: BTreeMap<AttemptKey, Attempt>,
     /// The one attempt running on this machine, if any.
     running: Option<Running>,
+    /// The attempt that ran before, once it ended.
+    last_job: Option<JobReport>,
     next_task: u64,
     shutdown: Option<Shutdown>,
     /// Callers to answer at the end of this round.
@@ -216,8 +220,19 @@ impl Attempt {
 
 struct Running {
     key: AttemptKey,
+    /// The approved bundle it runs.
+    bundle: BundleHash,
     stopper: Stopper,
     status: JobStatus,
+}
+
+impl Running {
+    /// Asks the attempt to stop; the first reason given wins. It shows as
+    /// stopping until the executor returns.
+    fn stop(&mut self, reason: StopReason) {
+        self.stopper.stop(reason);
+        self.status.stopping = true;
+    }
 }
 
 #[derive(Default)]
@@ -253,6 +268,7 @@ impl Coordinator {
             services: BTreeMap::new(),
             attempts: BTreeMap::new(),
             running: None,
+            last_job: None,
             next_task: 0,
             shutdown: None,
             replies: Vec::new(),
@@ -332,6 +348,17 @@ impl Coordinator {
                 }
             }
             Command::Approvals(paired, approved, reply) => {
+                if let Some(running) = &mut self.running
+                    && running.key.service == paired.id
+                    && !paired.is_approved(&running.bundle)
+                {
+                    // The owner no longer consents to running it.
+                    tracing::info!(
+                        "stopping {}: its bundle's approval was revoked",
+                        running.key
+                    );
+                    running.stop(StopReason::Interrupted);
+                }
                 if let Some(service) = self.services.get_mut(&paired.id) {
                     service.paired = *paired;
                 }
@@ -350,17 +377,17 @@ impl Coordinator {
                 }
             }
             Command::StopJob => {
-                if let Some(running) = &self.running {
+                if let Some(running) = &mut self.running {
                     tracing::info!("stopping {}", running.key);
-                    running.stopper.stop(StopReason::Interrupted);
+                    running.stop(StopReason::Interrupted);
                 }
             }
             Command::Shutdown(reply) => {
                 let deliver_by = Instant::now() + self.options.shutdown_grace;
                 let shutdown = self.shutdown.get_or_insert_with(Shutdown::default);
                 shutdown.waiters.push(reply);
-                match &self.running {
-                    Some(running) => running.stopper.stop(StopReason::Interrupted),
+                match &mut self.running {
+                    Some(running) => running.stop(StopReason::Interrupted),
                     None => {
                         shutdown.deliver_by.get_or_insert(deliver_by);
                     }
@@ -556,10 +583,12 @@ impl Coordinator {
             fraction: None,
             message: None,
             started_at: Instant::now(),
+            stopping: false,
         };
         self.attempts.insert(key.clone(), attempt);
         self.running = Some(Running {
             key: key.clone(),
+            bundle: bundle.hash(),
             stopper,
             status,
         });
@@ -660,8 +689,8 @@ impl Coordinator {
     }
 
     fn finished(&mut self, key: AttemptKey, outcome: Outcome) {
-        if self.running.as_ref().is_some_and(|r| r.key == key) {
-            self.running = None;
+        if let Some(running) = self.running.take_if(|r| r.key == key) {
+            self.last_job = Some(running.status.ended((&outcome).into()));
             if let Some(shutdown) = &mut self.shutdown {
                 shutdown.deliver_by = Some(Instant::now() + self.options.shutdown_grace);
             }
@@ -691,9 +720,9 @@ impl Coordinator {
             service: id.clone(),
             attempt,
         };
-        if let Some(running) = self.running.as_ref().filter(|r| r.key == key) {
+        if let Some(running) = self.running.as_mut().filter(|r| r.key == key) {
             tracing::info!("{id} cancelled {key}");
-            running.stopper.stop(StopReason::Cancelled);
+            running.stop(StopReason::Cancelled);
         }
     }
 
@@ -701,8 +730,8 @@ impl Coordinator {
     /// is sent.
     fn abandon(&mut self, key: &AttemptKey) {
         self.attempts.remove(key);
-        if let Some(running) = self.running.as_ref().filter(|r| r.key == *key) {
-            running.stopper.stop(StopReason::Cancelled);
+        if let Some(running) = self.running.as_mut().filter(|r| r.key == *key) {
+            running.stop(StopReason::Cancelled);
         }
     }
 
@@ -710,8 +739,8 @@ impl Coordinator {
     /// machine's messages, stopping the running one.
     fn drop_attempts(&mut self, id: &ServiceId) {
         self.attempts.retain(|key, _| key.service != *id);
-        if let Some(running) = self.running.as_ref().filter(|r| r.key.service == *id) {
-            running.stopper.stop(StopReason::Interrupted);
+        if let Some(running) = self.running.as_mut().filter(|r| r.key.service == *id) {
+            running.stop(StopReason::Interrupted);
         }
     }
 
@@ -889,6 +918,7 @@ impl Coordinator {
                 })
                 .collect(),
             job: self.running.as_ref().map(|r| r.status.clone()),
+            last_job: self.last_job.clone(),
         };
         self.snapshot.send_if_modified(|current| {
             let changed = *current != snapshot;
