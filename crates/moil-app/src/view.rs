@@ -34,6 +34,8 @@ pub struct ViewContext<'a> {
     pub clock: SystemTime,
     /// Whether moil opens at login; `None` where that can't be changed.
     pub open_at_login: Option<bool>,
+    /// Whether the app keeps a log file to show the owner.
+    pub has_log: bool,
     /// The app is shutting the agent down.
     pub quitting: bool,
     /// Reviews the owner put off with "Not now". They stay in the menu but
@@ -109,6 +111,8 @@ pub enum Action {
     },
     Unpair(ServiceId),
     ToggleOpenAtLogin,
+    /// Show the log file in Finder.
+    ShowLog,
     Quit,
 }
 
@@ -396,6 +400,12 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         enabled: cx.open_at_login.is_some(),
         action: Action::ToggleOpenAtLogin,
     });
+    if cx.has_log {
+        entries.push(Entry::item(
+            Label::new("Show Log in Finder"),
+            Action::ShowLog,
+        ));
+    }
     entries.push(Entry::item(Label::new("Quit moil"), Action::Quit));
     MenuModel { entries }
 }
@@ -587,6 +597,7 @@ mod tests {
         clock: SystemTime,
         deferred: HashSet<(ServiceId, BundleHash)>,
         open_at_login: Option<bool>,
+        has_log: bool,
         quitting: bool,
     }
 
@@ -597,6 +608,7 @@ mod tests {
                 clock: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
                 deferred: HashSet::new(),
                 open_at_login: Some(true),
+                has_log: true,
                 quitting: false,
             }
         }
@@ -608,6 +620,7 @@ mod tests {
                     now: self.now,
                     clock: self.clock,
                     open_at_login: self.open_at_login,
+                    has_log: self.has_log,
                     quitting: self.quitting,
                     deferred: &self.deferred,
                 },
@@ -690,6 +703,7 @@ mod tests {
                 "[Pair with a Service…]",
                 "---",
                 "[✓ Open at Login]",
+                "[Show Log in Finder]",
                 "[Quit moil]",
             ]
         );
@@ -726,6 +740,16 @@ mod tests {
             menu.action("Unpair klisi…"),
             Some(&Action::Unpair("klisi.example.com".parse().unwrap()))
         );
+        assert_eq!(menu.action("Show Log in Finder"), Some(&Action::ShowLog));
+        assert_eq!(menu.action("Quit moil"), Some(&Action::Quit));
+    }
+
+    #[test]
+    fn the_log_is_offered_only_when_there_is_one() {
+        let mut fx = Fixture::new();
+        fx.has_log = false;
+        let menu = fx.view(&Snapshot::default()).menu;
+        assert_eq!(menu.action("Show Log in Finder"), None);
         assert_eq!(menu.action("Quit moil"), Some(&Action::Quit));
     }
 

@@ -1,5 +1,9 @@
 //! The little that differs between platforms.
 
+use std::io;
+use std::path::Path;
+use std::process::Command;
+
 use tao::event_loop::EventLoop;
 use tray_icon::menu::Menu;
 use url::Url;
@@ -71,6 +75,32 @@ pub fn use_tabular_digits(icon: &tray_icon::TrayIcon) {
     }
     #[cfg(not(target_os = "macos"))]
     let _ = icon;
+}
+
+/// Shows a file in the file manager: selected in a Finder window on macOS,
+/// its folder elsewhere. A file that is gone shows its folder.
+pub fn reveal(path: &Path) {
+    let path = path.to_owned();
+    // Waits for `open` to hand the request to Finder, so off the event loop.
+    std::thread::spawn(move || {
+        let revealed = if cfg!(target_os = "macos") && path.exists() {
+            Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .status()
+                .and_then(|status| {
+                    status
+                        .success()
+                        .then_some(())
+                        .ok_or_else(|| io::Error::other(format!("open -R answered {status}")))
+                })
+        } else {
+            open::that_detached(path.parent().unwrap_or(&path))
+        };
+        if let Err(e) = revealed {
+            tracing::warn!("couldn't show {}: {e}", path.display());
+        }
+    });
 }
 
 /// Opens a web page in the owner's browser. Only `http` and `https` URLs

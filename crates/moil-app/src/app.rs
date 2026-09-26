@@ -6,6 +6,7 @@
 //! for, on the main thread for windows and on Tokio for the agent.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -73,12 +74,14 @@ pub enum AppEvent {
 }
 
 /// Runs the app until the owner quits. `backend` is the agent, or why it
-/// couldn't start; `links` are `moil://` links from the command line.
+/// couldn't start; `links` are `moil://` links from the command line;
+/// `log_file` is where the app logs, if it keeps a file.
 pub fn run(
     runtime: tokio::runtime::Runtime,
     backend: Result<Arc<dyn Backend>, String>,
     login: Box<dyn LoginItem>,
     links: Vec<String>,
+    log_file: Option<PathBuf>,
 ) -> ! {
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     platform::configure(&mut event_loop);
@@ -96,6 +99,7 @@ pub fn run(
         runtime,
         proxy,
         login,
+        log_file,
         tray: None,
         snapshot: Snapshot::default(),
         deferred: HashSet::new(),
@@ -135,6 +139,7 @@ struct App {
     runtime: tokio::runtime::Runtime,
     proxy: EventLoopProxy<AppEvent>,
     login: Box<dyn LoginItem>,
+    log_file: Option<PathBuf>,
     tray: Option<Tray>,
     snapshot: Snapshot,
     /// Reviews the owner closed without approving.
@@ -230,6 +235,7 @@ impl App {
                 now: Instant::now(),
                 clock: SystemTime::now(),
                 open_at_login: self.login.enabled(),
+                has_log: self.log_file.is_some(),
                 quitting: self.quitting,
                 deferred: &self.deferred,
             },
@@ -323,6 +329,11 @@ impl App {
                     self.open(target, frame, &html, Content::Notice { quit: false });
                 }
                 self.refresh_tray();
+            }
+            Action::ShowLog => {
+                if let Some(path) = &self.log_file {
+                    platform::reveal(path);
+                }
             }
             Action::Quit => self.quit(),
         }
