@@ -1,0 +1,51 @@
+{{define "title"}}{{or .Job.Title .Job.Run.ID}} · moil demo{{end}}
+{{define "content"}}
+<h1>{{or .Job.Title .Job.Run.ID}}</h1>
+<p class="muted">
+  <span class="pill {{.Job.Run.State}}" id="state">{{.Job.Run.State}}</span>
+  {{.Job.Bundle.Name}} {{.Job.Bundle.Version}} · <code>{{.Job.Run.ID}}</code>
+</p>
+
+{{if not .Running}}
+<section>
+  <h2>Result</h2>
+  {{with .Error}}<p class="error">{{.}}</p>{{end}}
+  {{if .Result}}
+    {{if .Outputs}}
+    <table>
+      <tr><th>Output</th><th>Size</th><th>SHA-256</th></tr>
+      {{range .Outputs}}
+      <tr><td><a href="{{.URL}}">{{.Name}}</a></td><td>{{.Size}} bytes</td><td><code title="{{.SHA256}}">{{short .SHA256}}…</code></td></tr>
+      {{end}}
+    </table>
+    {{else}}<p class="muted">No output files.</p>{{end}}
+    {{with .Meta}}<p>Metadata from the script:</p><pre>{{.}}</pre>{{end}}
+  {{else if not .Error}}<p class="muted">Cancelled.</p>{{end}}
+</section>
+{{end}}
+
+<section>
+  <h2>Events</h2>
+  <table class="events" id="events">
+    {{range .Events}}<tr><td>{{.Time}}</td><td>{{.Text}}</td></tr>{{end}}
+  </table>
+</section>
+
+{{if .Running}}
+<script>
+  // Follow the job live: every event from the first, then reload for the
+  // result when it ends.
+  const table = document.getElementById("events");
+  const stream = new EventSource(location.pathname + "/events");
+  stream.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    const row = table.insertRow();
+    row.insertCell().textContent = ev.time;
+    row.insertCell().textContent = ev.text;
+    if (ev.kind === "assigned") document.getElementById("state").textContent = "running";
+    if (ev.kind === "retrying") document.getElementById("state").textContent = "queued";
+  };
+  stream.addEventListener("end", () => { stream.close(); location.reload(); });
+</script>
+{{end}}
+{{end}}

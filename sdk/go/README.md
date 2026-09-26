@@ -1,0 +1,204 @@
+# moil Go SDK
+
+The service side of [moil](../../README.md): let the people who use your
+service lend it their machines, one approved job at a time. The SDK pairs
+machines, keeps a WebSocket to each, publishes your job bundles and
+schedules jobs onto the machines your policy allows. It implements
+[spec/protocol.md](../../spec/protocol.md), version 1.
+
+```
+go get git.convex.works/ConvexWorks/moil/sdk/go
+```
+
+- `moil`: the SDK.
+- `moiltest`: a fake machine for testing your service without the moil
+  app.
+
+It needs Go 1.24 and depends only on `github.com/coder/websocket` and
+`github.com/BurntSushi/toml`.
+
+## Mount the server
+
+```go
+store, err := moil.NewFileStore("data/moil-machines.json") // or your own moil.Store
+srv, err := moil.NewServer(moil.Config{
+	Name:            "klisi",
+	VerificationURL: "https://klisi.example.com/machines/pair",
+	Store:           store,
+	Logger:          slog.Default(),
+})
+defer srv.Close()
+
+mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
+```
+
+Users add your service in the moil app by its moil base URL, here
+`https://klisi.example.com/moil`. Machines need https, except on loopback
+addresses.
+
+`Store` keeps paired machines and the SHA-256 of their tokens, never the
+tokens. `FileStore` suits one process and a few hundred machines; for more,
+implement `moil.Store` over your database and check it with
+`moiltest.TestStore`. Timing knobs (`BidWindow`, `LeaseTTL`, `MaxAttempts`,
+`PingInterval`, …) default to the spec's values.
+
+## Confirm pairings
+
+Pairing is a device-code flow: the app shows a code like `WDJB-MJHT` and
+opens `VerificationURL?code=WDJB-MJHT` in the browser, where the user is
+signed in to your service. That page is yours:
+
+```go
+func (s *Service) pairPage(w http.ResponseWriter, r *http.Request) {
+	user := s.mustSignIn(w, r)
+	p, ok := s.moil.PendingPairing(r.URL.Query().Get("code"))
+	if !ok { /* unknown or expired code: let them type it again */ }
+	// Show p.Name, p.OS, p.Arch and p.Code, with Confirm and Deny.
+}
+
+func (s *Service) confirmPairing(w http.ResponseWriter, r *http.Request) {
+	user := s.mustSignIn(w, r)
+	code := r.FormValue("code")
+	if r.FormValue("action") == "deny" {
+		s.moil.DenyPairing(code)
+		return
+	}
+	m, err := s.moil.ConfirmPairing(r.Context(), code, user.ID) // user.ID becomes m.Owner
+	...
+}
+```
+
+Codes are compared case-insensitively, with or without the hyphen. The
+app picks up its token on its next poll.
+
+`srv.Machines(ctx, user.ID)` lists a user's machines: online or not, their
+state (idle, busy, paused, offline), hardware, and the bundle hashes the
+owner approved. `srv.RemoveMachine(ctx, id)` unpairs one; check it's the
+user's own first.
+
+## Publish bundles
+
+A bundle is `job.py`, `job.py.lock` and `manifest.json`
+([spec §5](../../spec/protocol.md#5-job-bundles)). Load and add every
+bundle you'll send jobs for; machines see the list and their owners review
+and approve each one by hash.
+
+```go
+//go:embed bundles
+var bundles embed.FS
+
+sub, _ := fs.Sub(bundles, "bundles/transcribe")
+transcribe, err := moil.LoadBundle(sub) // validates and hashes
+srv.AddBundle(transcribe)
+```
+
+A new version of a bundle has a new hash and needs a new approval, so
+keep publishing the old version until owners have approved the new one.
+
+## Submit jobs
+
+```go
+run, err := srv.Submit(ctx, moil.Job{
+	ID:       "meeting-42-transcript", // optional; same ID, same Run
+	Bundle:   transcribe,
+	Title:    "Weekly sync",
+	Params:   map[string]any{"language": "en"},
+	Inputs:   map[string]moil.Download{"audio.ogg": {URL: presignedGet}},
+	Outputs:  map[string]moil.Upload{"transcript.json": {URL: presignedPut}},
+	Eligible: moil.OwnedBy(room.OwnerID),               // who may see the inputs
+	Prefer:   func(m moil.Machine) int { return len(m.GPUs) }, // optional
+	Timeout:  time.Hour,
+})
+
+for ev := range run.Events(ctx) {
+	switch ev.Kind {
+	case moil.EventProgress:
+		// ev.Fraction, ev.Message
+	case moil.EventData:
+		// ev.Data: whatever your script sent
+	}
+}
+res, err := run.Wait(ctx)
+```
+
+- **Eligibility is required.** Whoever runs a machine can see the job's
+  inputs, so say whose machines may take it: `moil.OwnedBy(owner)`, your
+  own `func(moil.Machine) bool`, or `moil.AnyMachine` when anyone may.
+  Policies run on the scheduler: keep them fast and don't call the Server
+  from them.
+- **Jobs wait** without a time limit until an eligible, connected, idle
+  machine that approved the bundle bids. Among bidders, `Prefer` ranks
+  (highest score wins, ties to the earliest bid); retries rank machines that
+  already failed the job last.
+- **Pre-signed URLs expire.** If a job may wait a while or be retried, set
+  `Prepare` instead of `Inputs` and `Outputs`: it makes each attempt's URLs
+  as the attempt is assigned.
+- **Results.** `Wait` returns a `*moil.Result` (the script's `Meta`, and the
+  size and SHA-256 of each uploaded output), or a `*moil.JobError` with the
+  spec's error code, `moil.ErrCancelled`, or `moil.ErrClosed`.
+- **Events** replay from the first for every reader and end with the run;
+  the Server never drops them or waits for slow readers. Besides the
+  script's `phase`, `progress`, `log` and `data`, you get `queued`,
+  `assigned` (with the machine) and `retrying` (with the error).
+- **Leases and retries.** An attempt whose machine goes quiet for
+  `LeaseTTL` fails with `lease_expired`; a machine that restarts without its
+  attempt loses it (`lost`). Retryable failures are retried up to
+  `MaxAttempts`, not counting attempts that never started.
+- `run.Cancel()` stops a job: at once if it's waiting or its machine is
+  offline, otherwise when the machine confirms.
+
+Jobs live in memory. If the service restarts, unfinished jobs are gone and
+machines drop their attempts; resubmit what must finish, by the same ID,
+on startup. `srv.Run(id)` finds a job while it runs and for
+`KeepFinished` (an hour) after.
+
+## Test with moiltest
+
+`moiltest.Pair` pairs a fake machine with your Server over real HTTP; the
+fake speaks the machine side of the protocol over a real WebSocket and
+behaves like the app by default. Your test plays the script:
+
+```go
+func TestTranscriptionReachesTheRoom(t *testing.T) {
+	svc := newTestService(t) // your service, with its *moil.Server
+	owner := moiltest.Pair(t, svc.moil, "alice", moiltest.WithGPU("RTX 4090", 24<<30))
+	stranger := moiltest.Pair(t, svc.moil, "bob")
+	for _, m := range []*moiltest.Machine{owner, stranger} {
+		m.Approve(svc.transcribeBundle)
+		m.Connect()
+	}
+
+	svc.endMeeting(t, "alice") // submits the job
+
+	a := owner.NextAttempt()
+	audio := a.Input("audio.ogg") // downloads from your storage
+	a.Progress(0.5, "transcribing")
+	a.Output("transcript.json", fakeTranscript(audio)) // uploads to your storage
+	a.Succeed(map[string]any{"speakers": 2})
+
+	// ...assert your service stored the transcript...
+	stranger.Sync()
+	if len(stranger.Offers()) != 0 {
+		t.Fatal("bob's machine was offered alice's meeting")
+	}
+}
+```
+
+Attempts can also fail (`a.Fail`, `a.ScriptError`), go silent until the
+lease runs out (`a.GoSilent`), or carry on across `m.Disconnect()` and
+`m.Connect()`; `m.Crash()` restarts the app without its attempts. Use
+`m.OnOffer` to answer offers yourself, `m.Sync()` before asserting that
+something didn't happen, and `moiltest.At(url)` to reach the Server
+through your own router. Every message your service sends is checked
+against the protocol.
+
+## Try it with the app
+
+[examples/service](../../examples/service) is a small runnable service:
+
+```
+cd examples/service
+go run . -bundles ../bundles/echo -data .demo
+```
+
+Then add `http://127.0.0.1:8787/moil` in the moil app.

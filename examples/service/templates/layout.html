@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{block "title" .}}moil demo{{end}}</title>
+<style>
+  :root {
+    --fg: #1c1f24; --muted: #6b7079; --line: #e4e6ea; --bg: #f6f7f9; --card: #fff;
+    --accent: #2f5bea; --on-accent: #fff; --ok: #1f7a3f; --ok-bg: #e3f4e8; --warn: #95560a; --warn-bg: #fbeed8;
+    --bad: #b3261e; --bad-bg: #fbe4e2; --quiet-bg: #eef0f3;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6e8eb; --muted: #969ba4; --line: #2c3036; --bg: #15171a; --card: #1c1f23;
+      --accent: #7c9cff; --on-accent: #0d1330; --ok: #7fd49a; --ok-bg: #1d3325; --warn: #f0bf6c; --warn-bg: #3a2c14;
+      --bad: #ff8c80; --bad-bg: #3d1d1a; --quiet-bg: #262a30;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+  header a { color: var(--fg); font-weight: 600; text-decoration: none; }
+  h1 { font-size: 20px; margin: 16px 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  a { color: var(--accent); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+  table { width: 100%; border-collapse: collapse; }
+  th { font-weight: 500; color: var(--muted); text-align: left; padding: 4px 8px; }
+  td { padding: 8px; border-top: 1px solid var(--line); vertical-align: top; }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  pre { font-family: var(--mono); font-size: 12.5px; background: var(--quiet-bg); padding: 12px; border-radius: 6px; overflow-x: auto; margin: 0; }
+  .muted { color: var(--muted); }
+  .notice { background: var(--ok-bg); color: var(--ok); padding: 10px 14px; border-radius: 6px; }
+  .error { background: var(--bad-bg); color: var(--bad); padding: 10px 14px; border-radius: 6px; }
+  .pill { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 12px; background: var(--quiet-bg); color: var(--muted); }
+  .pill.idle, .pill.succeeded { background: var(--ok-bg); color: var(--ok); }
+  .pill.busy, .pill.running, .pill.paused { background: var(--warn-bg); color: var(--warn); }
+  .pill.failed { background: var(--bad-bg); color: var(--bad); }
+  form.stack { display: grid; gap: 10px; }
+  label { display: grid; gap: 4px; color: var(--muted); font-size: 13px; }
+  input, select, textarea { font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  textarea { font-family: var(--mono); font-size: 13px; min-height: 80px; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
+  button.link { border: none; background: none; color: var(--muted); padding: 0; text-decoration: underline; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .code { font-family: var(--mono); font-size: 32px; letter-spacing: 0.12em; margin: 8px 0 16px; }
+  .events td { font-family: var(--mono); font-size: 12.5px; padding: 3px 8px; }
+  .events td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+</style>
+</head>
+<body>
+<main>
+<header><a href="/">moil demo service</a><span class="muted">signed in as <b>demo</b></span></header>
+{{template "content" .}}
+</main>
+</body>
+</html>

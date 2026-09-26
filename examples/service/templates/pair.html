@@ -1,0 +1,26 @@
+{{define "title"}}Pair a machine · moil demo{{end}}
+{{define "content"}}
+<h1>Pair a machine</h1>
+<section>
+  {{if .Found}}
+  <p>A machine asks to run jobs for you:</p>
+  <table>
+    <tr><th>Name</th><td><b>{{.Pairing.Name}}</b></td></tr>
+    <tr><th>System</th><td>{{.Pairing.OS}}/{{.Pairing.Arch}}, moil {{.Pairing.AppVersion}}</td></tr>
+  </table>
+  <p>Check that the app on that machine shows this code:</p>
+  <div class="code">{{.Pairing.Code}}</div>
+  <form method="post" action="/pair" class="row">
+    <input type="hidden" name="code" value="{{.Pairing.Code}}">
+    <button class="primary" name="action" value="confirm">Confirm</button>
+    <button name="action" value="deny">Deny</button>
+  </form>
+  {{else}}
+  {{if .Code}}<p class="error">No machine is waiting with code <b>{{.Code}}</b>. Codes expire after 10 minutes.</p>{{end}}
+  <form method="get" action="/pair" class="row">
+    <input name="code" placeholder="XXXX-XXXX" autofocus>
+    <button class="primary">Look up</button>
+  </form>
+  {{end}}
+</section>
+{{end}}
