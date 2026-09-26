@@ -138,6 +138,7 @@ impl Demo {
                 ),
             ],
             job: None,
+            last_job: None,
         };
         let (klisi_id, lab_id) = (klisi.id.clone(), lab.id.clone());
         let state = Arc::new(State {

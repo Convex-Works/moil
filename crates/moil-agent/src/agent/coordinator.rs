@@ -29,7 +29,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::connection::{self, LinkEvent};
-use super::{AgentOptions, BundleStatus, Connection, JobStatus, ServiceStatus, Snapshot};
+use super::{
+    AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
+};
 use crate::{Machine, PairedService, ServiceId};
 
 /// Everything the coordinator reacts to.
@@ -111,6 +113,8 @@ pub(super) struct Coordinator {
     attempts: BTreeMap<AttemptKey, Attempt>,
     /// The one attempt running on this machine, if any.
     running: Option<Running>,
+    /// The attempt that ran before, once it ended.
+    last_job: Option<JobReport>,
     next_task: u64,
     shutdown: Option<Shutdown>,
     /// Callers to answer at the end of this round.
@@ -264,6 +268,7 @@ impl Coordinator {
             services: BTreeMap::new(),
             attempts: BTreeMap::new(),
             running: None,
+            last_job: None,
             next_task: 0,
             shutdown: None,
             replies: Vec::new(),
@@ -684,8 +689,8 @@ impl Coordinator {
     }
 
     fn finished(&mut self, key: AttemptKey, outcome: Outcome) {
-        if self.running.as_ref().is_some_and(|r| r.key == key) {
-            self.running = None;
+        if let Some(running) = self.running.take_if(|r| r.key == key) {
+            self.last_job = Some(running.status.ended((&outcome).into()));
             if let Some(shutdown) = &mut self.shutdown {
                 shutdown.deliver_by = Some(Instant::now() + self.options.shutdown_grace);
             }
@@ -913,6 +918,7 @@ impl Coordinator {
                 })
                 .collect(),
             job: self.running.as_ref().map(|r| r.status.clone()),
+            last_job: self.last_job.clone(),
         };
         self.snapshot.send_if_modified(|current| {
             let changed = *current != snapshot;

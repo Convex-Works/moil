@@ -40,7 +40,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 /// Everything that wakes the event loop, besides the platform's own events.
 #[derive(Debug)]
 pub enum AppEvent {
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     Menu(MenuId),
     /// A page posted a message.
     Ipc {
@@ -210,7 +210,7 @@ impl App {
         let proxy = self.proxy.clone();
         self.runtime.spawn(async move {
             while snapshots.changed().await.is_ok() {
-                let snapshot = snapshots.borrow_and_update().clone();
+                let snapshot = Box::new(snapshots.borrow_and_update().clone());
                 if proxy.send_event(AppEvent::Snapshot(snapshot)).is_err() {
                     break;
                 }
@@ -247,7 +247,7 @@ impl App {
     fn handle(&mut self, event: AppEvent, target: &EventLoopWindowTarget<AppEvent>) {
         match event {
             AppEvent::Snapshot(snapshot) => {
-                self.snapshot = snapshot;
+                self.snapshot = *snapshot;
                 self.refresh_tray();
             }
             AppEvent::Menu(id) => {

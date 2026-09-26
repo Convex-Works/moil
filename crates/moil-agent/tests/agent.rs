@@ -6,7 +6,10 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use moil_agent::{Agent, AgentHandle, AgentOptions, Connection, Machine, PairedService, Settings};
+use moil_agent::{
+    Agent, AgentHandle, AgentOptions, Connection, JobOutcome, JobReport, Machine, PairedService,
+    Settings,
+};
 use moil_bundle::Bundle;
 use moil_proto::control::{EventMessage, Hello, Welcome};
 use moil_proto::{
@@ -155,6 +158,12 @@ fn log(message: &str) -> JobEvent {
     JobEvent::log(LogLevel::Info, message)
 }
 
+/// How the job that just ran ended, once it has.
+async fn last_outcome(agent: &AgentHandle) -> JobOutcome {
+    let snapshot = snapshot_where(agent, "the job to end", |s| s.job.is_none()).await;
+    snapshot.last_job.expect("a job ran").outcome
+}
+
 /// How an attempt that was stopped by the owner or a shutdown ends.
 fn interrupted() -> Outcome {
     Outcome::failed(moil_proto::JobError::new(
@@ -257,6 +266,7 @@ async fn an_assignment_the_machine_cant_take_fails_at_once() {
         (seq, error.code, error.retryable),
         (1, ErrorCode::NotApproved, true)
     );
+    assert_eq!(setup.agent.snapshot().last_job, None, "it never ran");
 
     conn.send(assign("j2", 1, setup.hash(), 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
@@ -320,10 +330,25 @@ async fn an_attempt_reports_its_events_and_outcome_in_order() {
             files: Default::default(),
         },
     };
+    let before = std::time::SystemTime::now();
     run.finish(outcome.clone());
     assert_eq!(conn.recv().await, done("j_42", 1, 5, outcome));
     assert_eq!(conn.recv().await, state(MachineState::Idle));
-    snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+    let snapshot = snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+    let report = snapshot.last_job.unwrap();
+    assert!(report.ended_at >= before, "{report:?}");
+    assert_eq!(
+        report,
+        JobReport {
+            service: setup.paired().id.clone(),
+            job_id: "j_42".parse().unwrap(),
+            attempt: 1,
+            title: Some("j_42 title".into()),
+            bundle_name: "transcribe".into(),
+            outcome: JobOutcome::Succeeded,
+            ended_at: report.ended_at,
+        }
+    );
 
     // Acknowledged, the attempt is forgotten.
     conn.send(ServiceMessage::Ack(attempt("j_42", 1)));
@@ -331,6 +356,42 @@ async fn an_attempt_reports_its_events_and_outcome_in_order() {
     let hello = setup.service().accept().await.hello().await;
     assert_eq!(hello.attempts, []);
     assert_eq!(hello.state, MachineState::Idle);
+}
+
+#[tokio::test]
+async fn the_last_job_says_how_it_ended_until_another_ends() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+    let error = moil_proto::JobError::new(ErrorCode::ScriptError, "CUDA out of memory");
+    run.finish(Outcome::failed(error));
+    failure(conn.recv().await);
+    let failed = JobOutcome::Failed {
+        code: ErrorCode::ScriptError,
+        message: "CUDA out of memory".into(),
+    };
+    assert_eq!(last_outcome(&setup.agent).await, failed);
+
+    // Still the last job while the next one runs...
+    conn.send(assign("j2", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Idle));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let mut run = setup.runs.next().await;
+    let snapshot = snapshot_where(&setup.agent, "the next job", |s| s.job.is_some()).await;
+    let last = snapshot.last_job.unwrap();
+    assert_eq!((last.job_id.as_str(), last.outcome), ("j1", failed));
+
+    // ...until it ends in turn.
+    conn.send(ServiceMessage::Cancel(attempt("j2", 1)));
+    run.stopped().await;
+    let snapshot = snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+    let last = snapshot.last_job.unwrap();
+    assert_eq!(
+        (last.job_id.as_str(), last.outcome),
+        ("j2", JobOutcome::Cancelled)
+    );
 }
 
 #[tokio::test]
@@ -452,7 +513,11 @@ async fn a_stopping_job_shows_as_stopping_until_it_ends() {
 
         run.finish(outcome.clone());
         assert_eq!(conn.recv().await, done("j1", 1, 2, outcome), "{cause}");
-        snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+        let expected = match reason {
+            StopReason::Cancelled => JobOutcome::Cancelled,
+            StopReason::Interrupted => JobOutcome::Interrupted,
+        };
+        assert_eq!(last_outcome(&setup.agent).await, expected, "{cause}");
     }
 }
 
@@ -845,6 +910,7 @@ async fn revoking_a_bundle_stops_its_running_attempt() {
         "another machine may take the job"
     );
     assert_eq!(klisi.recv().await, state(MachineState::Idle));
+    assert_eq!(last_outcome(&setup.agent).await, JobOutcome::Interrupted);
 }
 
 #[tokio::test]
@@ -860,7 +926,7 @@ async fn unpairing_stops_the_services_running_attempt() {
     // Nothing more is said: the service fails the attempt as `lost` when
     // it removes the machine.
     assert_eq!(conn.closed().await, Some(1000));
-    snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+    assert_eq!(last_outcome(&setup.agent).await, JobOutcome::Interrupted);
 }
 
 #[tokio::test]

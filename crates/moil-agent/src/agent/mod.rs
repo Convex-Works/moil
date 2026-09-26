@@ -10,10 +10,10 @@ mod connection;
 mod coordinator;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use moil_proto::control::BundleInfo;
-use moil_proto::{BundleHash, JobId, Phase};
+use moil_proto::{BundleHash, ErrorCode, JobId, Outcome, Phase};
 use moil_runtime::Executor;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
@@ -196,6 +196,9 @@ pub struct Snapshot {
     pub services: Vec<ServiceStatus>,
     /// The running attempt, if any.
     pub job: Option<JobStatus>,
+    /// The attempt that ran here last, since the agent started, once it
+    /// has ended. Attempts refused without running don't count.
+    pub last_job: Option<JobReport>,
 }
 
 impl Snapshot {
@@ -269,4 +272,64 @@ pub struct JobStatus {
     /// withdrawn approval or shutting down) and is winding down. It stays
     /// the running job until the runtime has stopped it.
     pub stopping: bool,
+}
+
+impl JobStatus {
+    /// This attempt's report, as it ends now with `outcome`.
+    pub fn ended(self, outcome: JobOutcome) -> JobReport {
+        JobReport {
+            service: self.service,
+            job_id: self.job_id,
+            attempt: self.attempt,
+            title: self.title,
+            bundle_name: self.bundle_name,
+            outcome,
+            ended_at: SystemTime::now(),
+        }
+    }
+}
+
+/// An attempt that ran on this machine and has ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobReport {
+    pub service: ServiceId,
+    pub job_id: JobId,
+    pub attempt: u32,
+    /// The service's label for the job, e.g. a meeting's name.
+    pub title: Option<String>,
+    /// From the approved bundle's manifest.
+    pub bundle_name: String,
+    pub outcome: JobOutcome,
+    pub ended_at: SystemTime,
+}
+
+/// How an attempt ended, as the machine's owner sees it: its [`Outcome`],
+/// with the attempts stopped on this machine told apart from failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    Succeeded,
+    /// `message` says why, for people.
+    Failed {
+        code: ErrorCode,
+        message: String,
+    },
+    /// The service cancelled it, or stopped expecting it.
+    Cancelled,
+    /// Stopped here: by the owner, by revoking its bundle or unpairing its
+    /// service, or by quitting. The service may retry it elsewhere.
+    Interrupted,
+}
+
+impl From<&Outcome> for JobOutcome {
+    fn from(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Succeeded { .. } => Self::Succeeded,
+            Outcome::Cancelled => Self::Cancelled,
+            Outcome::Failed { error } if error.code == ErrorCode::Interrupted => Self::Interrupted,
+            Outcome::Failed { error } => Self::Failed {
+                code: error.code,
+                message: error.message.clone(),
+            },
+        }
+    }
 }

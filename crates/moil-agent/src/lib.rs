@@ -23,7 +23,8 @@ pub mod secrets;
 pub mod services;
 
 pub use agent::{
-    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobStatus, ServiceStatus, Snapshot,
+    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobOutcome, JobReport, JobStatus,
+    ServiceStatus, Snapshot,
 };
 pub use error::Error;
 pub use home::{Home, Settings};

@@ -577,6 +577,7 @@ mod tests {
             paused: false,
             services: vec![klisi(), lab(fx.now)],
             job: Some(job(Phase::Running, Some(0.42))),
+            last_job: None,
         };
         assert_eq!(
             lines(&fx.view(&snapshot).menu),
@@ -622,6 +623,7 @@ mod tests {
             paused: true,
             services: vec![klisi()],
             job: None,
+            last_job: None,
         };
         let menu = fx.view(&snapshot).menu;
         assert_eq!(
@@ -657,6 +659,7 @@ mod tests {
                     paused,
                     services: vec![klisi()],
                     job,
+                    last_job: None,
                 })
                 .menu,
             )[0]
@@ -697,6 +700,7 @@ mod tests {
             paused: true,
             services: vec![klisi()],
             job: Some(job(Phase::Running, Some(0.5))),
+            last_job: None,
         });
         assert!(lines(&paused.menu).contains(&"Paused: no new jobs after this one".to_owned()));
         assert_eq!(
@@ -714,6 +718,7 @@ mod tests {
                 paused: false,
                 services: vec![],
                 job,
+                last_job: None,
             })
             .title
         };
@@ -734,6 +739,7 @@ mod tests {
                 paused: false,
                 services,
                 job: None,
+                last_job: None,
             })
             .icon
             .attention
@@ -761,6 +767,7 @@ mod tests {
                 paused: false,
                 services: vec![klisi()],
                 job: None,
+                last_job: None,
             })
             .menu;
         assert!(
@@ -777,6 +784,7 @@ mod tests {
                 paused,
                 services: vec![],
                 job,
+                last_job: None,
             })
             .icon
             .activity
@@ -799,6 +807,7 @@ mod tests {
                 paused: false,
                 services: vec![service],
                 job: None,
+                last_job: None,
             })
             .menu;
         assert!(lines(&menu).contains(&"Removed this Mac; pair again to use it".to_owned()));
@@ -838,6 +847,7 @@ mod tests {
             paused: false,
             services: vec![klisi()],
             job: Some(job(Phase::Running, Some(0.3))),
+            last_job: None,
         });
         assert_eq!(lines(&view.menu), ["Stopping the job and quitting…"]);
     }
@@ -850,6 +860,7 @@ mod tests {
                 paused: false,
                 services,
                 job: Some(job(Phase::Running, Some(fraction))),
+                last_job: None,
             })
             .menu
         };
@@ -874,13 +885,15 @@ mod tests {
             paused: false,
             services: vec![klisi(), lab(fx.now)],
             job: None,
+            last_job: None,
         });
         assert_eq!(view.refresh_at, Some(fx.now + Duration::from_millis(400)));
         assert!(
             fx.view(&Snapshot {
                 paused: false,
                 services: vec![klisi()],
-                job: None
+                job: None,
+                last_job: None,
             })
             .refresh_at
             .is_none()
@@ -895,6 +908,7 @@ mod tests {
             paused: false,
             services: vec![due],
             job: None,
+            last_job: None,
         });
         assert_eq!(view.refresh_at, None);
         assert!(lines(&view.menu).contains(&"Offline: timed out. Retrying now".to_owned()));
@@ -911,6 +925,7 @@ mod tests {
                 paused: false,
                 services: vec![service],
                 job: None,
+                last_job: None,
             })
             .menu;
         let lines = lines(&menu);
