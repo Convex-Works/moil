@@ -88,7 +88,10 @@ func TestAJobRunsOnAPairedMachine(t *testing.T) {
 
 	// Everything the script sent arrives in order, each event once, with
 	// the runtime's phases around it. Its stray print arrives as a log;
-	// its stderr stays on the machine.
+	// its stderr stays on the machine. Data payloads arrive as the same
+	// JSON values: the machine re-encodes them, so the order of keys and
+	// the spelling of numbers may change, and numbers that don't fit a
+	// 64-bit integer or a double lose precision.
 	var got []string
 	for _, ev := range history(run) {
 		if ev.Kind != moil.EventQueued && (ev.Attempt != 1 || ev.Machine != m.ID()) {
