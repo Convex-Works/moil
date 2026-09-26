@@ -1,0 +1,6 @@
+{
+  "moil": 1,
+  "name": "minimal",
+  "version": "1.0.0",
+  "description": "Echoes its params back as the result."
+}

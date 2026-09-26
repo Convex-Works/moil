@@ -1,0 +1,561 @@
+{
+  "_doc": "Canonical protocol messages (spec §4, §6, §8). Each implementation must parse every message into its typed form and serialize it back to a JSON value equal to the original (object key order aside). Optional fields are omitted when absent.",
+  "machine_to_service": [
+    {
+      "name": "hello, full",
+      "message": {
+        "type": "hello",
+        "protocol": 1,
+        "app_version": "0.1.0",
+        "machine": {
+          "name": "Ada's MacBook Pro",
+          "os": "macos",
+          "arch": "aarch64",
+          "cpus": 12,
+          "memory_bytes": 38654705664,
+          "gpus": [
+            {
+              "name": "Apple M3 Pro"
+            },
+            {
+              "name": "eGPU",
+              "memory_bytes": 17179869184
+            }
+          ]
+        },
+        "state": "idle",
+        "approved": [
+          "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+          "0d8bc9941fef3ad79648a23fa2de4de63566a811b0f4ec55462c7c69b7143d2e"
+        ],
+        "attempts": [
+          {
+            "job_id": "j_42",
+            "attempt": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "hello, fresh machine",
+      "message": {
+        "type": "hello",
+        "protocol": 1,
+        "app_version": "0.1.0",
+        "machine": {
+          "name": "build-box",
+          "os": "linux",
+          "arch": "x86_64",
+          "cpus": 4,
+          "memory_bytes": 8589934592,
+          "gpus": []
+        },
+        "state": "paused",
+        "approved": [],
+        "attempts": []
+      }
+    },
+    {
+      "name": "state",
+      "message": {
+        "type": "state",
+        "state": "busy"
+      }
+    },
+    {
+      "name": "approved",
+      "message": {
+        "type": "approved",
+        "hashes": [
+          "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2"
+        ]
+      }
+    },
+    {
+      "name": "bid",
+      "message": {
+        "type": "bid",
+        "job_id": "j_42"
+      }
+    },
+    {
+      "name": "decline",
+      "message": {
+        "type": "decline",
+        "job_id": "j_42",
+        "reason": "not_approved"
+      }
+    },
+    {
+      "name": "event, phase",
+      "message": {
+        "type": "event",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 1,
+        "event": {
+          "v": 1,
+          "type": "phase",
+          "phase": "preparing"
+        }
+      }
+    },
+    {
+      "name": "event, progress",
+      "message": {
+        "type": "event",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 2,
+        "event": {
+          "v": 1,
+          "type": "progress",
+          "fraction": 0.42,
+          "message": "diarizing"
+        }
+      }
+    },
+    {
+      "name": "event, progress fraction only",
+      "message": {
+        "type": "event",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 3,
+        "event": {
+          "v": 1,
+          "type": "progress",
+          "fraction": 1
+        }
+      }
+    },
+    {
+      "name": "event, log",
+      "message": {
+        "type": "event",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 4,
+        "event": {
+          "v": 1,
+          "type": "log",
+          "level": "warn",
+          "message": "falling back to CPU"
+        }
+      }
+    },
+    {
+      "name": "event, data",
+      "message": {
+        "type": "event",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 5,
+        "event": {
+          "v": 1,
+          "type": "data",
+          "payload": {
+            "segment": {
+              "start": 1.2,
+              "end": 3.4,
+              "speaker": "S1",
+              "text": "héllo"
+            },
+            "tags": [
+              1,
+              "two",
+              null,
+              true
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "event, data null",
+      "message": {
+        "type": "event",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 6,
+        "event": {
+          "v": 1,
+          "type": "data",
+          "payload": null
+        }
+      }
+    },
+    {
+      "name": "renew",
+      "message": {
+        "type": "renew",
+        "job_id": "j_42",
+        "attempt": 1
+      }
+    },
+    {
+      "name": "done, succeeded",
+      "message": {
+        "type": "done",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 9,
+        "outcome": "succeeded",
+        "result": {
+          "meta": {
+            "speakers": 3
+          },
+          "files": {
+            "transcript.json": {
+              "size_bytes": 18211,
+              "sha256": "4f2d8a3c6b1e9d7f0a5c2e8b4d6f1a3c9e7b5d2f8a0c4e6b1d3f5a7c9e2b4d6f"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "done, succeeded without files or meta",
+      "message": {
+        "type": "done",
+        "job_id": "j_43",
+        "attempt": 2,
+        "seq": 1,
+        "outcome": "succeeded",
+        "result": {
+          "files": {}
+        }
+      }
+    },
+    {
+      "name": "done, failed",
+      "message": {
+        "type": "done",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 9,
+        "outcome": "failed",
+        "error": {
+          "code": "script_error",
+          "message": "CUDA out of memory",
+          "retryable": true,
+          "exit_code": 1,
+          "stderr_tail": "Traceback (most recent call last):\n  ...\n"
+        }
+      }
+    },
+    {
+      "name": "done, failed before start",
+      "message": {
+        "type": "done",
+        "job_id": "j_44",
+        "attempt": 3,
+        "seq": 1,
+        "outcome": "failed",
+        "error": {
+          "code": "busy",
+          "message": "already running j_42",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "name": "done, cancelled",
+      "message": {
+        "type": "done",
+        "job_id": "j_42",
+        "attempt": 1,
+        "seq": 9,
+        "outcome": "cancelled"
+      }
+    }
+  ],
+  "service_to_machine": [
+    {
+      "name": "welcome",
+      "message": {
+        "type": "welcome",
+        "protocol": 1,
+        "machine_id": "m_7Hq2Xk9Lw3",
+        "service": {
+          "name": "klisi"
+        },
+        "bundles": [
+          {
+            "hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+            "name": "minimal",
+            "version": "1.0.0",
+            "description": "Echoes its params back as the result."
+          },
+          {
+            "hash": "0d8bc9941fef3ad79648a23fa2de4de63566a811b0f4ec55462c7c69b7143d2e",
+            "name": "crlf-unicode",
+            "version": "2026.9.26"
+          }
+        ],
+        "resume": [
+          {
+            "job_id": "j_42",
+            "attempt": 1,
+            "seq": 7
+          }
+        ]
+      }
+    },
+    {
+      "name": "welcome, empty",
+      "message": {
+        "type": "welcome",
+        "protocol": 1,
+        "machine_id": "m_7Hq2Xk9Lw3",
+        "service": {
+          "name": "klisi"
+        },
+        "bundles": [],
+        "resume": []
+      }
+    },
+    {
+      "name": "bundles",
+      "message": {
+        "type": "bundles",
+        "bundles": [
+          {
+            "hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+            "name": "minimal",
+            "version": "1.0.0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "offer",
+      "message": {
+        "type": "offer",
+        "job_id": "j_42",
+        "bundle_hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+        "title": "Weekly sync",
+        "expires_ms": 2000
+      }
+    },
+    {
+      "name": "offer, untitled",
+      "message": {
+        "type": "offer",
+        "job_id": "j_43",
+        "bundle_hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+        "expires_ms": 1000
+      }
+    },
+    {
+      "name": "assign, full",
+      "message": {
+        "type": "assign",
+        "job_id": "j_42",
+        "attempt": 1,
+        "bundle_hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+        "title": "Weekly sync",
+        "params": {
+          "language": "en",
+          "speakers": {
+            "max": 8
+          }
+        },
+        "inputs": {
+          "audio.ogg": {
+            "url": "https://s3.example.com/rec/42.ogg?X-Amz-Signature=abc"
+          }
+        },
+        "outputs": {
+          "transcript.json": {
+            "url": "https://s3.example.com/out/42.json?X-Amz-Signature=def",
+            "method": "PUT",
+            "headers": {
+              "Content-Type": "application/json"
+            }
+          }
+        },
+        "lease_ms": 30000,
+        "timeout_ms": 3600000
+      }
+    },
+    {
+      "name": "assign, minimal",
+      "message": {
+        "type": "assign",
+        "job_id": "j_43",
+        "attempt": 2,
+        "bundle_hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+        "params": null,
+        "inputs": {},
+        "outputs": {
+          "result.txt": {
+            "url": "https://example.com/upload",
+            "method": "POST"
+          }
+        },
+        "lease_ms": 30000
+      }
+    },
+    {
+      "name": "ack",
+      "message": {
+        "type": "ack",
+        "job_id": "j_42",
+        "attempt": 1
+      }
+    },
+    {
+      "name": "cancel",
+      "message": {
+        "type": "cancel",
+        "job_id": "j_42",
+        "attempt": 1
+      }
+    }
+  ],
+  "http": {
+    "info_response": {
+      "protocol": 1,
+      "name": "klisi"
+    },
+    "pair_request": {
+      "name": "Ada's MacBook Pro",
+      "os": "macos",
+      "arch": "aarch64",
+      "app_version": "0.1.0"
+    },
+    "pair_response": {
+      "device_code": "0V8i3Yl5tE9c7mNcA4Qe2wBv",
+      "user_code": "WDJB-MJHT",
+      "verification_uri": "https://klisi.example.com/machines/pair",
+      "verification_uri_complete": "https://klisi.example.com/machines/pair?code=WDJB-MJHT",
+      "expires_in": 600,
+      "interval": 2,
+      "service": {
+        "name": "klisi"
+      }
+    },
+    "token_request": {
+      "device_code": "0V8i3Yl5tE9c7mNcA4Qe2wBv"
+    },
+    "token_response": {
+      "machine_id": "m_7Hq2Xk9Lw3",
+      "token": "moil_3q2-7wX9vKp0Lr8sT1uY4zA6bC5dE7fG9hJ2kM4nP6q",
+      "service": {
+        "name": "klisi"
+      }
+    },
+    "error_responses": [
+      {
+        "error": "authorization_pending"
+      },
+      {
+        "error": "slow_down"
+      },
+      {
+        "error": "access_denied",
+        "message": "The user rejected this machine."
+      },
+      {
+        "error": "expired_token"
+      },
+      {
+        "error": "not_found"
+      }
+    ],
+    "bundles_response": {
+      "bundles": [
+        {
+          "hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2",
+          "name": "minimal",
+          "version": "1.0.0",
+          "description": "Echoes its params back as the result."
+        }
+      ]
+    }
+  },
+  "script_events": [
+    {
+      "v": 1,
+      "type": "progress",
+      "fraction": 0.42,
+      "message": "diarizing"
+    },
+    {
+      "v": 1,
+      "type": "progress",
+      "message": "loading model"
+    },
+    {
+      "v": 1,
+      "type": "log",
+      "level": "info",
+      "message": "loaded model"
+    },
+    {
+      "v": 1,
+      "type": "log",
+      "level": "debug",
+      "message": "batch 3/9"
+    },
+    {
+      "v": 1,
+      "type": "data",
+      "payload": {
+        "segment": {
+          "start": 1.2,
+          "end": 3.4,
+          "text": "hi"
+        }
+      }
+    },
+    {
+      "v": 1,
+      "type": "result",
+      "files": [
+        "transcript.json"
+      ],
+      "meta": {
+        "speakers": 3
+      }
+    },
+    {
+      "v": 1,
+      "type": "result",
+      "files": []
+    },
+    {
+      "v": 1,
+      "type": "error",
+      "message": "CUDA out of memory",
+      "retryable": true
+    },
+    {
+      "v": 1,
+      "type": "error",
+      "message": "unsupported audio codec",
+      "retryable": false
+    }
+  ],
+  "job_context": {
+    "v": 1,
+    "job_id": "j_42",
+    "attempt": 1,
+    "params": {
+      "language": "en"
+    },
+    "work_dir": "/Users/ada/Library/Application Support/moil/jobs/j_42.1",
+    "inputs": {
+      "audio.ogg": "/Users/ada/Library/Application Support/moil/jobs/j_42.1/in/audio.ogg"
+    },
+    "output_dir": "/Users/ada/Library/Application Support/moil/jobs/j_42.1/out",
+    "outputs": [
+      "transcript.json"
+    ],
+    "assets_dir": "/Users/ada/Library/Application Support/moil/jobs/j_42.1/assets",
+    "assets": {
+      "whisper/model.bin": "/Users/ada/Library/Application Support/moil/jobs/j_42.1/assets/whisper/model.bin"
+    }
+  }
+}

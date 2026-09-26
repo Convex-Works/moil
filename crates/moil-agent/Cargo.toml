@@ -1,0 +1,26 @@
+[package]
+name = "moil-agent"
+description = "The machine side of moil: pairing, approvals, and the agent that takes jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+moil-proto.workspace = true
+moil-bundle.workspace = true
+moil-runtime.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

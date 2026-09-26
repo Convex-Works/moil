@@ -1,0 +1,23 @@
+[package]
+name = "moil-runtime"
+description = "Runs moil job bundles: environments, assets, inputs, the script, outputs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+moil-proto.workspace = true
+moil-bundle.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

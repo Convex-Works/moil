@@ -1,0 +1,21 @@
+[package]
+name = "moil-app"
+description = "The moil tray app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "moil-app"
+path = "src/main.rs"
+
+[dependencies]
+moil-proto.workspace = true
+moil-bundle.workspace = true
+moil-runtime.workspace = true
+moil-agent.workspace = true
+
+[lints]
+workspace = true

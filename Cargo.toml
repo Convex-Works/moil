@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://git.convex.works/ConvexWorks/moil"
+
+[workspace.dependencies]
+moil-proto = { path = "crates/moil-proto" }
+moil-bundle = { path = "crates/moil-bundle" }
+moil-runtime = { path = "crates/moil-runtime" }
+moil-agent = { path = "crates/moil-agent" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.11"
+hex = "0.4"
+toml = "1"
+similar = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "fs", "io-util", "signal", "net"] }
+tokio-util = "0.7"
+futures = "0.3"
+url = { version = "2", features = ["serde"] }
+tracing = "0.1"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+strip = true

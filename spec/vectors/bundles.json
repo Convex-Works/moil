@@ -1,0 +1,15 @@
+{
+  "_doc": "Bundle vectors. `valid` bundles live in bundles/<dir>/ and must hash to `hash`. Each `invalid` case starts from bundles/<base>/, then applies `set` (file name -> new contents) and `remove` (file names), and must be rejected.",
+  "valid": [
+    {"dir": "minimal", "hash": "a00a65c166291e905da7546a67518a81cc27cb498f009c75b824f28a8adfffb2"},
+    {"dir": "crlf-unicode", "hash": "0d8bc9941fef3ad79648a23fa2de4de63566a811b0f4ec55462c7c69b7143d2e"}
+  ],
+  "invalid": [
+    {"case": "missing lockfile", "base": "minimal", "remove": ["job.py.lock"]},
+    {"case": "missing script", "base": "minimal", "remove": ["job.py"]},
+    {"case": "missing manifest", "base": "minimal", "remove": ["manifest.json"]},
+    {"case": "extra file", "base": "minimal", "set": {"helpers.py": "X = 1\n"}},
+    {"case": "lockfile is not TOML", "base": "minimal", "set": {"job.py.lock": "version = = 1\n"}},
+    {"case": "manifest is invalid", "base": "minimal", "set": {"manifest.json": "{\"moil\": 1, \"name\": \"x\", \"version\": \"1\", \"extra\": true}"}}
+  ]
+}
