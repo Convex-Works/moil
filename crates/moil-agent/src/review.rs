@@ -18,6 +18,11 @@ pub struct Review {
 }
 
 impl Review {
+    /// Recomputes the bundle hash from the three files (spec §5.2), for
+    /// owners who want to check it with standard tools.
+    pub const VERIFY_COMMAND: &str =
+        "shasum -a 256 job.py job.py.lock manifest.json | shasum -a 256";
+
     /// How each file changed since `previous`.
     pub fn diff(&self) -> Option<Vec<FileDiff>> {
         self.previous

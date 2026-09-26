@@ -12,8 +12,11 @@
 
 mod agent;
 mod error;
+mod fs;
+mod hardware;
 pub mod home;
 pub mod machine;
+mod net;
 pub mod pairing;
 pub mod review;
 pub mod secrets;
