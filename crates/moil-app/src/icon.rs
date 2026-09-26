@@ -58,9 +58,9 @@ pub fn draw(state: IconState, size: u32) -> Image {
 }
 
 /// The badge's center and radius, and the clear gap around it.
-const BADGE: (f32, f32) = (29.0, 7.0);
-const BADGE_RADIUS: f32 = 5.5;
-const BADGE_GAP: f32 = 2.5;
+const BADGE: (f32, f32) = (30.5, 5.5);
+const BADGE_RADIUS: f32 = 4.5;
+const BADGE_GAP: f32 = 2.0;
 
 /// Whether the point (`x`, `y`) on the grid is inked.
 fn ink(state: IconState, x: f32, y: f32) -> bool {
@@ -173,15 +173,22 @@ mod tests {
         let (bx, by) = (BADGE.0 as u32, BADGE.1 as u32);
         assert_eq!(calm.alpha(bx, by), 0);
         assert_eq!(called.alpha(bx, by), 255);
-        // The chip's top edge is inked, but cleared around the badge.
-        assert_eq!(calm.alpha(22, 8), 255);
-        assert_eq!(called.alpha(22, 8), 0);
-        // Away from the badge, the two are the same.
-        for y in 16..TRAY_SIZE {
+
+        let from_badge =
+            |x: u32, y: u32| (x as f32 + 0.5 - BADGE.0).hypot(y as f32 + 0.5 - BADGE.1);
+        let mut cleared = 0;
+        for y in 0..TRAY_SIZE {
             for x in 0..TRAY_SIZE {
-                assert_eq!(calm.alpha(x, y), called.alpha(x, y), "({x}, {y})");
+                let d = from_badge(x, y);
+                if d > BADGE_RADIUS + 0.75 && d < BADGE_RADIUS + BADGE_GAP - 0.75 {
+                    assert_eq!(called.alpha(x, y), 0, "the gap is clear at ({x}, {y})");
+                    cleared += usize::from(calm.alpha(x, y) > 0);
+                } else if d > BADGE_RADIUS + BADGE_GAP + 0.75 {
+                    assert_eq!(calm.alpha(x, y), called.alpha(x, y), "({x}, {y})");
+                }
             }
         }
+        assert!(cleared > 0, "the gap cuts into the chip");
     }
 
     #[test]
