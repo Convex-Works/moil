@@ -125,7 +125,8 @@ impl Drop for Registration {
 /// Kills the processes of attempts whose supervising process is gone and
 /// removes their working directories (unless `keep_work_dirs`). Attempts
 /// still supervised by a live process, this one included, are left alone.
-/// Returns how many attempts it cleaned up.
+/// Returns how many attempts it cleaned up. An attempt it can't clean up
+/// is logged and kept for the next time, without holding up the others.
 pub(crate) fn reap(jobs_dir: &Path, keep_work_dirs: bool) -> io::Result<usize> {
     let dir = jobs_dir.join(RECORDS);
     let entries = match std::fs::read_dir(&dir) {
@@ -139,41 +140,52 @@ pub(crate) fn reap(jobs_dir: &Path, keep_work_dirs: bool) -> io::Result<usize> {
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let record: Record = match std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
-        {
-            Ok(record) => record,
+        match reap_one(&path, &jobs_dir, keep_work_dirs) {
+            Ok(true) => reaped += 1,
+            Ok(false) => {}
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "removing an unreadable attempt record");
-                std::fs::remove_file(&path)?;
-                continue;
+                tracing::warn!(path = %path.display(), %error, "couldn't clean up after an attempt of a crashed run");
             }
-        };
-        if record.supervisor.is_running() {
-            continue;
         }
-        if let Some(group) = &record.group {
-            kill_group(group)?;
-        }
-        // Only ever delete inside the jobs directory, whatever the record
-        // says.
-        let inside = record
-            .work_dir
-            .canonicalize()
-            .is_ok_and(|dir| dir.starts_with(&jobs_dir) && dir != jobs_dir);
-        if inside && !keep_work_dirs {
-            remove_tree(&record.work_dir)?;
-        }
-        std::fs::remove_file(&path)?;
-        tracing::info!(
-            job_id = record.job_id,
-            attempt = record.attempt,
-            "cleaned up after an attempt of a crashed run"
-        );
-        reaped += 1;
     }
     Ok(reaped)
+}
+
+/// Cleans up after the attempt recorded at `path`, if its supervisor is
+/// gone. Returns whether it did.
+fn reap_one(path: &Path, jobs_dir: &Path, keep_work_dirs: bool) -> io::Result<bool> {
+    let record: Record = match std::fs::read(path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+    {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "removing an unreadable attempt record");
+            std::fs::remove_file(path)?;
+            return Ok(false);
+        }
+    };
+    if record.supervisor.is_running() {
+        return Ok(false);
+    }
+    if let Some(group) = &record.group {
+        kill_group(group)?;
+    }
+    // Only ever delete inside the jobs directory, whatever the record says.
+    let inside = record
+        .work_dir
+        .canonicalize()
+        .is_ok_and(|dir| dir.starts_with(jobs_dir) && dir != jobs_dir);
+    if inside && !keep_work_dirs {
+        remove_tree(&record.work_dir)?;
+    }
+    std::fs::remove_file(path)?;
+    tracing::info!(
+        job_id = record.job_id,
+        attempt = record.attempt,
+        "cleaned up after an attempt of a crashed run"
+    );
+    Ok(true)
 }
 
 /// Kills what's left of the process group `group` led.
@@ -281,6 +293,34 @@ mod tests {
         assert!(work_dir.exists() && record.exists());
         script.kill().unwrap();
         script.wait().unwrap();
+    }
+
+    #[test]
+    fn a_record_that_cant_be_cleaned_up_holds_up_no_other() {
+        let jobs = tempfile::tempdir().unwrap();
+        // Neither readable nor removable as a record.
+        let stuck = jobs.path().join(RECORDS).join("stuck.json");
+        std::fs::create_dir_all(&stuck).unwrap();
+        let mut script = sleeper();
+        let work_dir = jobs.path().join("j.1");
+        std::fs::create_dir(&work_dir).unwrap();
+        write_record(
+            jobs.path(),
+            "j.1",
+            &Record {
+                job_id: "j".into(),
+                attempt: 1,
+                work_dir: work_dir.clone(),
+                supervisor: dead_supervisor(),
+                group: Process::of(script.id() as i32),
+            },
+        );
+
+        assert_eq!(reap(jobs.path(), false).unwrap(), 1);
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(script.wait().unwrap().signal(), Some(SIGKILL));
+        assert!(!work_dir.exists());
+        assert!(stuck.exists(), "kept for the next time");
     }
 
     #[test]

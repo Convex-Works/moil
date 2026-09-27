@@ -162,7 +162,8 @@ impl AssetCache {
     }
 
     /// Removes downloads that a crashed process left unfinished: partial
-    /// files nothing has written to for `idle`. Returns how many it removed.
+    /// files nothing has written to for `idle`. Returns how many it removed;
+    /// one it can't remove is logged and left for next time.
     pub fn remove_abandoned(&self, idle: Duration) -> io::Result<usize> {
         let entries = match std::fs::read_dir(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -173,13 +174,18 @@ impl AssetCache {
             let entry = entry?;
             let abandoned = entry.file_name().to_string_lossy().starts_with(PARTIAL)
                 && entry
-                    .metadata()?
-                    .modified()?
-                    .elapsed()
-                    .is_ok_and(|age| age >= idle);
-            if abandoned {
-                std::fs::remove_file(entry.path())?;
-                removed += 1;
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age >= idle));
+            if !abandoned {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    let path = entry.path();
+                    tracing::warn!(path = %path.display(), %error, "couldn't remove an abandoned download");
+                }
             }
         }
         Ok(removed)

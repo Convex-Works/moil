@@ -291,15 +291,19 @@ impl Runtime {
     /// one's, are left alone, so calling it while attempts run is safe. It
     /// also removes asset downloads that were abandoned mid-way, going by
     /// files nothing has written to for an hour, and the environments of
-    /// bundles no longer stored.
+    /// bundles no longer stored. What it can't clean up is logged and left
+    /// for next time; it fails only if it can't look at all.
     pub fn reap_orphans(&self) -> std::io::Result<usize> {
-        let reaped = orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs)?;
-        self.assets.remove_abandoned(Duration::from_secs(60 * 60))?;
-        let pruned = self.environments.prune(&self.config.bundles)?;
-        if pruned > 0 {
+        // Each cleans up what it can, whatever the others run into.
+        let reaped = orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs);
+        let abandoned = self.assets.remove_abandoned(Duration::from_secs(60 * 60));
+        let pruned = self.environments.prune(&self.config.bundles);
+        if let Ok(pruned @ 1..) = pruned {
             tracing::info!("removed the environments of {pruned} bundles no longer stored");
         }
-        Ok(reaped)
+        abandoned?;
+        pruned?;
+        reaped
     }
 
     /// `policy`, widened to `http` anywhere if the owner allowed that.
