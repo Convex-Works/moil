@@ -624,9 +624,15 @@ func (j *jobState) assign(n int, lease time.Duration, inputs map[string]wire.Dow
 		Params:     j.params,
 		Inputs:     inputs,
 		Outputs:    outputs,
-		LeaseMS:    max(1, lease.Milliseconds()),
-		TimeoutMS:  j.timeout.Milliseconds(),
+		LeaseMS:    ceilMilliseconds(lease),
+		TimeoutMS:  ceilMilliseconds(j.timeout),
 	}
+}
+
+// ceilMilliseconds rounds d up to whole milliseconds, so that a positive
+// duration never becomes 0, which means none.
+func ceilMilliseconds(d time.Duration) int64 {
+	return int64((d + time.Millisecond - 1) / time.Millisecond)
 }
 
 func (sc *scheduler) renew(a *attemptState) {

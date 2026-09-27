@@ -25,7 +25,11 @@ type Job struct {
 	// show their owners, e.g. the meeting's name.
 	Title string
 	// Params is handed to the script as JSON. It is marshaled once, at
-	// Submit; nil becomes null.
+	// Submit; nil becomes null. The script gets the same JSON value, not
+	// necessarily the same bytes (spec §2): keep it within I-JSON, with
+	// integers beyond 2^53, such as 64-bit IDs, as strings. Submit refuses
+	// params nested more than 64 levels deep or with numbers beyond the
+	// range of a double, which machines can't read.
 	Params any
 	// Inputs are the files the runtime downloads before starting the
 	// script, by file name (^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$).
@@ -54,8 +58,9 @@ type Job struct {
 	// job rank below all others. Like Eligible, it must be fast and must
 	// not call the Server.
 	Prefer func(Machine) int
-	// Timeout limits each attempt's running time on the machine. Zero
-	// means no limit.
+	// Timeout limits each attempt's running time on the machine,
+	// preparation and transfers included, rounded up to whole
+	// milliseconds. Zero means no limit.
 	Timeout time.Duration
 	// MaxAttempts overrides Config.MaxAttempts for this job when positive.
 	MaxAttempts int

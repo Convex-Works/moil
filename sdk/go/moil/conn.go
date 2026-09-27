@@ -57,7 +57,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept has answered the request
 	}
-	conn.SetReadLimit(maxMessageBytes)
+	conn.SetReadLimit(wire.MaxMessageBytes)
 	s.serveChannel(conn, rec)
 }
 

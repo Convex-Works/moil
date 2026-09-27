@@ -42,14 +42,19 @@ type Config struct {
 	// decides as soon as every offered machine answered. Default 2s.
 	BidWindow time.Duration
 	// LeaseTTL is how long an attempt may go without word from its
-	// machine before it fails with CodeLeaseExpired. Default 30s.
+	// machine before it fails with CodeLeaseExpired. Default 2 minutes.
+	// Keep it at least 90 seconds (spec §7.3): a machine takes up to 45
+	// seconds to notice a silently dead channel, and must reconnect
+	// before its lease runs out.
 	LeaseTTL time.Duration
 	// MaxAttempts is how many attempts a job may use, not counting ones
 	// that never started. Default 3.
 	MaxAttempts int
 	// PingInterval is how often the Server pings each machine; a machine
 	// that doesn't answer before the next ping is disconnected. It also
-	// bounds how long a machine may take to say hello. Default 20s.
+	// bounds how long a machine may take to say hello. Default and
+	// maximum 20s: machines take a channel that stays silent for 45
+	// seconds for dead (spec §6.1).
 	PingInterval time.Duration
 	// KeepFinished is how long a finished job stays known, for Run and
 	// for idempotent Submit. Default 1 hour.
@@ -96,7 +101,7 @@ func (c *Config) setDefaults() error {
 		{&c.PairingTTL, 10 * time.Minute},
 		{&c.PairingInterval, 2 * time.Second},
 		{&c.BidWindow, 2 * time.Second},
-		{&c.LeaseTTL, 30 * time.Second},
+		{&c.LeaseTTL, 2 * time.Minute},
 		{&c.PingInterval, 20 * time.Second},
 		{&c.KeepFinished, time.Hour},
 	}
@@ -107,6 +112,9 @@ func (c *Config) setDefaults() error {
 		if *d.d == 0 {
 			*d.d = d.def
 		}
+	}
+	if c.PingInterval > 20*time.Second {
+		return errors.New("moil: Config.PingInterval must be at most 20s; machines take a channel that stays silent for 45 seconds for dead")
 	}
 	if c.MaxPendingPairings <= 0 {
 		c.MaxPendingPairings = 1000
@@ -382,6 +390,9 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("moil: Job.Params: %w", err)
 	}
+	if err := wire.CheckValue(params); err != nil {
+		return nil, fmt.Errorf("moil: Job.Params %v; machines can't read it", err)
+	}
 	j := &jobState{
 		id:          job.ID,
 		bundle:      job.Bundle,
@@ -452,7 +463,7 @@ func checkSize(msg wire.Assign) error {
 	if err != nil {
 		return fmt.Errorf("moil: encoding the job: %w", err)
 	}
-	if len(data) > maxMessageBytes {
+	if len(data) > wire.MaxMessageBytes {
 		return fmt.Errorf("moil: the job's params, inputs and outputs take %d bytes; a control message is limited to 1 MiB", len(data))
 	}
 	return nil
@@ -469,6 +480,3 @@ func (s *Server) Run(id string) (*Run, bool) {
 	})
 	return run, run != nil
 }
-
-// maxMessageBytes is the largest control message either side reads.
-const maxMessageBytes = 1 << 20

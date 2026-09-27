@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"slices"
 	"strings"
@@ -185,6 +186,11 @@ func TestSubmitRejectsJobsMachinesCouldNotRun(t *testing.T) {
 		{"long title", func(j *moil.Job) { j.Title = strings.Repeat("é", 201) }, "200 characters"},
 		{"params that aren't JSON", func(j *moil.Job) { j.Params = make(chan int) }, "Params"},
 		{"params over a control message", func(j *moil.Job) { j.Params = strings.Repeat("x", 1<<20) }, "1 MiB"},
+		{"params nested too deep", func(j *moil.Job) {
+			j.Params = map[string]any{"a": json.RawMessage(strings.Repeat("[", 64) + strings.Repeat("]", 64))}
+		}, "nested more than 64 levels deep"},
+		{"params with a number beyond a double", func(j *moil.Job) { j.Params = map[string]any{"n": new(big.Int).Lsh(big.NewInt(1), 1024)} }, "beyond the range of a double"},
+		{"negative timeout", func(j *moil.Job) { j.Timeout = -time.Second }, "Timeout"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			job := ok
@@ -198,6 +204,67 @@ func TestSubmitRejectsJobsMachinesCouldNotRun(t *testing.T) {
 	if _, err := srv.Submit(context.Background(), ok); err != nil {
 		t.Fatalf("the valid job was rejected: %v", err)
 	}
+	ok.Params = map[string]any{"a": json.RawMessage(strings.Repeat("[", 63) + strings.Repeat("]", 63)), "id": uint64(1<<64 - 1)}
+	if _, err := srv.Submit(context.Background(), ok); err != nil {
+		t.Fatalf("params 64 levels deep were rejected: %v", err)
+	}
+}
+
+// The lease defaults to two minutes, so that a machine can notice a dead
+// channel and reconnect in time, and a time limit under a millisecond
+// isn't sent as none.
+func TestLeasesAndTimeLimitsReachTheMachine(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.LeaseTTL = 0 })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	for _, c := range []struct{ timeout, sent time.Duration }{
+		{0, 0},
+		{500 * time.Microsecond, time.Millisecond},
+		{1500 * time.Microsecond, 2 * time.Millisecond},
+		{time.Hour, time.Hour},
+	} {
+		run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Timeout: c.timeout})
+		a := m.NextAttempt()
+		if a.Lease != 2*time.Minute || a.Timeout != c.sent {
+			t.Errorf("Timeout %v: the machine got a lease of %v and a time limit of %v, want 2m0s and %v", c.timeout, a.Lease, a.Timeout, c.sent)
+		}
+		a.Succeed(nil)
+		succeeded(t, run)
+	}
+}
+
+func TestConfigIsChecked(t *testing.T) {
+	valid := moil.Config{Name: "klisi", VerificationURL: "https://klisi.example.com/pair", Store: moil.NewMemoryStore()}
+	for _, c := range []struct {
+		name string
+		edit func(*moil.Config)
+		want string
+	}{
+		{"no name", func(c *moil.Config) { c.Name = "" }, "Name"},
+		{"relative verification URL", func(c *moil.Config) { c.VerificationURL = "/pair" }, "VerificationURL"},
+		{"no store", func(c *moil.Config) { c.Store = nil }, "Store"},
+		{"negative duration", func(c *moil.Config) { c.BidWindow = -time.Second }, "negative"},
+		{"pings too rare for machines", func(c *moil.Config) { c.PingInterval = 21 * time.Second }, "PingInterval"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := valid
+			c.edit(&cfg)
+			if srv, err := moil.NewServer(cfg); err == nil || !strings.Contains(err.Error(), c.want) {
+				if srv != nil {
+					srv.Close()
+				}
+				t.Fatalf("err = %v, want one mentioning %s", err, c.want)
+			}
+		})
+	}
+	valid.PingInterval = 20 * time.Second
+	srv, err := moil.NewServer(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Close()
 }
 
 // Submit accepts the URLs machines accept: https, and http to loopback
