@@ -380,6 +380,33 @@ async fn a_service_is_paired_only_under_a_name_that_hides_nothing() {
     }
 }
 
+/// A service can't pass off another service's confirmation page as its
+/// own: relaying another service's pairing, it would have the owner pair
+/// the relay's machine with their account there (spec §4).
+#[tokio::test]
+async fn pairing_is_confirmed_only_on_the_services_own_origin() {
+    let klisi = FakeService::start("klisi").await;
+    let relay = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+
+    let theirs = format!("{}/pair", klisi.base_url);
+    let own = format!("{}/pair", relay.base_url);
+    let klisi_site = url::Url::parse(&klisi.base_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    for (page, complete) in [(&theirs, &theirs), (&own, &theirs), (&theirs, &own)] {
+        relay.pairing_pages(page, &format!("{complete}?code=WDJB-MJHT"));
+        match machine.pair(&relay.base_url).await {
+            Err(Error::ForeignPairingPage { site, .. }) => assert_eq!(site, klisi_site),
+            other => panic!("paired with {page} and {complete}: {other:?}"),
+        }
+    }
+    assert!(relay.polls().is_empty(), "no token was asked for");
+    assert!(machine.services().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
     let dir = tempfile::tempdir().unwrap();

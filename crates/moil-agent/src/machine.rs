@@ -15,6 +15,7 @@ use url::Url;
 use crate::fs::{PUBLIC, read_json, with_path, write_json};
 use crate::hardware::Hardware;
 use crate::net::{self, Net};
+use crate::pairing::check_confirmation_page;
 use crate::services;
 use crate::{
     Approval, Error, Home, PairedService, PairingSession, Review, SecretStore, ServiceId, Settings,
@@ -363,16 +364,8 @@ impl Machine {
         let started = Instant::now();
         let pairing: PairResponse = net::read_json(&info.name, response).await?;
         services::check_name(&pairing.service.name).map_err(not_a_service)?;
-        for uri in [
-            &pairing.verification_uri,
-            &pairing.verification_uri_complete,
-        ] {
-            if !Url::parse(uri).is_ok_and(|u| matches!(u.scheme(), "https" | "http")) {
-                return Err(not_a_service(format!(
-                    "its confirmation page {uri:?} isn't a web address"
-                )));
-            }
-        }
+        check_confirmation_page(&base_url, &pairing.verification_uri)?;
+        check_confirmation_page(&base_url, &pairing.verification_uri_complete)?;
         Ok(PairingSession::new(
             self.clone(),
             base_url,
