@@ -1,0 +1,132 @@
+{
+  "_doc": "Lockfile vectors (spec §5.1). `lockfile` is the raw contents of job.py.lock; `valid` says whether a bundle holding it is valid; for valid ones, `builds_from_source` names the packages the machine would build from source, in lockfile order.",
+  "cases": [
+    {
+      "case": "no packages",
+      "valid": true,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n",
+      "builds_from_source": []
+    },
+    {
+      "case": "registry package with hashed sdist and wheel",
+      "valid": true,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/pkg-1.0.tar.gz\", hash = \"sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44\", size = 216463 }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\", size = 69583 },\n]\n\n",
+      "builds_from_source": []
+    },
+    {
+      "case": "registry package with only a hashed sdist is built from source",
+      "valid": true,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/pkg-1.0.tar.gz\", hash = \"sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44\", size = 216463 }\n\n",
+      "builds_from_source": [
+        "pkg"
+      ]
+    },
+    {
+      "case": "url archive with a hashed sdist is built from source",
+      "valid": true,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.1.0.dev0\"\nsource = { url = \"https://github.com/example/pkg/archive/0123456789abcdef.tar.gz\" }\nsdist = { hash = \"sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44\" }\n\n",
+      "builds_from_source": [
+        "pkg"
+      ]
+    },
+    {
+      "case": "url wheel with a hash",
+      "valid": true,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { url = \"https://example.com/pkg-1.0-py3-none-any.whl\" }\nwheels = [\n    { hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\" },\n]\n\n",
+      "builds_from_source": []
+    },
+    {
+      "case": "git pinned to a full commit is built from source",
+      "valid": true,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.2.1\"\nsource = { git = \"https://github.com/example/pkg?rev=main#ed9a06cd89a93e47838f564998a6c09b655d7f43\" }\n\n",
+      "builds_from_source": [
+        "pkg"
+      ]
+    },
+    {
+      "case": "unhashed wheel",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/pkg-1.0.tar.gz\", hash = \"sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44\", size = 216463 }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", size = 69583 },\n]\n\n"
+    },
+    {
+      "case": "unhashed sdist",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/pkg-1.0.tar.gz\", size = 216463 }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\", size = 69583 },\n]\n\n"
+    },
+    {
+      "case": "hash that isn't sha256",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"md5:0123456789abcdef0123456789abcdef\" },\n]\n\n"
+    },
+    {
+      "case": "registry package without artifacts",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\n\n"
+    },
+    {
+      "case": "plain http registry",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"http://packages.example.com/simple\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\", size = 69583 },\n]\n\n"
+    },
+    {
+      "case": "loopback http registry",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"http://127.0.0.1:8931/\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\", size = 69583 },\n]\n\n"
+    },
+    {
+      "case": "registry on the author's disk",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { registry = \"../wheels\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\", size = 69583 },\n]\n\n"
+    },
+    {
+      "case": "plain http url source",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { url = \"http://example.com/pkg-1.0.tar.gz\" }\nsdist = { hash = \"sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44\" }\n\n"
+    },
+    {
+      "case": "git over ssh",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { git = \"ssh://git@github.com/example/pkg?rev=main#ed9a06cd89a93e47838f564998a6c09b655d7f43\" }\n\n"
+    },
+    {
+      "case": "git without a full commit",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { git = \"https://github.com/example/pkg?rev=main\" }\n\n"
+    },
+    {
+      "case": "git pinned to a short commit",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { git = \"https://github.com/example/pkg?rev=main#ed9a06c\" }\n\n"
+    },
+    {
+      "case": "path source",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { path = \"../pkg-1.0-py3-none-any.whl\" }\nwheels = [\n    { hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\" },\n]\n\n"
+    },
+    {
+      "case": "directory source",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { directory = \"../pkg\" }\n\n"
+    },
+    {
+      "case": "editable source",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { editable = \"../pkg\" }\n\n"
+    },
+    {
+      "case": "virtual source",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nsource = { virtual = \".\" }\n\n"
+    },
+    {
+      "case": "package without a source",
+      "valid": false,
+      "lockfile": "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n[manifest]\nrequirements = [{ name = \"pkg\" }]\n\n[[package]]\nname = \"pkg\"\nversion = \"1.0\"\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/pkg-1.0-py3-none-any.whl\", hash = \"sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c\", size = 69583 },\n]\n"
+    },
+    {
+      "case": "not TOML",
+      "valid": false,
+      "lockfile": "version = = 1\n"
+    }
+  ]
+}

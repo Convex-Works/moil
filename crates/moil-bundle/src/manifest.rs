@@ -73,7 +73,13 @@ pub enum ManifestError {
         "asset name {0:?} must be a relative path of segments made of A-Z, a-z, 0-9, '.', '_' and '-'"
     )]
     InvalidAssetName(String),
-    #[error("asset {name:?} must be fetched over https, not {url:?}")]
+    #[error(
+        "{field} contains control or bidirectional formatting characters, which could make it read differently from what it is"
+    )]
+    HiddenCharacters { field: &'static str },
+    #[error(
+        "asset {name:?} must be fetched from a plain https URL (https://host[:port]/path[?query]), not {url:?}"
+    )]
     InvalidAssetUrl { name: String, url: String },
     #[error("asset {name:?} has an invalid sha256 (expected 64 lowercase hex characters)")]
     InvalidAssetHash { name: String },
@@ -112,20 +118,24 @@ impl Manifest {
         if !(1..=32).contains(&self.version.chars().count()) {
             return Err(ManifestError::InvalidVersion);
         }
-        if self
-            .description
-            .as_ref()
-            .is_some_and(|d| d.chars().count() > 500)
-        {
-            return Err(ManifestError::DescriptionTooLong);
+        if !is_plain_text(&self.version, false) {
+            return Err(ManifestError::HiddenCharacters { field: "version" });
+        }
+        if let Some(description) = &self.description {
+            if description.chars().count() > 500 {
+                return Err(ManifestError::DescriptionTooLong);
+            }
+            if !is_plain_text(description, true) {
+                return Err(ManifestError::HiddenCharacters {
+                    field: "description",
+                });
+            }
         }
         for (name, asset) in &self.assets {
             if !is_asset_name(name) {
                 return Err(ManifestError::InvalidAssetName(name.clone()));
             }
-            let https = url::Url::parse(&asset.url)
-                .is_ok_and(|u| u.scheme() == "https" && u.host().is_some());
-            if !https {
+            if !is_asset_url(&asset.url) {
                 return Err(ManifestError::InvalidAssetUrl {
                     name: name.clone(),
                     url: asset.url.clone(),
@@ -143,6 +153,62 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// No control characters (except line feeds, if `line_feeds`) and no
+/// bidirectional formatting characters (spec §5.3).
+fn is_plain_text(text: &str, line_feeds: bool) -> bool {
+    text.chars().all(|c| {
+        let bidi = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+        !bidi && (!c.is_control() || (line_feeds && c == '\n'))
+    })
+}
+
+/// `https://` host [`:` port] [path] [`?` query], as spec §5.3 defines it:
+/// narrower than URL parsers accept, so every implementation agrees.
+fn is_asset_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let host_ok = !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len())
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+    });
+    host_ok && port_ok && is_path_and_query(tail)
+}
+
+/// RFC 3986 unreserved characters, percent-encodings, sub-delimiters, `:`,
+/// `@`, `/` and `?`.
+fn is_path_and_query(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                i += 3;
+                continue;
+            }
+            b if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&b) => {}
+            _ => return false,
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Two asset names that can't both be laid out on disk, because one would

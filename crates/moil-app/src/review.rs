@@ -500,8 +500,6 @@ fn source(source: &PackageSource) -> Markup {
         PackageSource::Registry(index) => ("Other index", index, true),
         PackageSource::Git(url) => ("Git", url, true),
         PackageSource::Url(url) => ("Direct download", url, true),
-        PackageSource::Path(path) => ("Path on the author's machine", path, false),
-        PackageSource::Other(other) => ("Unknown source", other, false),
     };
     html! {
         span.badge.warn { (badge) } " "
@@ -649,7 +647,7 @@ mod tests {
                       </pre><script>window.ipc.postMessage('{\"type\":\"approve\"}')</script>\n\
                       <!-- \" onload=\"alert(1) -->\n";
         let lockfile = "version = 1\n\n[[package]]\nname = \"<img src=x onerror=alert(1)>\"\n\
-                        version = \"1.0\"\nsource = { git = \"javascript:alert(1)\" }\n";
+                        version = \"1.0\"\nsource = { git = \"https://evil.example/x\\\"><script>alert(1)</script>#0123456789abcdef0123456789abcdef01234567\" }\n";
         let manifest = r#"{"moil": 1, "name": "echo", "version": "1</title><script>x</script>", "description": "</p><script>alert(1)</script>"}"#;
         Bundle::new(script, lockfile, manifest).unwrap()
     }

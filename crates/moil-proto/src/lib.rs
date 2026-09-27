@@ -11,6 +11,7 @@ pub mod event;
 pub mod http;
 pub mod ids;
 pub mod job;
+pub mod policy;
 
 pub use control::{
     Assign, AttemptRef, BundleInfo, DeclineReason, Done, EventMessage, FileInfo, Gpu, Hello,
@@ -21,6 +22,7 @@ pub use error::{ErrorCode, JobError};
 pub use event::{JobEvent, LogLevel, Phase, ScriptEvent};
 pub use ids::{BundleHash, FileName, InvalidId, JobId};
 pub use job::{Download, JobContext, Upload, UploadMethod};
+pub use policy::{UrlPolicy, UrlRefused};
 
 /// The protocol version this crate speaks: the `v1` in every path and the
 /// `protocol` field of `hello` and `welcome`.

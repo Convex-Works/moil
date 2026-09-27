@@ -40,6 +40,7 @@ async fn supervise_until_killed() {
         inputs: Default::default(),
         outputs: Default::default(),
         timeout: None,
+        url_policy: Default::default(),
     };
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (_stopper, stop) = stop_signal();

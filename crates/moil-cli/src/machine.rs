@@ -307,11 +307,21 @@ fn show(review: &Review) {
         let version = package.version.as_deref().unwrap_or("(no version)");
         let source = match (&package.source, package.link()) {
             (_, Some(link)) => link,
-            (PackageSource::Path(path), None) => format!("a path on the author's machine: {path}"),
-            (PackageSource::Registry(index), None) => format!("from {index}"),
-            (source, None) => format!("{source:?}"),
+            (
+                PackageSource::Registry(index)
+                | PackageSource::Git(index)
+                | PackageSource::Url(index),
+                None,
+            ) => {
+                format!("from {index}")
+            }
         };
-        println!("  {} {version}  {}", package.name, reveal(&source));
+        let built = if package.builds_from_source {
+            "  (built from source here; its build tools aren't pinned)"
+        } else {
+            ""
+        };
+        println!("  {} {version}  {}{built}", package.name, reveal(&source));
     }
 
     println!();

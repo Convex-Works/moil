@@ -28,7 +28,7 @@ use futures::future::BoxFuture;
 use moil_bundle::{Bundle, BundleHash, BundleStore};
 use moil_proto::control::Assign;
 use moil_proto::job::{Download, Upload};
-use moil_proto::{ErrorCode, FileName, JobError, JobEvent, JobId, Outcome};
+use moil_proto::{ErrorCode, FileName, JobError, JobEvent, JobId, Outcome, UrlPolicy};
 use tokio::sync::{mpsc, watch};
 
 mod assets;
@@ -82,11 +82,16 @@ pub struct Job {
     /// The attempt's time limit, counted from when [`Executor::run`] starts
     /// until the outcome is known: preparation and transfers count too.
     pub timeout: Option<Duration>,
+    /// Which URLs the inputs and outputs may use (spec §3): see
+    /// [`UrlPolicy::for_service`]. [`RuntimeConfig::allow_insecure_http`]
+    /// widens it to `http` anywhere.
+    pub url_policy: UrlPolicy,
 }
 
 impl Job {
     /// The attempt an `assign` describes, to run with `bundle`, which the
     /// caller has checked is the approved bundle `assign.bundle_hash` names.
+    /// Its URLs must use `https` until the caller sets [`Job::url_policy`].
     pub fn from_assign(assign: Assign, bundle: Bundle) -> Self {
         debug_assert_eq!(assign.bundle_hash, bundle.hash());
         Self {
@@ -97,6 +102,7 @@ impl Job {
             inputs: assign.inputs,
             outputs: assign.outputs,
             timeout: assign.timeout_ms.map(Duration::from_millis),
+            url_policy: UrlPolicy::HTTPS_ONLY,
         }
     }
 }

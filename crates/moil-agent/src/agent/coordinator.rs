@@ -22,6 +22,7 @@ use moil_proto::control::{BundleInfo, EventMessage, Hello, Welcome};
 use moil_proto::{
     Assign, AttemptRef, BundleHash, DeclineReason, Done, ErrorCode, JobError, JobEvent,
     MachineMessage, MachineState, Offer, Outcome, PROTOCOL_VERSION, Phase, ServiceMessage,
+    UrlPolicy,
 };
 use moil_runtime::{Executor, Job, StopReason, StopSignal, Stopper};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -592,7 +593,22 @@ impl Coordinator {
             stopper,
             status,
         });
-        self.spawn_attempt(key, Job::from_assign(assign, bundle), stop);
+        let mut job = Job::from_assign(assign, bundle);
+        job.url_policy = self.url_policy(&key.service);
+        self.spawn_attempt(key, job, stop);
+    }
+
+    /// Which URLs the jobs of service `id` may use for their files (spec
+    /// §3).
+    fn url_policy(&self, id: &ServiceId) -> UrlPolicy {
+        let insecure = self.machine.settings().allow_insecure_http;
+        match self.services.get(id) {
+            Some(service) => UrlPolicy::for_service(&service.paired.base_url, insecure),
+            None => UrlPolicy {
+                any_http: insecure,
+                ..UrlPolicy::HTTPS_ONLY
+            },
+        }
     }
 
     /// Whether the machine takes a job for `hash` from `id` now (spec

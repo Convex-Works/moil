@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moil_proto::http::ErrorBody;
+use moil_proto::{UrlPolicy, UrlRefused};
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::de::DeserializeOwned;
-use url::{Host, Url};
+use url::Url;
 
 use crate::Error;
 
@@ -79,26 +80,18 @@ pub(crate) fn parse_base_url(input: &str) -> Result<Url, Error> {
     Ok(url)
 }
 
-/// Fails unless `url` may be used (spec §3): `https`, or `http` to a
-/// loopback host, or `http` anywhere when the owner allowed it.
+/// Fails unless `url` may be a service's base URL (spec §3): `https`, or
+/// `http` to a loopback host, or `http` anywhere when the owner allowed it.
 pub(crate) fn check_url(url: &Url, allow_insecure_http: bool) -> Result<(), Error> {
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if allow_insecure_http || is_loopback(url) => Ok(()),
-        "http" => Err(Error::InsecureUrl(url.to_string())),
-        _ => Err(Error::NotAService {
+    match UrlPolicy::for_base_urls(allow_insecure_http).check(url) {
+        Ok(()) => Ok(()),
+        Err(UrlRefused::Http(_) | UrlRefused::LoopbackHttp(_)) => {
+            Err(Error::InsecureUrl(url.to_string()))
+        }
+        Err(refused) => Err(Error::NotAService {
             url: url.to_string(),
-            reason: "moil services are reached over https".into(),
+            reason: format!("moil services are reached over https, and this URL {refused}"),
         }),
-    }
-}
-
-fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
     }
 }
 

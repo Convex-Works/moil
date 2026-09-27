@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use moil_bundle::Bundle;
 use moil_proto::{
     FileName, JobError, JobEvent, JobId, JobResult, LogLevel, Outcome, Phase, Upload, UploadMethod,
+    UrlPolicy,
 };
 use moil_runtime::{Executor, Job, Runtime, RuntimeConfig, StopReason, Stopper, stop_signal};
 use serde_json::{Value, json};
@@ -119,6 +120,10 @@ impl Harness {
             inputs: BTreeMap::new(),
             outputs: BTreeMap::new(),
             timeout: None,
+            url_policy: UrlPolicy {
+                loopback_http: true,
+                any_http: false,
+            },
         }
     }
 

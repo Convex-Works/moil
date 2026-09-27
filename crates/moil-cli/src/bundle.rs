@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use moil_bundle::{Bundle, PackageSource};
-use moil_proto::{FileName, JobEvent, JobId, LogLevel, Outcome, Phase};
+use moil_proto::{FileName, JobEvent, JobId, LogLevel, Outcome, Phase, UrlPolicy};
 use moil_runtime::{Executor, Job, Runtime, RuntimeConfig, StopReason, Uv, stop_signal};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
@@ -159,15 +159,6 @@ async fn check(dir: &Path) -> anyhow::Result<()> {
     }
 
     let mut problems = Vec::new();
-    for package in bundle.packages() {
-        if let PackageSource::Path(path) = &package.source {
-            problems.push(format!(
-                "{} comes from {path}, a path on this computer that other machines won't have; \
-                 depend on a published version or a git repository instead",
-                package.name
-            ));
-        }
-    }
     if let Err(problem) = check_lockfile(dir).await? {
         problems.push(problem);
     }
@@ -192,8 +183,6 @@ fn describe_source(source: &PackageSource) -> String {
         PackageSource::Registry(index) => format!("from {index}"),
         PackageSource::Git(url) => format!("from git {url}"),
         PackageSource::Url(url) => format!("from {url}"),
-        PackageSource::Path(path) => format!("from the local path {path}"),
-        PackageSource::Other(other) => format!("from {other}"),
     }
 }
 
@@ -401,6 +390,11 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
             .map(|name| (name.clone(), storage.upload(name)))
             .collect(),
         timeout: args.timeout,
+        // Inputs and outputs move through this command's own loopback server.
+        url_policy: UrlPolicy {
+            loopback_http: true,
+            any_http: false,
+        },
     };
     let work_dir = runtime.work_dir(&job.id, job.attempt);
 
