@@ -102,7 +102,7 @@ pub(crate) async fn sync(uv: &Uv, script: &Path, echo_stderr: bool) -> Result<()
     if status.success() {
         return Ok(());
     }
-    let mut error = JobError::new(ErrorCode::Environment, sync_failure(&tail));
+    let mut error = sync_failure(&tail);
     if let Some(code) = status.code() {
         error = error.with_exit_code(code);
     }
@@ -113,26 +113,31 @@ pub(crate) async fn sync(uv: &Uv, script: &Path, echo_stderr: bool) -> Result<()
 /// another machine may well succeed.
 pub(crate) fn cant_start(uv: &Uv, error: &std::io::Error) -> JobError {
     JobError::new(
-        ErrorCode::Environment,
+        ErrorCode::Internal,
         format!("couldn't run uv ({}): {error}", uv.program.display()),
     )
-    .retryable(true)
 }
 
-/// Explains a failed `uv sync` from its stderr.
-fn sync_failure(stderr: &str) -> String {
+/// Explains a failed `uv sync` from its stderr. Retryable, as an index
+/// that is down may be back for the next attempt, unless the bundle itself
+/// is at fault (spec §9).
+fn sync_failure(stderr: &str) -> JobError {
     if stderr.contains("needs to be updated") {
-        return "job.py.lock doesn't match the dependencies job.py declares; \
-                the bundle's author must run `uv lock --script job.py`"
-            .into();
+        return JobError::new(
+            ErrorCode::Environment,
+            "job.py.lock doesn't match the dependencies job.py declares; \
+             the bundle's author must run `uv lock --script job.py`",
+        )
+        .retryable(false);
     }
-    match stderr
+    let message = match stderr
         .lines()
         .find_map(|line| line.trim().strip_prefix("error:"))
     {
         Some(reason) => format!("uv couldn't create the environment: {}", reason.trim()),
         None => "uv couldn't create the environment".into(),
-    }
+    };
+    JobError::new(ErrorCode::Environment, message)
 }
 
 /// Where uv is: `explicit` (`$MOIL_UV`) if given, else a `uv` next to

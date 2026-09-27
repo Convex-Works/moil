@@ -316,6 +316,8 @@ mod assets {
 }
 
 mod environment {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -400,19 +402,26 @@ mod environment {
         .unwrap();
         let error = h.runtime.prepare(&bundle).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::Environment);
+        assert!(error.retryable);
         assert!(error.message.contains("3.99"), "{}", error.message);
         assert!(error.stderr_tail.as_deref().unwrap().contains("3.99"));
         assert!(error.exit_code.is_some_and(|code| code != 0));
     }
 
     #[tokio::test]
-    async fn a_machine_without_uv_fails_retryably() {
-        let h = Harness::with(|c| c.uv = "/nonexistent/uv".into()).await;
+    async fn uv_that_cant_start_is_an_internal_error() {
+        // An executable that can't be run, as when uv's install is broken.
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("uv");
+        std::fs::write(&broken, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let h = Harness::with(|c| c.uv = broken.clone()).await;
+
         let error = h.runtime.prepare(&probe()).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::Environment);
-        assert!(error.retryable, "another machine may have uv");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.retryable, "another machine may have a working uv");
         assert!(
-            error.message.contains("/nonexistent/uv"),
+            error.message.contains(broken.to_str().unwrap()),
             "{}",
             error.message
         );
