@@ -6,7 +6,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use moil_agent::{Error, Home, Machine, MachineConfig, MemorySecrets, Settings};
+use moil_agent::{Error, FileSecrets, Home, Machine, MachineConfig, MemorySecrets, Settings};
 use moil_bundle::{BundleError, LineKind, LoadError};
 use support::*;
 
@@ -30,6 +30,52 @@ fn a_home_is_open_in_one_process_at_a_time() {
     }
     drop(clone);
     Machine::open(config()).expect("the lock is released with the last clone");
+}
+
+#[tokio::test]
+async fn a_machine_can_be_read_while_another_process_has_it_open() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    service.host(&bundle);
+
+    let config = || MachineConfig {
+        home: Home::new(dir.path()),
+        secrets: std::sync::Arc::new(FileSecrets::new(dir.path().join("secrets.json"))),
+        app_version: "0.1.0-test".into(),
+    };
+    assert!(matches!(
+        Machine::open(config()),
+        Err(Error::AlreadyRunning(_))
+    ));
+    let reader = Machine::open_read_only(config()).unwrap();
+    assert_eq!(reader.services().unwrap(), std::slice::from_ref(&paired));
+    assert_eq!(reader.find_service("klisi").unwrap(), paired);
+    assert_eq!(reader.bundles(&paired.id).await.unwrap(), [info(&bundle)]);
+    let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
+    assert_eq!((&review.bundle, review.approved), (&bundle, false));
+
+    // It sees what the process that has the machine open changes.
+    machine.approve(&review).unwrap();
+    assert!(reader.services().unwrap()[0].is_approved(&bundle.hash()));
+    let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
+    assert!(review.approved);
+}
+
+#[test]
+fn reading_a_machine_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("moil");
+    let reader = Machine::open_read_only(MachineConfig {
+        home: Home::new(&root),
+        secrets: std::sync::Arc::new(MemorySecrets::default()),
+        app_version: "0.1.0-test".into(),
+    })
+    .unwrap();
+    assert_eq!(reader.services().unwrap(), []);
+    assert!(!root.exists(), "a home that wasn't there still isn't");
 }
 
 #[test]

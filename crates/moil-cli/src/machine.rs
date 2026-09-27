@@ -13,7 +13,8 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use moil_agent::display::{self, reveal};
 use moil_agent::{
-    Agent, Home, Machine, MachineConfig, PairedService, Review, Snapshot, default_secrets,
+    Agent, Home, Machine, MachineConfig, PairedService, ReadOnlyMachine, Review, Snapshot,
+    default_secrets,
 };
 use moil_bundle::PackageSource;
 use moil_proto::BundleHash;
@@ -72,15 +73,20 @@ pub enum Command {
 }
 
 pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
-    let machine = open(globals)?;
+    // Commands that only read work while the agent runs, without the
+    // home's lock. The others change what the agent holds.
+    let reader =
+        || -> anyhow::Result<ReadOnlyMachine> { Ok(Machine::open_read_only(config(globals)?)?) };
+    let owner = || -> anyhow::Result<Machine> { Ok(Machine::open(config(globals)?)?) };
     match command {
         Command::Pair {
             url,
             name,
             no_browser,
-        } => pair(&machine, &url, name, no_browser).await,
-        Command::Services => services(&machine),
+        } => pair(&owner()?, &url, name, no_browser).await,
+        Command::Services => services(&reader()?),
         Command::Unpair { service } => {
+            let machine = owner()?;
             let service = machine.find_service(&service)?;
             machine.unpair(&service.id).await?;
             println!("Unpaired: {}", service.id);
@@ -89,21 +95,26 @@ pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
         Command::Review {
             service,
             hash: None,
-        } => bundles(&machine, &machine.find_service(&service)?).await,
+        } => {
+            let machine = reader()?;
+            bundles(&machine, &machine.find_service(&service)?).await
+        }
         Command::Review {
             service,
             hash: Some(hash),
         } => {
+            let machine = reader()?;
             let service = machine.find_service(&service)?;
             let review = machine.review(&service.id, hash).await?;
-            show(&review, &mut io::stdout().lock())?;
-            Ok(())
+            Ok(show(&review, &mut io::stdout().lock())?)
         }
         Command::Approve { service, hash, yes } => {
+            let machine = owner()?;
             let service = machine.find_service(&service)?;
             approve(&machine, &machine.review(&service.id, hash).await?, yes)
         }
         Command::Revoke { service, hash } => {
+            let machine = owner()?;
             let service = machine.find_service(&service)?;
             if !service.is_approved(&hash) {
                 bail!("{hash} isn't approved for {}", service.id);
@@ -112,22 +123,23 @@ pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
             println!("Revoked: {hash}");
             Ok(())
         }
-        Command::Agent => agent(machine).await,
+        Command::Agent => agent(owner()?).await,
     }
 }
 
-fn open(globals: &Globals) -> anyhow::Result<Machine> {
+/// The machine's home, as `--home` or `$MOIL_HOME` say, and its tokens.
+fn config(globals: &Globals) -> anyhow::Result<MachineConfig> {
     let root = match &globals.home {
         Some(root) => root.clone(),
         None => Home::default_root()?,
     };
     let home = Home::new(root);
     let secrets = default_secrets(&home)?;
-    Ok(Machine::open(MachineConfig {
+    Ok(MachineConfig {
         home,
         secrets,
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
-    })?)
+    })
 }
 
 async fn pair(
@@ -187,7 +199,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         .map(drop)
 }
 
-fn services(machine: &Machine) -> anyhow::Result<()> {
+fn services(machine: &ReadOnlyMachine) -> anyhow::Result<()> {
     let services = machine.services()?;
     if services.is_empty() {
         eprintln!("No paired services. Pair one with `moil pair URL`.");
@@ -210,7 +222,7 @@ fn services(machine: &Machine) -> anyhow::Result<()> {
 
 /// The service's bundles and whether each is approved, plus approved
 /// bundles it no longer offers.
-async fn bundles(machine: &Machine, service: &PairedService) -> anyhow::Result<()> {
+async fn bundles(machine: &ReadOnlyMachine, service: &PairedService) -> anyhow::Result<()> {
     let offered = machine.bundles(&service.id).await?;
     let listed: HashSet<BundleHash> = offered.iter().map(|b| b.hash).collect();
     let mut rows: Vec<[String; 3]> = offered
@@ -441,21 +453,21 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
 }
 
 /// Tells the owner, once each, about bundles waiting for their review.
-/// Approving needs the machine's home, which the agent holds, so the owner
-/// stops the agent first.
+/// Reading one works while the agent runs; approving changes what the agent
+/// holds, so the owner stops it first.
 async fn announce_reviews(mut snapshots: tokio::sync::watch::Receiver<Snapshot>) {
     let mut announced = HashSet::new();
     loop {
         for (service, bundle) in snapshots.borrow_and_update().pending_reviews() {
             if announced.insert((service.id.clone(), bundle.info.hash)) {
+                let (id, hash) = (&service.id, bundle.info.hash);
                 tracing::info!(
-                    "{} offers {} {}, which you haven't approved; to read and approve it, \
-                     stop the agent and run `moil approve {} {}`",
+                    "{} offers {} {}, which you haven't approved; read it with \
+                     `moil review {id} {hash}`, and to approve it, stop the agent and run \
+                     `moil approve {id} {hash}`",
                     reveal(&service.name),
                     reveal(&bundle.info.name),
                     reveal(&bundle.info.version),
-                    service.id,
-                    bundle.info.hash
                 );
             }
         }

@@ -97,3 +97,37 @@ fn a_cleanup_that_fails_is_a_warning_as_in_the_app() {
     agent.logged("no paired services yet");
     assert!(agent.is_running(), "{}", agent.log.join("\n"));
 }
+
+#[test]
+fn what_only_reads_works_while_the_agent_runs() {
+    let home = tempfile::tempdir().unwrap();
+    // A service paired before, whose token is gone: the agent gives up on
+    // it without reaching for the network.
+    let service = r#"{"id": "klisi.example.com", "base_url": "https://klisi.example.com/moil",
+        "name": "klisi", "machine_id": "m_1",
+        "paired_at": {"secs_since_epoch": 1790000000, "nanos_since_epoch": 0}, "approvals": []}"#;
+    std::fs::create_dir_all(home.path().join("services")).unwrap();
+    std::fs::write(home.path().join("services/klisi.example.com.json"), service).unwrap();
+    let mut agent = Agent::start(home.path());
+    agent.logged("klisi removed this machine");
+
+    let listed = moil(home.path(), &["services"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.status.success() && stdout.contains("klisi.example.com"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    // What changes the machine needs it to itself.
+    let hash = "0".repeat(64);
+    let revoked = moil(home.path(), &["revoke", "klisi", &hash])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&revoked.stderr);
+    assert!(
+        !revoked.status.success() && stderr.contains("already running"),
+        "{stderr}"
+    );
+    assert!(agent.is_running(), "{}", agent.log.join("\n"));
+}

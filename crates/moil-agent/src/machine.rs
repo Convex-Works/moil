@@ -53,7 +53,8 @@ struct Inner {
     /// every home on the computer.
     token_scope: String,
     hardware: OnceLock<Hardware>,
-    _lock: File,
+    /// The home's lock, unless this is a [`ReadOnlyMachine`].
+    _lock: Option<File>,
 }
 
 impl fmt::Debug for Inner {
@@ -62,6 +63,39 @@ impl fmt::Debug for Inner {
             .field("home", &self.home.root())
             .field("secrets", &self.secrets)
             .finish_non_exhaustive()
+    }
+}
+
+/// This computer's moil state, opened without taking the home's lock, for
+/// looking at while an agent runs: the paired services, and the bundles
+/// they offer. It changes nothing, and reads each file afresh, so it sees
+/// what the agent has written. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct ReadOnlyMachine(Machine);
+
+impl ReadOnlyMachine {
+    pub fn home(&self) -> &Home {
+        self.0.home()
+    }
+
+    /// Like [`Machine::services`].
+    pub fn services(&self) -> Result<Vec<PairedService>, Error> {
+        self.0.services()
+    }
+
+    /// Like [`Machine::find_service`].
+    pub fn find_service(&self, query: &str) -> Result<PairedService, Error> {
+        self.0.find_service(query)
+    }
+
+    /// Like [`Machine::bundles`].
+    pub async fn bundles(&self, id: &ServiceId) -> Result<Vec<BundleInfo>, Error> {
+        self.0.bundles(id).await
+    }
+
+    /// Like [`Machine::review`].
+    pub async fn review(&self, id: &ServiceId, hash: BundleHash) -> Result<Review, Error> {
+        self.0.review(id, hash).await
     }
 }
 
@@ -78,19 +112,31 @@ impl Machine {
     /// Opens the machine's home, creating it if needed. Fails with
     /// [`Error::AlreadyRunning`] if another process has it open.
     pub fn open(config: MachineConfig) -> Result<Self, Error> {
+        let lock = config.home.lock()?;
+        Self::with_lock(config, Some(lock))
+    }
+
+    /// Opens the machine's home to read it, even while another process has
+    /// it open. Nothing is created or changed.
+    pub fn open_read_only(config: MachineConfig) -> Result<ReadOnlyMachine, Error> {
+        Self::with_lock(config, None).map(ReadOnlyMachine)
+    }
+
+    fn with_lock(config: MachineConfig, lock: Option<File>) -> Result<Self, Error> {
         let MachineConfig {
             home,
             secrets,
             app_version,
         } = config;
-        let lock = home.lock()?;
         let settings = home.load_settings()?;
-        let token_scope = home
-            .root()
-            .canonicalize()
-            .map_err(|e| with_path(e, home.root()))?
-            .display()
-            .to_string();
+        let token_scope = match home.root().canonicalize() {
+            Ok(root) => root.display().to_string(),
+            // A home that doesn't exist yet has no tokens to find.
+            Err(e) if lock.is_none() && e.kind() == std::io::ErrorKind::NotFound => {
+                home.root().display().to_string()
+            }
+            Err(e) => return Err(with_path(e, home.root()).into()),
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 net: Net::new(&app_version)?,
