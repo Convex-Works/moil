@@ -115,6 +115,7 @@ type preparation struct {
 type attemptState struct {
 	n       int
 	machine string
+	outputs map[string]wire.Upload // the outputs the attempt may produce
 	lastSeq int64
 	// The lease runs out at deadline; timer checks it.
 	deadline time.Time
@@ -625,7 +626,7 @@ func (sc *scheduler) endPreparation(j *jobState) {
 }
 
 func (sc *scheduler) assign(j *jobState, lm *liveMachine, n int, inputs map[string]wire.Download, outputs map[string]wire.Upload) {
-	a := &attemptState{n: n, machine: lm.m.ID}
+	a := &attemptState{n: n, machine: lm.m.ID, outputs: outputs}
 	j.cur = a
 	j.phase = phaseRunning
 	sc.running[lm.m.ID] = j
@@ -694,6 +695,10 @@ func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
 	case wire.OutcomeSucceeded:
 		res := &Result{Meta: m.Result.Meta, Files: make(map[string]File, len(m.Result.Files)), Machine: a.machine, Attempt: a.n}
 		for name, f := range m.Result.Files {
+			if _, declared := a.outputs[name]; !declared {
+				sc.log.Warn("moil: a machine reported an output the job didn't declare; ignoring it", "job", j.id, "attempt", a.n, "machine", a.machine, "output", name)
+				continue
+			}
 			res.Files[name] = File{SizeBytes: f.SizeBytes, SHA256: f.SHA256}
 		}
 		sc.finish(j, Succeeded, res, nil)

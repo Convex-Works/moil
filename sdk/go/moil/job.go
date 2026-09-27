@@ -175,7 +175,8 @@ type Result struct {
 	// the JSON value the script sent, not necessarily the same bytes:
 	// machines re-encode it (spec §2).
 	Meta json.RawMessage
-	// Files describes every uploaded output, by name.
+	// Files describes every uploaded output, by name. Only the job's
+	// declared outputs appear.
 	Files map[string]File
 	// Machine and Attempt say which attempt succeeded.
 	Machine string

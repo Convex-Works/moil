@@ -699,3 +699,22 @@ func TestCloseWaitsForPrepare(t *testing.T) {
 		t.Fatalf("Wait = %v, want ErrClosed", err)
 	}
 }
+
+// A result only ever names the job's declared outputs, whatever a machine
+// reports.
+func TestResultsNameOnlyDeclaredOutputs(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Outputs: map[string]moil.Upload{"out.txt": {URL: "https://s3.example.com/out"}}})
+	a := m.NextAttempt()
+	file := map[string]any{"size_bytes": 5, "sha256": strings.Repeat("a", 64)}
+	m.Send(map[string]any{"type": "done", "job_id": a.JobID, "attempt": a.Number, "seq": 1, "outcome": "succeeded",
+		"result": map[string]any{"files": map[string]any{"out.txt": file, "passwords.txt": file}}})
+	res := succeeded(t, run)
+	if len(res.Files) != 1 || res.Files["out.txt"].SizeBytes != 5 {
+		t.Fatalf("result files %+v, want only out.txt", res.Files)
+	}
+}
