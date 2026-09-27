@@ -1129,3 +1129,133 @@ async fn sleep_until(at: Option<Instant>) {
         None => std::future::pending().await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::future::BoxFuture;
+    use moil_proto::control::{ServiceInfo, Welcome};
+    use moil_runtime::EventSink;
+    use url::Url;
+
+    use super::*;
+    use crate::{Home, MachineConfig, MemorySecrets, Review};
+
+    /// Hands every job it's given to the test.
+    #[derive(Debug)]
+    struct Jobs(mpsc::UnboundedSender<Job>);
+
+    impl Executor for Jobs {
+        fn prepare<'a>(&'a self, _: &'a Bundle) -> BoxFuture<'a, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run(&self, job: Job, _: EventSink, mut stop: StopSignal) -> BoxFuture<'_, Outcome> {
+            let _ = self.0.send(job);
+            Box::pin(async move {
+                stop.stopped().await;
+                Outcome::Cancelled
+            })
+        }
+    }
+
+    /// The job an assignment from the service at `base_url` becomes. The
+    /// test plays the connection, so the service needn't exist: no remote
+    /// service does in tests.
+    async fn job_from(base_url: &str) -> Job {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Machine::open(MachineConfig {
+            home: Home::new(dir.path()),
+            secrets: Arc::new(MemorySecrets::default()),
+            app_version: "0.1.0-test".into(),
+        })
+        .unwrap();
+        let base_url = Url::parse(base_url).unwrap();
+        let (paired, _) = machine
+            .record_pairing(&base_url, "klisi".into(), "m_1".into(), "moil_token")
+            .unwrap();
+        let bundle = Bundle::new(
+            "# /// script\n# requires-python = \">=3.12\"\n# dependencies = []\n# ///\n",
+            "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n",
+            r#"{"moil": 1, "name": "echo", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        let hash = bundle.hash();
+        let review = Review {
+            service: paired,
+            bundle,
+            previous: None,
+            approved: false,
+        };
+        let id = machine.approve(&review).unwrap().id;
+
+        let (jobs, mut ran) = mpsc::unbounded_channel();
+        let (inputs, _) = mpsc::unbounded_channel();
+        let (snapshot, _) = watch::channel(Snapshot::default());
+        let options = AgentOptions::default();
+        let mut coordinator =
+            Coordinator::new(machine, Arc::new(Jobs(jobs)), options, inputs, snapshot);
+        coordinator.services[&id].stop.cancel();
+        coordinator.bundles = coordinator.warm_up().await;
+        let (outbox, _frames) = connection::outbox();
+        let welcome = Welcome {
+            protocol: PROTOCOL_VERSION,
+            machine_id: "m_1".into(),
+            service: ServiceInfo {
+                name: "klisi".into(),
+            },
+            bundles: vec![],
+            resume: vec![],
+        };
+        let assign = Assign {
+            job_id: "j1".parse().unwrap(),
+            attempt: 1,
+            bundle_hash: hash,
+            title: None,
+            params: serde_json::Value::Null,
+            inputs: Default::default(),
+            outputs: Default::default(),
+            lease_ms: 120_000,
+            timeout_ms: None,
+        };
+        for event in [
+            LinkEvent::Open(outbox),
+            LinkEvent::Message(ServiceMessage::Welcome(welcome)),
+            LinkEvent::Message(ServiceMessage::Assign(assign)),
+        ] {
+            let service = id.clone();
+            coordinator.handle(Input::Link {
+                service,
+                task: 0,
+                event,
+            });
+        }
+        ran.recv().await.expect("the attempt runs")
+    }
+
+    fn allows(job: &Job, url: &str) -> bool {
+        job.url_policy.check(&Url::parse(url).unwrap()).is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_remote_services_jobs_cant_use_http_to_this_machine() {
+        let job = job_from("https://klisi.example.com/moil").await;
+        assert!(allows(&job, "https://s3.example.com/meeting.ogg"));
+        for refused in [
+            "http://127.0.0.1:6379/",
+            "http://localhost:8080/admin",
+            "http://[::1]/",
+            "http://s3.example.com/meeting.ogg",
+        ] {
+            assert!(!allows(&job, refused), "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_on_this_machine_may_use_http_to_it() {
+        let job = job_from("http://127.0.0.1:8787/moil").await;
+        assert!(allows(&job, "http://127.0.0.1:8787/files/meeting.ogg"));
+        assert!(allows(&job, "http://localhost:9000/bucket/out.json"));
+        assert!(allows(&job, "https://s3.example.com/meeting.ogg"));
+        assert!(!allows(&job, "http://s3.example.com/meeting.ogg"));
+    }
+}

@@ -109,12 +109,13 @@ impl Outbox {
 }
 
 /// The writer's end of an [`Outbox`].
-struct Frames {
+pub(super) struct Frames {
     frames: mpsc::Receiver<String>,
     full: Arc<AtomicBool>,
 }
 
-fn outbox() -> (Outbox, Frames) {
+/// A new outbox, and the writer's end of it.
+pub(super) fn outbox() -> (Outbox, Frames) {
     let (sender, receiver) = mpsc::channel(OUTBOX_FRAMES);
     let full = Arc::new(AtomicBool::new(false));
     let outbox = Outbox {
