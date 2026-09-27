@@ -27,6 +27,9 @@ type namedMessage struct {
 
 func loadMessageVectors(t *testing.T) messageVectors {
 	t.Helper()
+	if _, err := os.Stat(vectorsDir); err != nil {
+		t.Skipf("the shared test vectors aren't at %s (%v); run the SDK's tests from a checkout of the moil repository", vectorsDir, err)
+	}
 	data, err := os.ReadFile(filepath.Join(vectorsDir, "messages.json"))
 	if err != nil {
 		t.Fatal(err)

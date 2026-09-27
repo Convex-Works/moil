@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -56,7 +55,7 @@ func (l testLog) Write(p []byte) (int, error) {
 // vectorBundle loads a bundle from spec/vectors/bundles.
 func vectorBundle(t *testing.T, dir string) *moil.Bundle {
 	t.Helper()
-	b, err := moil.LoadBundle(os.DirFS(filepath.Join(vectorsDir, "bundles", dir)))
+	b, err := moil.LoadBundle(os.DirFS(vectorPath(t, "bundles", dir)))
 	if err != nil {
 		t.Fatal(err)
 	}
