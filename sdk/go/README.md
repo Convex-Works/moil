@@ -126,7 +126,7 @@ for ev := range run.Events(ctx) {
 	case moil.EventProgress:
 		// ev.Fraction, ev.Message
 	case moil.EventData:
-		// ev.Data: whatever your script sent
+		// ev.Data: the JSON value your script sent
 	}
 }
 res, err := run.Wait(ctx)
@@ -144,6 +144,11 @@ res, err := run.Wait(ctx)
 - **Pre-signed URLs expire.** If a job may wait a while or be retried, set
   `Prepare` instead of `Inputs` and `Outputs`: it makes each attempt's URLs
   as the attempt is assigned.
+- **JSON values, not bytes.** `Params`, `ev.Data` and `Result.Meta` reach
+  the other side as the same JSON value, but machines re-encode them, so
+  key order, whitespace and the spelling of numbers may change. Keep them
+  within I-JSON: send integers beyond 2^53, such as 64-bit IDs, as
+  strings.
 - **Results.** `Wait` returns a `*moil.Result` (the script's `Meta`, and the
   size and SHA-256 of each uploaded output), or a `*moil.JobError` with the
   spec's error code, `moil.ErrCancelled`, or `moil.ErrClosed`.
@@ -202,6 +207,13 @@ lease runs out (`a.GoSilent`), or carry on across `m.Disconnect()` and
 something didn't happen, and `moiltest.At(url)` to reach the Server
 through your own router. Every message your service sends is checked
 against the protocol.
+
+The fake holds your service to what real machines do: it re-encodes
+params, data and meta as the app does, so compare them as JSON values,
+not bytes; it refuses input and output URLs machines refuse
+(`moiltest.WithInsecureHTTP()` for a service using
+`Config.AllowInsecureHTTP`); and it drops data and refuses meta that a
+machine wouldn't forward.
 
 ## Try it with the app
 

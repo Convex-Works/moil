@@ -29,7 +29,9 @@ type Attempt struct {
 	Number     int
 	BundleHash string
 	Title      string
-	// Params is the job's params, as JSON.
+	// Params is the job's params, as the script would read them: the
+	// same JSON value the service submitted, re-encoded as the app does,
+	// so not necessarily the same bytes.
 	Params  json.RawMessage
 	Inputs  map[string]moil.Download
 	Outputs map[string]moil.Upload
@@ -68,7 +70,6 @@ func newAttempt(m *Machine, msg wire.Assign) *Attempt {
 		Number:     msg.Attempt,
 		BundleHash: msg.BundleHash,
 		Title:      msg.Title,
-		Params:     msg.Params,
 		Inputs:     make(map[string]moil.Download, len(msg.Inputs)),
 		Outputs:    make(map[string]moil.Upload, len(msg.Outputs)),
 		Lease:      time.Duration(msg.LeaseMS) * time.Millisecond,
@@ -116,14 +117,35 @@ func (a *Attempt) Log(level, message string) {
 	a.event(wire.JobEvent{Type: "log", Level: level, Message: &message})
 }
 
-// Data sends service-specific JSON, as the script's data events do.
+// Data sends service-specific JSON, as the script's data events do. Like
+// the app, the machine re-encodes it, and sends a warning instead if the
+// payload is over 256 KiB, nested more than 64 levels deep, or holds a
+// number beyond the range of a double.
 func (a *Attempt) Data(payload any) {
 	a.m.t.Helper()
 	data, err := json.Marshal(payload)
 	if err != nil {
 		a.m.t.Fatal(err)
 	}
+	if data, err = forwardable(data); err != nil {
+		message := "ignored a data event: its payload " + err.Error()
+		a.event(wire.JobEvent{Type: "log", Level: "warn", Message: &message})
+		return
+	}
 	a.event(wire.JobEvent{Type: "data", Payload: data})
+}
+
+// forwardable returns a payload or meta as a machine forwards it, or why
+// it wouldn't, completing the sentence "the payload …".
+func forwardable(raw []byte) (json.RawMessage, error) {
+	data, err := reencode(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > wire.MaxPayloadBytes {
+		return nil, fmt.Errorf("is %d bytes, over the 256 KiB limit", len(data))
+	}
+	return data, nil
 }
 
 func (a *Attempt) event(e wire.JobEvent) {
@@ -255,19 +277,29 @@ func (a *Attempt) transfer(kind, name string, req *http.Request) (*http.Response
 }
 
 // Succeed ends the attempt successfully, with meta (nil for none) and
-// every output uploaded with Output.
+// every output uploaded with Output. Like the app, the machine re-encodes
+// meta; it refuses meta it couldn't forward, as Data does, and the
+// attempt fails with moil.CodeNoResult instead.
 func (a *Attempt) Succeed(meta any) {
 	a.m.t.Helper()
 	var raw json.RawMessage
+	var refused error
 	if meta != nil {
-		var err error
-		if raw, err = json.Marshal(meta); err != nil {
+		data, err := json.Marshal(meta)
+		if err != nil {
 			a.m.t.Fatal(err)
 		}
+		raw, refused = forwardable(data)
 	}
 	a.m.mu.Lock()
 	defer a.m.mu.Unlock()
 	a.mustRunLocked()
+	if refused != nil {
+		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
+			Code: string(moil.CodeNoResult), Message: "the script's result was refused: its meta " + refused.Error(),
+		}})
+		return
+	}
 	files := make(map[string]wire.FileInfo, len(a.uploaded))
 	for name, f := range a.uploaded {
 		files[name] = f

@@ -162,8 +162,9 @@ var ErrClosed = errors.New("moil: server closed")
 
 // A Result is what a succeeded job produced.
 type Result struct {
-	// Meta is the script's result metadata, untouched; nil if it sent
-	// none.
+	// Meta is the script's result metadata, nil if it sent none. It is
+	// the JSON value the script sent, not necessarily the same bytes:
+	// machines re-encode it (spec §2).
 	Meta json.RawMessage
 	// Files describes every uploaded output, by name.
 	Files map[string]File
@@ -211,7 +212,9 @@ type Event struct {
 	// Level is the log level: "debug", "info", "warn" or "error", or a
 	// level from a newer machine, to be shown as it is.
 	Level string
-	// Data is the payload of EventData, untouched.
+	// Data is the payload of EventData: the JSON value the script sent,
+	// not necessarily the same bytes, since machines re-encode it (spec
+	// §2). Compare it as JSON.
 	Data json.RawMessage
 	// Err is why the attempt failed, for EventRetrying.
 	Err *JobError

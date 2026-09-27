@@ -828,7 +828,13 @@ func (m *Machine) assign(msg wire.Assign) {
 	}
 	a := newAttempt(m, msg)
 	m.attempts[ref] = a
+	params, unreadable := reencode(msg.Params)
 	switch {
+	case unreadable != nil:
+		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
+			Code: string(moil.CodeRejected), Message: "params " + unreadable.Error(),
+		}})
+		return
 	case m.refuse > 0:
 		m.refuse--
 		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
@@ -846,6 +852,7 @@ func (m *Machine) assign(msg wire.Assign) {
 		}})
 		return
 	}
+	a.Params = params
 	a.started = true
 	m.assigned = append(m.assigned, a)
 	m.reportStateLocked()

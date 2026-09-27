@@ -111,6 +111,34 @@ func TestJobRunsEndToEnd(t *testing.T) {
 	a.WaitAcked()
 }
 
+// Params, data and meta travel as JSON values: machines re-encode them,
+// and moiltest does as they do. What a machine wouldn't forward never
+// reaches the service.
+func TestJSONTravelsAsValuesNotBytes(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Params: json.RawMessage(`{"b": 1.0, "a": [1e2, 3]}`)})
+	a := m.NextAttempt()
+	if string(a.Params) != `{"a":[100.0,3],"b":1.0}` {
+		t.Errorf("the script would read the params as %s", a.Params)
+	}
+	a.Data(json.RawMessage(`{"z": 1, "y": 2.50}`))
+	a.Data(strings.Repeat("x", 256<<10))
+	a.Succeed(map[string]any{"deep": json.RawMessage(strings.Repeat("[", 64) + strings.Repeat("]", 64))})
+	_, err := wait(t, run)
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != moil.CodeNoResult {
+		t.Errorf("a result with meta a machine refuses ended the job with %v, want %s", err, moil.CodeNoResult)
+	}
+	evs := events(t, run)
+	if len(evs) != 4 || string(evs[2].Data) != `{"y":2.5,"z":1}` || evs[3].Kind != moil.EventLog || evs[3].Level != "warn" {
+		t.Fatalf("events %+v", evs)
+	}
+}
+
 // Phases and log levels are only shown, so the ones a newer machine
 // sends reach the service as they are, rather than ending the channel.
 func TestNewerPhasesAndLogLevelsPassThrough(t *testing.T) {
