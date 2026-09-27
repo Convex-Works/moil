@@ -185,8 +185,8 @@ res, err := run.Wait(ctx)
 - **Results.** `Wait` returns a `*moil.Result` (the script's `Meta`, and the
   size and SHA-256 of each uploaded output), or an error: a
   `*moil.JobError` with the spec's error code, the error `Prepare`
-  returned, `moil.ErrTooMuchData`, `moil.ErrCancelled` or
-  `moil.ErrClosed`.
+  returned, `moil.ErrTooMuchData`, `moil.ErrCancelled` (only after
+  `run.Cancel()`) or `moil.ErrClosed`.
 - **Events** replay from the first for every reader and end with the run;
   the Server never waits for slow readers. Besides the script's `phase`,
   `progress`, `log` and `data`, you get `queued`, `assigned` (with the
@@ -202,7 +202,9 @@ res, err := run.Wait(ctx)
   them, of which a job tolerates ten.
 - `run.Cancel()` stops a job: at once if it's waiting or its machine is
   offline, otherwise when the machine confirms. It ends as cancelled
-  unless its attempt succeeded before the machine saw the request.
+  unless its attempt succeeded before the machine saw the request. A
+  machine that reports an attempt cancelled when you didn't cancel it has
+  failed the attempt, as `interrupted`, and the job is retried.
 
 Jobs live in memory. If the service restarts, unfinished jobs are gone and
 machines drop their attempts; resubmit what must finish, by the same ID,
@@ -244,12 +246,13 @@ func TestTranscriptionReachesTheRoom(t *testing.T) {
 ```
 
 Attempts can also fail (`a.Fail`, `a.ScriptError`), go silent until the
-lease runs out (`a.GoSilent`), or carry on across `m.Disconnect()` and
-`m.Connect()`; `m.Crash()` restarts the app without its attempts. Use
-`m.OnOffer` to answer offers yourself, `m.Sync()` before asserting that
-something didn't happen, and `moiltest.At(url)` to reach the Server
-through your own router. Every message your service sends is checked
-against the protocol.
+lease runs out (`a.GoSilent`), end cancelled unasked as a machine breaking
+the protocol would (`a.CancelUnasked`), or carry on across
+`m.Disconnect()` and `m.Connect()`; `m.Crash()` restarts the app without
+its attempts. Use `m.OnOffer` to answer offers yourself, `m.Sync()` before
+asserting that something didn't happen, and `moiltest.At(url)` to reach
+the Server through your own router. Every message your service sends is
+checked against the protocol.
 
 The fake holds your service to what real machines do: it refuses to pair
 unless your confirmation page is on the origin it reaches the Server at

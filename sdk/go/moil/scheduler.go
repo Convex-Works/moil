@@ -737,7 +737,23 @@ func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
 			StderrTail: e.StderrTail,
 		})
 	case wire.OutcomeCancelled:
-		sc.finish(j, Cancelled, nil, ErrCancelled)
+		if j.cancelled {
+			sc.finish(j, Cancelled, nil, ErrCancelled)
+			return
+		}
+		// A machine may report cancelled only after the service's cancel
+		// (spec §7.6). Taken at its word, an unasked one would end the job
+		// as if the service had cancelled it, and a service that resubmits
+		// jobs it didn't cancel would do so for as long as the machine
+		// answers that way. The attempt did stop on the machine, which the
+		// spec calls interrupted: a retryable failure that counts toward
+		// MaxAttempts.
+		sc.log.Warn("moil: a machine reported an attempt cancelled that the service didn't cancel; counting it as interrupted", "job", j.id, "attempt", a.n, "machine", a.machine)
+		sc.attemptFailed(j, &JobError{
+			Code:      CodeInterrupted,
+			Message:   "the machine reported the attempt cancelled, but the service didn't cancel it",
+			Retryable: true,
+		})
 	}
 }
 

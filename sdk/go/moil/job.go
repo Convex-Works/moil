@@ -110,7 +110,7 @@ const (
 	CodeInputDownload ErrorCode = "input_download" // an input couldn't be downloaded
 	CodeOutputUpload  ErrorCode = "output_upload"  // an output couldn't be uploaded
 	CodeRejected      ErrorCode = "rejected"       // the machine couldn't read the assignment; never started
-	CodeInterrupted   ErrorCode = "interrupted"    // stopped by the machine's owner, or the app quit
+	CodeInterrupted   ErrorCode = "interrupted"    // stopped by the machine's owner, or the app quit; also a cancelled the service didn't ask for
 	CodeBusy          ErrorCode = "busy"           // assigned while not idle; never started
 	CodeNotApproved   ErrorCode = "not_approved"   // bundle not approved or not stored; never started
 	CodeInternal      ErrorCode = "internal"       // a bug in the machine's runtime
@@ -159,7 +159,11 @@ func (e *JobError) Error() string {
 	return fmt.Sprintf("moil: attempt %d on machine %s failed: %s: %s", e.Attempt, e.Machine, e.Code, e.Message)
 }
 
-// ErrCancelled is returned by Run.Wait for a job that was cancelled.
+// ErrCancelled is returned by Run.Wait for a job the service cancelled
+// with Run.Cancel, and only for one. An attempt a machine reports
+// cancelled without having been asked to fails with CodeInterrupted
+// instead, and the job is retried like after any other failure (spec
+// §7.6).
 var ErrCancelled = errors.New("moil: job cancelled")
 
 // ErrClosed is returned for work the Server can no longer do because it

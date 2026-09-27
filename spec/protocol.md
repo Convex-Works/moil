@@ -619,6 +619,12 @@ app while one runs, the machine sends `done` with outcome `failed` and code
 `interrupted`, which is retryable, so the service can hand the job to
 another machine.
 
+A service that receives `cancelled` for an attempt it didn't cancel MUST
+NOT end the job as cancelled, which would let a machine end any job it's
+given as if the service had. It SHOULD treat the `done` as outcome
+`failed` with code `interrupted`, counting the attempt toward its retry
+limit.
+
 ### 7.7 Retries
 
 A service MAY retry a failed attempt whose error is retryable, as a new
@@ -809,7 +815,7 @@ A failed `done` carries `error`:
 | `input_download` | machine | An input couldn't be downloaded | yes; no when the URL policy (§3) refused it, or it's larger than the machine accepts |
 | `output_upload` | machine | An output couldn't be uploaded | yes; no when the URL policy (§3) refused it |
 | `rejected` | machine | The assignment couldn't be read (§7.2); never started | no |
-| `interrupted` | machine | Stopped by the owner, or the app quit | yes |
+| `interrupted` | machine | Stopped by the owner, or the app quit; also how a service counts a `cancelled` it didn't ask for (§7.6) | yes |
 | `busy` | machine | Assigned while not idle; never started | yes |
 | `not_approved` | machine | Bundle not approved or not stored; never started | yes |
 | `internal` | machine | A bug in the runtime | yes |
