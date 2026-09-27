@@ -111,6 +111,29 @@ func TestJobRunsEndToEnd(t *testing.T) {
 	a.WaitAcked()
 }
 
+// Phases and log levels are only shown, so the ones a newer machine
+// sends reach the service as they are, rather than ending the channel.
+func TestNewerPhasesAndLogLevelsPassThrough(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	a := m.NextAttempt()
+	a.Phase("compiling")
+	a.Log("trace", "linking")
+	a.Succeed(nil)
+	succeeded(t, run)
+	evs := events(t, run)
+	if len(evs) != 4 || evs[2].Phase != "compiling" || evs[3].Level != "trace" || evs[3].Message != "linking" {
+		t.Fatalf("events %+v", evs)
+	}
+	if !m.Connected() {
+		t.Fatal("the service closed the channel")
+	}
+}
+
 // Submitting a job the Server knows returns the same Run, while it runs and
 // after it ended, so a service can resubmit by ID without doubling work.
 func TestSubmitIsIdempotentByID(t *testing.T) {

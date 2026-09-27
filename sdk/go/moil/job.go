@@ -201,13 +201,15 @@ type Event struct {
 	// zero for EventQueued.
 	Attempt int
 	Machine string
-	// Phase is "preparing", "downloading", "running" or "uploading".
+	// Phase is "preparing", "downloading", "running" or "uploading", or
+	// a phase from a newer machine, to be shown as it is.
 	Phase string
 	// Fraction is the progress from 0 to 1, when the script gave one.
 	Fraction *float64
 	// Message is the progress or log message.
 	Message string
-	// Level is the log level: "debug", "info", "warn" or "error".
+	// Level is the log level: "debug", "info", "warn" or "error", or a
+	// level from a newer machine, to be shown as it is.
 	Level string
 	// Data is the payload of EventData, untouched.
 	Data json.RawMessage

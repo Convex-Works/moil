@@ -111,7 +111,8 @@ type Event struct {
 
 // JobEvent is an event a machine forwards: phase, progress, log or data
 // (spec §8.3). Types from newer machines decode without error so that
-// receivers can ignore them.
+// receivers can ignore them, and so do phases and log levels, which
+// receivers show as they are (spec §11).
 type JobEvent struct {
 	Type     string          `json:"type"`
 	Phase    string          `json:"phase,omitempty"`
@@ -457,11 +458,9 @@ func (e JobEvent) validate() error {
 	case "":
 		return errors.New("event has no type")
 	case "phase":
-		switch e.Phase {
-		case "preparing", "downloading", "running", "uploading":
-			return nil
+		if e.Phase == "" {
+			return errors.New("phase event has no phase")
 		}
-		return fmt.Errorf("unknown phase %q", e.Phase)
 	case "progress":
 		if e.Fraction == nil && e.Message == nil {
 			return errors.New("progress needs a fraction or a message")
@@ -472,11 +471,6 @@ func (e JobEvent) validate() error {
 	case "log":
 		if e.Message == nil {
 			return errors.New("log needs a message")
-		}
-		switch e.Level {
-		case "", "debug", "info", "warn", "error":
-		default:
-			return fmt.Errorf("unknown log level %q", e.Level)
 		}
 	case "data":
 		if e.Payload == nil {

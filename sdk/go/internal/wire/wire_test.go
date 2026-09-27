@@ -142,6 +142,7 @@ func TestDecodeRejectsWhatThePeerMustNotSend(t *testing.T) {
 		{"seq zero", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 0, "event": {"v": 1, "type": "log", "message": "x"}}`},
 		{"fraction above one", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "progress", "fraction": 1.5}}`},
 		{"empty progress", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "progress"}}`},
+		{"phase without a phase", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "phase"}}`},
 		{"data without payload", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "data"}}`},
 		{"succeeded without result", `{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "succeeded"}`},
 		{"failed without error", `{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "failed"}`},
@@ -181,6 +182,12 @@ func TestDecodeToleratesAdditions(t *testing.T) {
 	}
 	if ev := m.(Event); ev.Event.Type != "metric" {
 		t.Fatalf("got %#v", ev)
+	}
+	// Phases and log levels are only shown, so newer ones pass.
+	for _, event := range []string{`{"type": "phase", "phase": "compiling"}`, `{"type": "log", "level": "trace", "message": "x"}`} {
+		if _, err := Decode([]byte(`{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": ` + event + `}`)); err != nil {
+			t.Errorf("%s: %v", event, err)
+		}
 	}
 }
 

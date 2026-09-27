@@ -91,7 +91,8 @@ func newAttempt(m *Machine, msg wire.Assign) *Attempt {
 func (a *Attempt) running() bool { return a.started && !a.finished && !a.abandoned }
 
 // Phase reports that the runtime entered a phase: "preparing",
-// "downloading", "running" or "uploading".
+// "downloading", "running" or "uploading", or another, as a newer machine
+// might.
 func (a *Attempt) Phase(phase string) {
 	a.m.t.Helper()
 	a.event(wire.JobEvent{Type: "phase", Phase: phase})
@@ -108,7 +109,8 @@ func (a *Attempt) Progress(fraction float64, message string) {
 	a.event(e)
 }
 
-// Log reports a log line at level "debug", "info", "warn" or "error".
+// Log reports a log line at level "debug", "info", "warn" or "error", or
+// another, as a newer machine might.
 func (a *Attempt) Log(level, message string) {
 	a.m.t.Helper()
 	a.event(wire.JobEvent{Type: "log", Level: level, Message: &message})
