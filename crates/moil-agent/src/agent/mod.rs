@@ -66,7 +66,7 @@ pub struct AgentOptions {
     pub reconnect_max: Duration,
     /// How long a control channel may go without receiving anything (pings
     /// included), or without taking what the machine writes, before the
-    /// agent treats it as dead (spec §6.1: 60 s). Also bounds how long
+    /// agent treats it as dead (spec §6.1: 45 s). Also bounds how long
     /// opening one may take.
     pub channel_timeout: Duration,
     /// How long [`AgentHandle::shutdown`] waits for services to acknowledge
@@ -83,7 +83,7 @@ impl Default for AgentOptions {
         Self {
             reconnect_min: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
-            channel_timeout: Duration::from_secs(60),
+            channel_timeout: Duration::from_secs(45),
             shutdown_grace: Duration::from_secs(5),
             max_kept_bytes: 16 << 20,
         }
@@ -336,5 +336,24 @@ impl From<&Outcome> for JobOutcome {
                 message: error.message.clone(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_timings_are_the_specs() {
+        let options = AgentOptions::default();
+        // Spec §6.1.
+        assert_eq!(options.channel_timeout, Duration::from_secs(45));
+        assert_eq!(options.reconnect_min, Duration::from_secs(1));
+        assert_eq!(options.reconnect_max, Duration::from_secs(60));
+        // Spec §7.3: with the shortest lease services should use, renewed
+        // every third of it, a machine whose channel dies right after a
+        // renewal notices and connects again before the lease runs out.
+        let lease = Duration::from_secs(90);
+        assert!(lease / 3 + options.channel_timeout + options.reconnect_min < lease);
     }
 }
