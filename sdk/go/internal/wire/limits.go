@@ -57,3 +57,24 @@ func CheckValue(raw []byte) error {
 		}
 	}
 }
+
+// checkPayload fails unless a data payload or result meta is within the
+// limits of spec §10: at most MaxPayloadBytes serialized, and within
+// CheckValue's bounds.
+func checkPayload(what string, raw json.RawMessage) error {
+	size := len(raw)
+	if size > MaxPayloadBytes {
+		// Measure it as the machine did, without whitespace.
+		var compact bytes.Buffer
+		if json.Compact(&compact, raw) == nil {
+			size = compact.Len()
+		}
+	}
+	if size > MaxPayloadBytes {
+		return fmt.Errorf("%s is %d bytes, over the 256 KiB limit", what, size)
+	}
+	if err := CheckValue(raw); err != nil {
+		return fmt.Errorf("%s %w", what, err)
+	}
+	return nil
+}

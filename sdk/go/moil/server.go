@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"sync"
@@ -59,6 +60,11 @@ type Config struct {
 	// KeepFinished is how long a finished job stays known, for Run and
 	// for idempotent Submit. Default 1 hour.
 	KeepFinished time.Duration
+	// MaxDataBytes bounds the data events a Run keeps, so that a machine
+	// can't make the service hold unbounded memory: each counts its
+	// payload's size plus 256 bytes. An attempt that sends more is
+	// stopped, and its job fails with ErrTooMuchData. Default 16 MiB.
+	MaxDataBytes int
 
 	// AllowInsecureHTTP lets jobs use plain http input and output URLs on
 	// any host, for development against storage without TLS, such as a
@@ -122,6 +128,9 @@ func (c *Config) setDefaults() error {
 	if c.MaxAttempts <= 0 {
 		c.MaxAttempts = 3
 	}
+	if c.MaxDataBytes <= 0 {
+		c.MaxDataBytes = 16 << 20
+	}
 	return nil
 }
 
@@ -171,7 +180,7 @@ func NewServer(cfg Config) (*Server, error) {
 		cmds:        make(chan func(*scheduler)),
 		stop:        make(chan struct{}),
 		loopDone:    make(chan struct{}),
-		reports:     newQueue[func(context.Context)](),
+		reports:     newQueue[func(context.Context)](math.MaxInt),
 		reportsDone: make(chan struct{}),
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())

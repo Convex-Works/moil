@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"iter"
-	"sync"
 	"time"
 )
 
@@ -160,6 +158,11 @@ var ErrCancelled = errors.New("moil: job cancelled")
 // was closed.
 var ErrClosed = errors.New("moil: server closed")
 
+// ErrTooMuchData is returned by Run.Wait for a job whose attempt sent more
+// data than Config.MaxDataBytes. The attempt is stopped and not retried:
+// another would send as much.
+var ErrTooMuchData = errors.New("moil: the job sent more data than the Server keeps")
+
 // A Result is what a succeeded job produced.
 type Result struct {
 	// Meta is the script's result metadata, nil if it sent none. It is
@@ -232,124 +235,3 @@ const (
 	Failed    RunState = "failed"
 	Cancelled RunState = "cancelled"
 )
-
-// A Run is a submitted job. Its methods are safe to call from any
-// goroutine.
-//
-// Runs live in memory: when the service restarts, unfinished jobs are
-// lost, and machines abandon the attempts they were running for them. A
-// service that must finish a job resubmits it, by the same ID, on startup.
-type Run struct {
-	id     string
-	cancel func()
-
-	mu     sync.Mutex
-	state  RunState
-	events []Event
-	wake   chan struct{} // closed and replaced when something changes
-	done   chan struct{} // closed when the run ends
-	ended  bool
-	result *Result
-	err    error
-}
-
-func newRun(id string, cancel func()) *Run {
-	return &Run{id: id, cancel: cancel, state: Queued, wake: make(chan struct{}), done: make(chan struct{})}
-}
-
-// ID is the job's ID.
-func (r *Run) ID() string { return r.id }
-
-// State reports where the run is now.
-func (r *Run) State() RunState {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.state
-}
-
-// Events returns the run's events in order, from the first, then each new
-// one as it happens. The sequence ends after the run ends and every event
-// has been yielded, or when ctx is done. Each call starts from the first
-// event, and the Server never drops or waits for events: a slow reader only
-// delays itself.
-func (r *Run) Events(ctx context.Context) iter.Seq[Event] {
-	return func(yield func(Event) bool) {
-		next := 0
-		for {
-			r.mu.Lock()
-			// Events are only ever appended, so the elements of this
-			// slice never change after it's taken.
-			pending := r.events[next:]
-			ended := r.ended
-			wake := r.wake
-			r.mu.Unlock()
-			for _, ev := range pending {
-				if !yield(ev) {
-					return
-				}
-			}
-			next += len(pending)
-			if len(pending) > 0 {
-				continue
-			}
-			if ended {
-				return
-			}
-			select {
-			case <-wake:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-// Done is closed when the run ends.
-func (r *Run) Done() <-chan struct{} { return r.done }
-
-// Wait blocks until the run ends or ctx is done. A succeeded job returns
-// its Result. A failed one returns a *JobError, or the error from
-// Job.Prepare; a cancelled one ErrCancelled, and one the Server gave up on
-// when closing ErrClosed.
-func (r *Run) Wait(ctx context.Context) (*Result, error) {
-	select {
-	case <-r.done:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.result, r.err
-}
-
-// Cancel asks for the job to stop. A job that is waiting for a machine
-// ends at once; a running one ends when its machine confirms, or at once
-// if the machine is offline. If the attempt finishes before its machine
-// sees the request, the run ends with that attempt's outcome instead.
-// Cancelling an ended run does nothing.
-func (r *Run) Cancel() { r.cancel() }
-
-// The methods below are called by the scheduler.
-
-func (r *Run) emit(ev Event) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, ev)
-	close(r.wake)
-	r.wake = make(chan struct{})
-}
-
-func (r *Run) setState(s RunState) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state = s
-}
-
-func (r *Run) finish(s RunState, res *Result, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state, r.result, r.err, r.ended = s, res, err, true
-	close(r.wake)
-	r.wake = make(chan struct{})
-	close(r.done)
-}

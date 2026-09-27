@@ -153,9 +153,13 @@ res, err := run.Wait(ctx)
   size and SHA-256 of each uploaded output), or a `*moil.JobError` with the
   spec's error code, `moil.ErrCancelled`, or `moil.ErrClosed`.
 - **Events** replay from the first for every reader and end with the run;
-  the Server never drops them or waits for slow readers. Besides the
-  script's `phase`, `progress`, `log` and `data`, you get `queued`,
-  `assigned` (with the machine) and `retrying` (with the error).
+  the Server never waits for slow readers. Besides the script's `phase`,
+  `progress`, `log` and `data`, you get `queued`, `assigned` (with the
+  machine) and `retrying` (with the error). A run keeps its events within
+  bounds a machine can't push past: consecutive progress events collapse
+  into the latest, logs stop after 1 MiB, and an attempt sending more
+  data than `Config.MaxDataBytes` (16 MiB) is stopped and its job fails
+  with `moil.ErrTooMuchData`.
 - **Leases and retries.** An attempt whose machine goes quiet for
   `LeaseTTL` fails with `lease_expired`; a machine that restarts without its
   attempt loses it (`lost`). Retryable failures are retried up to

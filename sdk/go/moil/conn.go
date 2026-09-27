@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -18,7 +19,13 @@ type session struct {
 	conn      *websocket.Conn
 	out       *queue[outbound]
 	log       *slog.Logger
+	overflow  sync.Once
 }
+
+// maxOutbound bounds the messages waiting to be sent to a machine. A
+// machine that lets more pile up isn't reading them, and is disconnected
+// rather than let the service hold them.
+const maxOutbound = 1024
 
 // outbound is a message to send, or, if closeCode is set, a request to
 // close the channel after the messages queued before it.
@@ -29,11 +36,20 @@ type outbound struct {
 }
 
 // send queues a message without waiting for the network.
-func (se *session) send(m wire.Message) { se.out.push(outbound{msg: m}) }
+func (se *session) send(m wire.Message) { se.push(outbound{msg: m}) }
 
 // close queues the close handshake after the messages already queued.
 func (se *session) close(code websocket.StatusCode, reason string) {
-	se.out.push(outbound{closeCode: code, reason: reason})
+	se.push(outbound{closeCode: code, reason: reason})
+}
+
+func (se *session) push(ob outbound) {
+	if !se.out.push(ob) {
+		se.overflow.Do(func() {
+			se.log.Warn("moil: a machine isn't reading what the service sends; disconnecting it", "machine", se.machineID)
+			se.conn.CloseNow()
+		})
+	}
 }
 
 // handleConnect serves GET /v1/connect: it authenticates the machine,
@@ -75,7 +91,7 @@ func (s *Server) serveChannel(conn *websocket.Conn, rec MachineRecord) {
 		return
 	}
 
-	sess := &session{machineID: rec.ID, conn: conn, out: newQueue[outbound](), log: s.log}
+	sess := &session{machineID: rec.ID, conn: conn, out: newQueue[outbound](maxOutbound), log: s.log}
 	var regErr error
 	if err := s.call(func(sc *scheduler) { regErr = sc.register(sess, rec, hello) }); err != nil {
 		regErr = err

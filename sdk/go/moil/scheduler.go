@@ -319,7 +319,9 @@ func (sc *scheduler) handle(sess *session, msg wire.Message) {
 			a.lastSeq = m.Seq
 			if ev, ok := jobEvent(m.Event); ok {
 				ev.Attempt, ev.Machine = a.n, a.machine
-				j.run.emit(ev)
+				if !j.run.emit(ev) {
+					sc.tooMuchData(j, a)
+				}
 			}
 		}
 	case wire.Renew:
@@ -359,7 +361,7 @@ func (sc *scheduler) submit(j *jobState) (*Run, error) {
 	if sc.bundleByHash[j.bundle.Hash()] == nil {
 		return nil, fmt.Errorf("moil: bundle %s wasn't added to the server; call AddBundle first", j.bundle)
 	}
-	j.run = newRun(j.id, func() { sc.s.post(func(sc *scheduler) { sc.cancel(j) }) })
+	j.run = newRun(j.id, func() { sc.s.post(func(sc *scheduler) { sc.cancel(j) }) }, sc.cfg.MaxDataBytes)
 	sc.jobs[j.id] = j
 	sc.queue = append(sc.queue, j)
 	j.run.emit(Event{Kind: EventQueued, Time: time.Now()})
@@ -655,6 +657,16 @@ func (sc *scheduler) checkLease(j *jobState, a *attemptState) {
 		lm.sess.send(wire.Cancel{JobID: j.id, Attempt: a.n})
 	}
 	sc.attemptFailed(j, &JobError{Code: CodeLeaseExpired, Message: "the machine stopped reporting on the attempt", Retryable: true})
+}
+
+// tooMuchData stops an attempt that sent more data than its run keeps, and
+// ends its job: another attempt would send as much.
+func (sc *scheduler) tooMuchData(j *jobState, a *attemptState) {
+	if lm := sc.machines[a.machine]; lm != nil {
+		lm.sess.send(wire.Cancel{JobID: j.id, Attempt: a.n})
+	}
+	sc.log.Warn("moil: an attempt sent more data than Config.MaxDataBytes; stopping it", "job", j.id, "attempt", a.n, "machine", a.machine)
+	sc.finish(j, Failed, nil, fmt.Errorf("%w: attempt %d on machine %s sent more than Config.MaxDataBytes (%d bytes)", ErrTooMuchData, a.n, a.machine, sc.cfg.MaxDataBytes))
 }
 
 func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
