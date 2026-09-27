@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"iter"
-	"sync"
 	"time"
 )
 
@@ -14,10 +12,10 @@ import (
 // these input files and these output destinations.
 type Job struct {
 	// ID identifies the job, ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$. It is
-	// optional; one is generated if empty. Submitting a job whose ID the
-	// Server already knows returns the existing Run, so a service can
+	// optional; one is generated if empty. Submitting a job while one
+	// with its ID is unfinished returns that one's Run, so a service can
 	// derive IDs from its own records (e.g. "meeting-42-transcript") and
-	// resubmit safely.
+	// resubmit safely; once it has finished, the ID runs again.
 	ID string
 	// Bundle is the code to run. It must have been added with AddBundle.
 	Bundle *Bundle
@@ -25,7 +23,11 @@ type Job struct {
 	// show their owners, e.g. the meeting's name.
 	Title string
 	// Params is handed to the script as JSON. It is marshaled once, at
-	// Submit; nil becomes null.
+	// Submit; nil becomes null. The script gets the same JSON value, not
+	// necessarily the same bytes (spec §2): keep it within I-JSON, with
+	// integers beyond 2^53, such as 64-bit IDs, as strings. Submit refuses
+	// params nested more than 64 levels deep or with numbers beyond the
+	// range of a double, which machines can't read.
 	Params any
 	// Inputs are the files the runtime downloads before starting the
 	// script, by file name (^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$).
@@ -37,8 +39,14 @@ type Job struct {
 	// attempt is assigned, instead of Inputs and Outputs. Use it for
 	// pre-signed URLs, which could expire while the job waits for a
 	// machine or between attempts. It runs on its own goroutine before the
-	// machine hears of the attempt; ctx ends if the job does. An error
-	// ends the job, and Run.Wait returns it.
+	// machine hears of the attempt, holding the machine for the job. ctx
+	// ends if the job ends or the machine leaves; the job then waits for a
+	// machine again. Server.Close waits for Prepare, so return soon after
+	// ctx ends.
+	//
+	// A *JobError with Retryable set puts the job back in the queue, as a
+	// failed attempt that counts toward MaxAttempts; any other error ends
+	// the job, and Run.Wait returns it.
 	Prepare func(ctx context.Context, a Assignment) (inputs map[string]Download, outputs map[string]Upload, err error)
 	// Eligible is the service's policy for which machines may run the
 	// job, for example OwnedBy(room.OwnerID). It is required: machine
@@ -50,12 +58,13 @@ type Job struct {
 	Eligible func(Machine) bool
 	// Prefer optionally ranks the machines that bid for the job: the
 	// highest score wins, ties go to the earliest bid. Without it the
-	// earliest bid wins. When retrying, machines that already failed the
-	// job rank below all others. Like Eligible, it must be fast and must
-	// not call the Server.
+	// earliest bid wins. When retrying, machines that already failed or
+	// refused the job rank below all others. Like Eligible, it must be
+	// fast and must not call the Server.
 	Prefer func(Machine) int
-	// Timeout limits each attempt's running time on the machine. Zero
-	// means no limit.
+	// Timeout limits each attempt's running time on the machine,
+	// preparation and transfers included, rounded up to whole
+	// milliseconds. Zero means no limit.
 	Timeout time.Duration
 	// MaxAttempts overrides Config.MaxAttempts for this job when positive.
 	MaxAttempts int
@@ -69,13 +78,15 @@ type Assignment struct {
 }
 
 // A Download is where the runtime fetches an input from, with GET. URLs are
-// typically pre-signed; they must stay valid until the job runs.
+// typically pre-signed; they must stay valid until the job runs. Machines
+// take https URLs, and http ones only as Config.AllowInsecureHTTP says.
 type Download struct {
 	URL     string
 	Headers map[string]string
 }
 
-// An Upload is where the runtime sends an output to.
+// An Upload is where the runtime sends an output to, with the same rules
+// for URLs as a Download.
 type Upload struct {
 	URL string
 	// Method is "PUT" (the default when empty) or "POST".
@@ -93,11 +104,12 @@ const (
 	CodeNoResult      ErrorCode = "no_result"      // exited without a result
 	CodeOutputMissing ErrorCode = "output_missing" // the result named an undeclared or absent file
 	CodeTimeout       ErrorCode = "timeout"        // ran past Job.Timeout
-	CodeEnvironment   ErrorCode = "environment"    // uv couldn't create the environment
+	CodeEnvironment   ErrorCode = "environment"    // uv couldn't create the environment; retryable unless the machine can tell it's permanent
 	CodeAssetDownload ErrorCode = "asset_download" // an asset couldn't be downloaded
 	CodeAssetMismatch ErrorCode = "asset_mismatch" // an asset's hash didn't match the manifest
 	CodeInputDownload ErrorCode = "input_download" // an input couldn't be downloaded
 	CodeOutputUpload  ErrorCode = "output_upload"  // an output couldn't be uploaded
+	CodeRejected      ErrorCode = "rejected"       // the machine couldn't read the assignment; never started
 	CodeInterrupted   ErrorCode = "interrupted"    // stopped by the machine's owner, or the app quit
 	CodeBusy          ErrorCode = "busy"           // assigned while not idle; never started
 	CodeNotApproved   ErrorCode = "not_approved"   // bundle not approved or not stored; never started
@@ -106,19 +118,23 @@ const (
 	CodeLost          ErrorCode = "lost"           // the machine came back without the attempt, or was removed
 )
 
-// Retryable reports whether the spec says another attempt could succeed
-// after an error with this code. For CodeScriptError the script decides;
-// this reports false, the default when it doesn't say.
+// Retryable reports whether, by default, the spec says another attempt
+// could succeed after an error with this code. The machine has the last
+// word: the script decides for CodeScriptError (this reports false, the
+// default when it doesn't say), and a machine reports CodeEnvironment,
+// CodeInputDownload or CodeOutputUpload as final when it can tell the
+// failure is permanent. Codes from newer machines are retryable.
 func (c ErrorCode) Retryable() bool {
 	switch c {
-	case CodeScriptError, CodeExit, CodeNoResult, CodeOutputMissing, CodeTimeout, CodeEnvironment, CodeAssetMismatch:
+	case CodeScriptError, CodeExit, CodeNoResult, CodeOutputMissing, CodeTimeout, CodeAssetMismatch, CodeRejected:
 		return false
 	}
 	return true
 }
 
-// NeverStarted reports whether an attempt that failed with this code never
-// started, so it doesn't count toward a job's attempt limit (spec §7.2).
+// NeverStarted reports whether the machine refused the attempt before
+// starting it because it was busy or lacked the bundle (spec §7.2). Such
+// attempts don't count toward a job's attempt limit.
 func (c ErrorCode) NeverStarted() bool { return c == CodeBusy || c == CodeNotApproved }
 
 // A JobError is why an attempt failed. Run.Wait returns the last attempt's
@@ -150,12 +166,23 @@ var ErrCancelled = errors.New("moil: job cancelled")
 // was closed.
 var ErrClosed = errors.New("moil: server closed")
 
+// ErrBundleRemoved is returned by Run.Wait for a job whose bundle was
+// removed before it could run, or before it could be retried.
+var ErrBundleRemoved = errors.New("moil: the job's bundle was removed")
+
+// ErrTooMuchData is returned by Run.Wait for a job whose attempt sent more
+// data than Config.MaxDataBytes. The attempt is stopped and not retried:
+// another would send as much.
+var ErrTooMuchData = errors.New("moil: the job sent more data than the Server keeps")
+
 // A Result is what a succeeded job produced.
 type Result struct {
-	// Meta is the script's result metadata, untouched; nil if it sent
-	// none.
+	// Meta is the script's result metadata, nil if it sent none. It is
+	// the JSON value the script sent, not necessarily the same bytes:
+	// machines re-encode it (spec §2).
 	Meta json.RawMessage
-	// Files describes every uploaded output, by name.
+	// Files describes every uploaded output, by name. Only the job's
+	// declared outputs appear.
 	Files map[string]File
 	// Machine and Attempt say which attempt succeeded.
 	Machine string
@@ -191,15 +218,19 @@ type Event struct {
 	// zero for EventQueued.
 	Attempt int
 	Machine string
-	// Phase is "preparing", "downloading", "running" or "uploading".
+	// Phase is "preparing", "downloading", "running" or "uploading", or
+	// a phase from a newer machine, to be shown as it is.
 	Phase string
 	// Fraction is the progress from 0 to 1, when the script gave one.
 	Fraction *float64
 	// Message is the progress or log message.
 	Message string
-	// Level is the log level: "debug", "info", "warn" or "error".
+	// Level is the log level: "debug", "info", "warn" or "error", or a
+	// level from a newer machine, to be shown as it is.
 	Level string
-	// Data is the payload of EventData, untouched.
+	// Data is the payload of EventData: the JSON value the script sent,
+	// not necessarily the same bytes, since machines re-encode it (spec
+	// §2). Compare it as JSON.
 	Data json.RawMessage
 	// Err is why the attempt failed, for EventRetrying.
 	Err *JobError
@@ -217,124 +248,3 @@ const (
 	Failed    RunState = "failed"
 	Cancelled RunState = "cancelled"
 )
-
-// A Run is a submitted job. Its methods are safe to call from any
-// goroutine.
-//
-// Runs live in memory: when the service restarts, unfinished jobs are
-// lost, and machines abandon the attempts they were running for them. A
-// service that must finish a job resubmits it, by the same ID, on startup.
-type Run struct {
-	id     string
-	cancel func()
-
-	mu     sync.Mutex
-	state  RunState
-	events []Event
-	wake   chan struct{} // closed and replaced when something changes
-	done   chan struct{} // closed when the run ends
-	ended  bool
-	result *Result
-	err    error
-}
-
-func newRun(id string, cancel func()) *Run {
-	return &Run{id: id, cancel: cancel, state: Queued, wake: make(chan struct{}), done: make(chan struct{})}
-}
-
-// ID is the job's ID.
-func (r *Run) ID() string { return r.id }
-
-// State reports where the run is now.
-func (r *Run) State() RunState {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.state
-}
-
-// Events returns the run's events in order, from the first, then each new
-// one as it happens. The sequence ends after the run ends and every event
-// has been yielded, or when ctx is done. Each call starts from the first
-// event, and the Server never drops or waits for events: a slow reader only
-// delays itself.
-func (r *Run) Events(ctx context.Context) iter.Seq[Event] {
-	return func(yield func(Event) bool) {
-		next := 0
-		for {
-			r.mu.Lock()
-			// Events are only ever appended, so the elements of this
-			// slice never change after it's taken.
-			pending := r.events[next:]
-			ended := r.ended
-			wake := r.wake
-			r.mu.Unlock()
-			for _, ev := range pending {
-				if !yield(ev) {
-					return
-				}
-			}
-			next += len(pending)
-			if len(pending) > 0 {
-				continue
-			}
-			if ended {
-				return
-			}
-			select {
-			case <-wake:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-// Done is closed when the run ends.
-func (r *Run) Done() <-chan struct{} { return r.done }
-
-// Wait blocks until the run ends or ctx is done. A succeeded job returns
-// its Result. A failed one returns a *JobError, or the error from
-// Job.Prepare; a cancelled one ErrCancelled, and one the Server gave up on
-// when closing ErrClosed.
-func (r *Run) Wait(ctx context.Context) (*Result, error) {
-	select {
-	case <-r.done:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.result, r.err
-}
-
-// Cancel asks for the job to stop. A job that is waiting for a machine
-// ends at once; a running one ends when its machine confirms, or at once
-// if the machine is offline. If the attempt finishes before its machine
-// sees the request, the run ends with that attempt's outcome instead.
-// Cancelling an ended run does nothing.
-func (r *Run) Cancel() { r.cancel() }
-
-// The methods below are called by the scheduler.
-
-func (r *Run) emit(ev Event) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, ev)
-	close(r.wake)
-	r.wake = make(chan struct{})
-}
-
-func (r *Run) setState(s RunState) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state = s
-}
-
-func (r *Run) finish(s RunState, res *Result, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state, r.result, r.err, r.ended = s, res, err, true
-	close(r.wake)
-	r.wake = make(chan struct{})
-	close(r.done)
-}

@@ -34,26 +34,58 @@ type Config struct {
 	// PairingInterval is how often a pairing machine may poll for its
 	// token; machines polling faster are told to slow down. Default 2s.
 	PairingInterval time.Duration
-	// MaxPendingPairings bounds the pairings waiting for confirmation, so
-	// that anonymous requests can't exhaust memory. Default 1000.
+	// MaxPendingPairings bounds the pairings in progress, so that
+	// anonymous requests can't exhaust memory. When it's reached, a new
+	// pairing replaces the oldest one nobody confirmed. Default 10000.
+	// POST /v1/pair needs no credentials: also limit how often one client
+	// may call it, in front of the Handler.
 	MaxPendingPairings int
 
 	// BidWindow is how long machines have to answer an offer. The Server
 	// decides as soon as every offered machine answered. Default 2s.
 	BidWindow time.Duration
 	// LeaseTTL is how long an attempt may go without word from its
-	// machine before it fails with CodeLeaseExpired. Default 30s.
+	// machine before it fails with CodeLeaseExpired. Default 2 minutes.
+	// Keep it at least 90 seconds (spec §7.3): a machine takes up to 45
+	// seconds to notice a silently dead channel, and must reconnect
+	// before its lease runs out.
 	LeaseTTL time.Duration
-	// MaxAttempts is how many attempts a job may use, not counting ones
-	// that never started. Default 3.
+	// MaxAttempts is how many attempts a job may use. Default 3.
+	// Attempts a machine refused before starting them (it was busy or
+	// lacked the bundle, spec §7.2) don't count, but a job fails after 10
+	// of those, so that a machine that keeps bidding and then refusing
+	// can't hold it forever.
 	MaxAttempts int
 	// PingInterval is how often the Server pings each machine; a machine
 	// that doesn't answer before the next ping is disconnected. It also
-	// bounds how long a machine may take to say hello. Default 20s.
+	// bounds how long a machine may take to say hello. Default and
+	// maximum 20s: machines take a channel that stays silent for 45
+	// seconds for dead (spec §6.1).
 	PingInterval time.Duration
-	// KeepFinished is how long a finished job stays known, for Run and
-	// for idempotent Submit. Default 1 hour.
+	// KeepFinished is how long Server.Run finds a finished job. Default
+	// 1 hour.
 	KeepFinished time.Duration
+	// MaxDataBytes bounds the data events a Run keeps, so that a machine
+	// can't make the service hold unbounded memory: each counts its
+	// payload's size plus 256 bytes. An attempt that sends more is
+	// stopped, and its job fails with ErrTooMuchData. Default 16 MiB.
+	MaxDataBytes int
+
+	// AllowInsecureHTTP lets jobs use plain http input and output URLs on
+	// any host, for development against storage without TLS, such as a
+	// local MinIO. Machines refuse such URLs too unless their owners also
+	// allow insecure http in the machine's settings, so leave it off in
+	// production. Without it Submit accepts https URLs, and http URLs to
+	// loopback hosts, which machines accept only from a service they
+	// reach on loopback, as in local development (spec §3).
+	AllowInsecureHTTP bool
+}
+
+// urlPolicy is what Submit accepts for input and output URLs: what a
+// machine accepts from a service on loopback, since the SDK can't know
+// the base URL machines reach it at.
+func (c *Config) urlPolicy() wire.URLPolicy {
+	return wire.URLPolicy{LoopbackHTTP: true, AnyHTTP: c.AllowInsecureHTTP}
 }
 
 func (c *Config) setDefaults() error {
@@ -80,7 +112,7 @@ func (c *Config) setDefaults() error {
 		{&c.PairingTTL, 10 * time.Minute},
 		{&c.PairingInterval, 2 * time.Second},
 		{&c.BidWindow, 2 * time.Second},
-		{&c.LeaseTTL, 30 * time.Second},
+		{&c.LeaseTTL, 2 * time.Minute},
 		{&c.PingInterval, 20 * time.Second},
 		{&c.KeepFinished, time.Hour},
 	}
@@ -92,11 +124,17 @@ func (c *Config) setDefaults() error {
 			*d.d = d.def
 		}
 	}
+	if c.PingInterval > 20*time.Second {
+		return errors.New("moil: Config.PingInterval must be at most 20s; machines take a channel that stays silent for 45 seconds for dead")
+	}
 	if c.MaxPendingPairings <= 0 {
-		c.MaxPendingPairings = 1000
+		c.MaxPendingPairings = 10000
 	}
 	if c.MaxAttempts <= 0 {
 		c.MaxAttempts = 3
+	}
+	if c.MaxDataBytes <= 0 {
+		c.MaxDataBytes = 16 << 20
 	}
 	return nil
 }
@@ -128,8 +166,9 @@ type Server struct {
 	closing bool
 	conns   sync.WaitGroup
 
-	reports     *queue[func(context.Context)]
-	reportsDone chan struct{}
+	prepares sync.WaitGroup // Job.Prepare calls in flight
+
+	reports *reporter
 
 	closeOnce sync.Once
 }
@@ -140,20 +179,18 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:         cfg,
-		log:         cfg.Logger,
-		store:       cfg.Store,
-		pairings:    newPairings(),
-		cmds:        make(chan func(*scheduler)),
-		stop:        make(chan struct{}),
-		loopDone:    make(chan struct{}),
-		reports:     newQueue[func(context.Context)](),
-		reportsDone: make(chan struct{}),
+		cfg:      cfg,
+		log:      cfg.Logger,
+		store:    cfg.Store,
+		pairings: newPairings(),
+		cmds:     make(chan func(*scheduler)),
+		stop:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		reports:  newReporter(cfg.Store, cfg.Logger),
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
 	s.handler = s.routes()
 	go s.loop(newScheduler(s))
-	go s.writeReports()
 	return s, nil
 }
 
@@ -164,7 +201,9 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // Close disconnects every machine and ends every unfinished Run with
-// ErrClosed. It waits for the Server's goroutines to finish.
+// ErrClosed. It waits for the Server's goroutines to finish, Job.Prepare
+// calls included, and saves what machines last reported, giving the Store
+// up to five seconds.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.connMu.Lock()
@@ -175,11 +214,15 @@ func (s *Server) Close() error {
 		close(s.stop)
 		<-s.loopDone
 		s.conns.Wait()
-		s.reports.close()
-		<-s.reportsDone
+		s.prepares.Wait()
+		s.reports.close(closeGrace)
 	})
 	return nil
 }
+
+// closeGrace is how long Close waits for the Store to save what machines
+// last reported.
+const closeGrace = 5 * time.Second
 
 func (s *Server) loop(sc *scheduler) {
 	defer close(s.loopDone)
@@ -221,29 +264,9 @@ func (s *Server) call(f func(*scheduler)) error {
 	return nil
 }
 
-// saveReport persists what a machine reported, in the order the scheduler
-// saw the reports, without making the scheduler wait for the Store.
-func (s *Server) saveReport(id string, r MachineReport) {
-	s.reports.push(func(ctx context.Context) {
-		err := s.store.SaveReport(ctx, id, r)
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			s.log.Error("moil: saving a machine's report", "machine", id, "err", err)
-		}
-	})
-}
-
-func (s *Server) writeReports() {
-	defer close(s.reportsDone)
-	for {
-		write, ok := s.reports.pop(nil)
-		if !ok {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		write(ctx)
-		cancel()
-	}
-}
+// saveReport persists what a machine reported, without making the
+// scheduler wait for the Store.
+func (s *Server) saveReport(id string, r MachineReport) { s.reports.save(id, r) }
 
 // AddBundle makes bundles available for jobs. Connected machines are told
 // at once, so their owners can review them; machines connecting later
@@ -255,6 +278,24 @@ func (s *Server) AddBundle(bundles ...*Bundle) {
 		}
 	}
 	_ = s.call(func(sc *scheduler) { sc.addBundles(bundles) })
+}
+
+// RemoveBundle retires bundles, such as a version found to be vulnerable.
+// Connected machines are told at once, machines can no longer fetch them,
+// and no machine is offered their jobs any more: jobs waiting for a
+// machine fail with ErrBundleRemoved. An attempt already running finishes,
+// but isn't retried. Removing a bundle that isn't there does nothing.
+func (s *Server) RemoveBundle(bundles ...*Bundle) {
+	_ = s.call(func(sc *scheduler) { sc.removeBundles(bundles) })
+}
+
+// Reschedule offers the jobs waiting for a machine again to every machine
+// that could take them. The Server does so by itself whenever something it
+// sees changes, such as a machine connecting or approving a bundle; call
+// Reschedule after a change in the service that makes more machines
+// eligible (Job.Eligible), such as a user sharing a meeting with another.
+func (s *Server) Reschedule() {
+	_ = s.call(func(sc *scheduler) { sc.dirty = true })
 }
 
 // Bundles returns the bundles added so far, in the order they were added.
@@ -322,8 +363,11 @@ func (s *Server) RemoveMachine(ctx context.Context, id string) error {
 // limit, until a connected, idle, eligible machine that approved its bundle
 // bids for it.
 //
-// If a job with the same ID is already known, Submit returns its Run and
-// ignores job: the first submission's definition wins.
+// If a job with the same ID hasn't finished, Submit returns its Run and
+// ignores job: the first submission's definition wins, so a service can
+// resubmit what must run without doubling the work. Once a job has
+// finished, its ID runs again, as a new Run: that's how to retry a job
+// that failed or was cancelled.
 func (s *Server) Submit(ctx context.Context, job Job) (*Run, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -366,6 +410,9 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("moil: Job.Params: %w", err)
 	}
+	if err := wire.CheckValue(params); err != nil {
+		return nil, fmt.Errorf("moil: Job.Params %v; machines can't read it", err)
+	}
 	j := &jobState{
 		id:          job.ID,
 		bundle:      job.Bundle,
@@ -382,7 +429,7 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 	if j.maxAttempts <= 0 {
 		j.maxAttempts = s.cfg.MaxAttempts
 	}
-	if j.inputs, j.outputs, err = wireFiles(job.Inputs, job.Outputs); err != nil {
+	if j.inputs, j.outputs, err = wireFiles(s.cfg.urlPolicy(), job.Inputs, job.Outputs); err != nil {
 		return nil, err
 	}
 	if err := checkSize(j.assign(1, s.cfg.LeaseTTL, j.inputs, j.outputs)); err != nil {
@@ -393,17 +440,17 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 
 // wireFiles checks a job's inputs and outputs and converts them for
 // assign.
-func wireFiles(inputs map[string]Download, outputs map[string]Upload) (map[string]wire.Download, map[string]wire.Upload, error) {
+func wireFiles(policy wire.URLPolicy, inputs map[string]Download, outputs map[string]Upload) (map[string]wire.Download, map[string]wire.Upload, error) {
 	ins := make(map[string]wire.Download, len(inputs))
 	outs := make(map[string]wire.Upload, len(outputs))
 	for name, in := range inputs {
-		if err := checkFile("input", name, in.URL); err != nil {
+		if err := checkFile(policy, "input", name, in.URL); err != nil {
 			return nil, nil, err
 		}
 		ins[name] = wire.Download{URL: in.URL, Headers: in.Headers}
 	}
 	for name, out := range outputs {
-		if err := checkFile("output", name, out.URL); err != nil {
+		if err := checkFile(policy, "output", name, out.URL); err != nil {
 			return nil, nil, err
 		}
 		method := out.Method
@@ -419,13 +466,12 @@ func wireFiles(inputs map[string]Download, outputs map[string]Upload) (map[strin
 	return ins, outs, nil
 }
 
-func checkFile(kind, name, rawURL string) error {
+func checkFile(policy wire.URLPolicy, kind, name, rawURL string) error {
 	if !wire.IsFileName(name) {
 		return fmt.Errorf("moil: %s name %q must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", kind, name)
 	}
-	u, err := url.Parse(rawURL)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return fmt.Errorf("moil: %s %q needs an absolute http or https URL", kind, name)
+	if err := policy.Check(rawURL); err != nil {
+		return fmt.Errorf("moil: %s %q: machines would refuse it: the URL %w", kind, name, err)
 	}
 	return nil
 }
@@ -437,14 +483,15 @@ func checkSize(msg wire.Assign) error {
 	if err != nil {
 		return fmt.Errorf("moil: encoding the job: %w", err)
 	}
-	if len(data) > maxMessageBytes {
+	if len(data) > wire.MaxMessageBytes {
 		return fmt.Errorf("moil: the job's params, inputs and outputs take %d bytes; a control message is limited to 1 MiB", len(data))
 	}
 	return nil
 }
 
 // Run returns the job with the given ID, if the Server knows it: it's
-// unfinished, or finished less than Config.KeepFinished ago.
+// unfinished, or finished less than Config.KeepFinished ago. After a
+// resubmission, that's the latest Run.
 func (s *Server) Run(id string) (*Run, bool) {
 	var run *Run
 	_ = s.call(func(sc *scheduler) {
@@ -454,6 +501,3 @@ func (s *Server) Run(id string) (*Run, bool) {
 	})
 	return run, run != nil
 }
-
-// maxMessageBytes is the largest control message either side reads.
-const maxMessageBytes = 1 << 20

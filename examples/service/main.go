@@ -23,13 +23,17 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"git.convex.works/ConvexWorks/moil/sdk/go/moil"
@@ -52,13 +56,23 @@ func main() {
 		*public = "http://" + *addr
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(*addr, strings.TrimSuffix(*public, "/"), *data, bundleDirs, log); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ln, err := net.Listen("tcp", *addr)
+	if err == nil {
+		err = run(ctx, ln, strings.TrimSuffix(*public, "/"), *data, bundleDirs, log)
+	}
+	if err != nil {
 		log.Error(err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(addr, public, dataDir string, bundleDirs []string, log *slog.Logger) error {
+// run serves the demo on ln until ctx ends, then shuts down gracefully: it
+// closes the moil Server, which ends its runs so that pages following jobs
+// finish, and waits for the requests in flight.
+func run(ctx context.Context, ln net.Listener, public, dataDir string, bundleDirs []string, log *slog.Logger) error {
+	defer ln.Close()
 	store, err := moil.NewFileStore(filepath.Join(dataDir, "machines.json"))
 	if err != nil {
 		return err
@@ -72,6 +86,7 @@ func run(addr, public, dataDir string, bundleDirs []string, log *slog.Logger) er
 	if err != nil {
 		return err
 	}
+	defer srv.Close()
 	for _, dir := range bundleDirs {
 		b, err := moil.LoadBundle(os.DirFS(dir))
 		if err != nil {
@@ -80,19 +95,20 @@ func run(addr, public, dataDir string, bundleDirs []string, log *slog.Logger) er
 		srv.AddBundle(b)
 	}
 
-	httpServer := &http.Server{Addr: addr, Handler: newDemo(srv, public).routes(), ReadHeaderTimeout: 10 * time.Second}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	go func() {
-		<-ctx.Done()
-		srv.Close() // ends runs, so live job pages finish too
-		httpServer.Shutdown(context.Background())
-	}()
+	httpServer := &http.Server{Handler: newDemo(srv, public).routes(), ReadHeaderTimeout: 10 * time.Second}
+	served := make(chan error, 1)
+	go func() { served <- httpServer.Serve(ln) }()
 	log.Info("moil demo service ready", "open", public, "moil base URL", public+"/moil", "bundles", len(bundleDirs))
-	if err := httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+	select {
+	case err := <-served:
 		return err
+	case <-ctx.Done():
 	}
-	return nil
+	log.Info("moil demo service shutting down")
+	srv.Close()
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return httpServer.Shutdown(shutdown)
 }
 
 // demo is the service: the moil Server, plus the little a real service
@@ -111,10 +127,9 @@ type demo struct {
 // outputs, which the machine uploads to the service. Its URL holds a
 // random token, standing in for a pre-signed object-storage URL.
 type file struct {
-	name        string
-	data        []byte
-	contentType string
-	received    bool
+	name     string
+	data     []byte
+	received bool
 }
 
 type job struct {
@@ -135,15 +150,47 @@ func (d *demo) routes() http.Handler {
 	mux.Handle("/moil/", http.StripPrefix("/moil", d.srv.Handler()))
 	mux.HandleFunc("GET /{$}", d.home)
 	mux.HandleFunc("GET /pair", d.pairPage)
-	mux.HandleFunc("POST /pair", d.pair)
-	mux.HandleFunc("POST /machines/{id}/remove", d.removeMachine)
-	mux.HandleFunc("POST /jobs", d.submit)
+	mux.Handle("POST /pair", sameOrigin(d.pair))
+	mux.Handle("POST /machines/{id}/remove", sameOrigin(d.removeMachine))
+	mux.Handle("POST /jobs", sameOrigin(d.submit))
 	mux.HandleFunc("GET /jobs/{id}", d.jobPage)
 	mux.HandleFunc("GET /jobs/{id}/events", d.jobEvents)
 	mux.HandleFunc("GET /files/{token}", d.getFile)
 	mux.HandleFunc("PUT /files/{token}", d.putFile)
 	mux.HandleFunc("POST /files/{token}", d.putFile)
 	return mux
+}
+
+// sameOrigin refuses requests a browser sent from another site, so that
+// another site can't make a signed-in user confirm an attacker's machine
+// or submit jobs (cross-site request forgery). It goes by the headers
+// browsers set, as Go 1.25's http.CrossOriginProtection does; a request
+// without them doesn't come from a browser, or from one too old to send
+// them. A service with sessions can check a CSRF token instead, or too.
+func sameOrigin(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if crossOrigin(r) {
+			http.Error(w, "cross-origin request refused", http.StatusForbidden)
+			return
+		}
+		h(w, r)
+	})
+}
+
+func crossOrigin(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return false
+	case "":
+	default:
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	return err != nil || u.Host != r.Host
 }
 
 // Pages.
@@ -229,7 +276,7 @@ func (d *demo) submit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	input := d.addFile(&file{name: "text.txt", data: []byte(r.FormValue("text")), contentType: "text/plain; charset=utf-8"})
+	input := d.addFile(&file{name: "text.txt", data: []byte(r.FormValue("text"))})
 	j := &job{Title: r.FormValue("title"), Bundle: bundle, Created: time.Now(), Outputs: map[string]string{}}
 	outputs := map[string]moil.Upload{}
 	for _, name := range strings.FieldsFunc(r.FormValue("outputs"), func(c rune) bool { return c == ',' || c == ' ' }) {
@@ -353,27 +400,37 @@ func (d *demo) addFile(f *file) string {
 
 func (d *demo) fileURL(token string) string { return d.public + "/files/" + token }
 
+// getFile serves an input to a machine, or an output to the user. Whoever
+// ran the job chose the output's bytes, so it's served as a download, never
+// as a page of this site: served inline, an HTML output could run scripts
+// as the signed-in user.
 func (d *demo) getFile(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
+	var name string
+	var data []byte
 	f := d.files[r.PathValue("token")]
+	found := f != nil && (f.data != nil || f.received)
+	if found {
+		name, data = f.name, f.data
+	}
 	d.mu.Unlock()
-	if f == nil || (f.data == nil && !f.received) {
+	if !found {
 		http.NotFound(w, r)
 		return
 	}
-	if f.contentType != "" {
-		w.Header().Set("Content-Type", f.contentType)
-	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", f.name))
-	w.Write(f.data)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+	w.Write(data)
 }
 
 // putFile receives an output. The runtime sends the bytes as the body.
 func (d *demo) putFile(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	f := d.files[r.PathValue("token")]
+	isOutput := f != nil && f.name != "text.txt"
 	d.mu.Unlock()
-	if f == nil || f.name == "text.txt" {
+	if !isOutput {
 		http.NotFound(w, r)
 		return
 	}
@@ -383,7 +440,7 @@ func (d *demo) putFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.mu.Lock()
-	f.data, f.contentType, f.received = data, r.Header.Get("Content-Type"), true
+	f.data, f.received = data, true
 	d.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -73,6 +73,13 @@ func WithGPU(name string, memoryBytes int64) Option {
 // failing the test.
 func WithTimeout(d time.Duration) Option { return func(m *Machine) { m.timeout = d } }
 
+// WithInsecureHTTP makes the machine accept plain http input and output
+// URLs on any host, as a machine whose owner allowed insecure http in its
+// settings does. Use it with moil.Config.AllowInsecureHTTP. Without it
+// the machine accepts https, and http to loopback hosts only while the
+// service is on loopback, as it is in tests (spec §3).
+func WithInsecureHTTP() Option { return func(m *Machine) { m.insecureHTTP = true } }
+
 // At makes Pair reach the service at baseURL, such as the moil prefix of
 // the service's own router, instead of serving the Server's handler on a
 // new test server.
@@ -82,11 +89,12 @@ func At(baseURL string) Option {
 
 // A Machine is a fake moil machine paired with one service.
 type Machine struct {
-	t       testing.TB
-	baseURL string
-	client  *http.Client
-	timeout time.Duration
-	info    wire.MachineInfo
+	t            testing.TB
+	baseURL      string
+	client       *http.Client
+	timeout      time.Duration
+	info         wire.MachineInfo
+	insecureHTTP bool
 
 	mu         sync.Mutex
 	id, token  string
@@ -392,9 +400,11 @@ func (m *Machine) SetState(s moil.MachineState) {
 	m.reportStateLocked()
 }
 
-// RefuseNext makes the machine refuse its next n assignments with code,
+// RefuseNext makes the machine refuse its next n assignments with code:
 // moil.CodeBusy or moil.CodeNotApproved, as the app does when it became
-// busy or lost the bundle between bidding and being assigned.
+// busy or lost the bundle between bidding and being assigned, or
+// moil.CodeRejected, as it does with an assignment it can't read. The
+// refusal is retryable as code.Retryable says.
 func (m *Machine) RefuseNext(n int, code moil.ErrorCode) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -818,11 +828,17 @@ func (m *Machine) assign(msg wire.Assign) {
 	}
 	a := newAttempt(m, msg)
 	m.attempts[ref] = a
+	params, unreadable := reencode(msg.Params)
 	switch {
+	case unreadable != nil:
+		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
+			Code: string(moil.CodeRejected), Message: "params " + unreadable.Error(),
+		}})
+		return
 	case m.refuse > 0:
 		m.refuse--
 		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
-			Code: string(m.refuseCode), Message: "refused, as the test asked", Retryable: true,
+			Code: string(m.refuseCode), Message: "refused, as the test asked", Retryable: m.refuseCode.Retryable(),
 		}})
 		return
 	case m.effectiveState() != wire.StateIdle:
@@ -836,6 +852,7 @@ func (m *Machine) assign(msg wire.Assign) {
 		}})
 		return
 	}
+	a.Params = params
 	a.started = true
 	m.assigned = append(m.assigned, a)
 	m.reportStateLocked()

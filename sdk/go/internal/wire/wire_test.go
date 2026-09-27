@@ -27,6 +27,9 @@ type namedMessage struct {
 
 func loadMessageVectors(t *testing.T) messageVectors {
 	t.Helper()
+	if _, err := os.Stat(vectorsDir); err != nil {
+		t.Skipf("the shared test vectors aren't at %s (%v); run the SDK's tests from a checkout of the moil repository", vectorsDir, err)
+	}
 	data, err := os.ReadFile(filepath.Join(vectorsDir, "messages.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -139,6 +142,7 @@ func TestDecodeRejectsWhatThePeerMustNotSend(t *testing.T) {
 		{"seq zero", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 0, "event": {"v": 1, "type": "log", "message": "x"}}`},
 		{"fraction above one", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "progress", "fraction": 1.5}}`},
 		{"empty progress", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "progress"}}`},
+		{"phase without a phase", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "phase"}}`},
 		{"data without payload", `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": {"type": "data"}}`},
 		{"succeeded without result", `{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "succeeded"}`},
 		{"failed without error", `{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "failed"}`},
@@ -146,12 +150,48 @@ func TestDecodeRejectsWhatThePeerMustNotSend(t *testing.T) {
 		{"assign without params", `{"type": "assign", "job_id": "j", "attempt": 1, "bundle_hash": "` + hash + `", "inputs": {}, "outputs": {}, "lease_ms": 1}`},
 		{"assign with an unsafe output name", `{"type": "assign", "job_id": "j", "attempt": 1, "bundle_hash": "` + hash + `", "params": null, "inputs": {}, "outputs": {"../x": {"url": "https://e.com", "method": "PUT"}}, "lease_ms": 1}`},
 		{"attempt as a string", `{"type": "ack", "job_id": "j", "attempt": "1"}`},
+		// The limits of spec §10, and bounds on what a machine reports.
+		{"log message over 64 KiB", event(`{"type": "log", "message": "` + strings.Repeat("x", 64<<10+1) + `"}`)},
+		{"progress message over 64 KiB", event(`{"type": "progress", "message": "` + strings.Repeat("x", 64<<10+1) + `"}`)},
+		{"payload over 256 KiB", event(`{"type": "data", "payload": "` + strings.Repeat("x", 256<<10) + `"}`)},
+		{"payload nested 65 levels deep", event(`{"type": "data", "payload": ` + strings.Repeat("[", 65) + strings.Repeat("]", 65) + `}`)},
+		{"payload with a number beyond a double", event(`{"type": "data", "payload": {"n": 1e999}}`)},
+		{"meta over 256 KiB", `{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "succeeded", "result": {"files": {}, "meta": "` + strings.Repeat("x", 256<<10) + `"}}`},
+		{"stderr tail over 8 KiB", `{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "failed", "error": {"code": "exit", "message": "", "retryable": false, "stderr_tail": "` + strings.Repeat("x", 8<<10+1) + `"}}`},
+		{"machine name over 64 characters", hello(`{"name": "`+strings.Repeat("é", 65)+`", "os": "linux", "arch": "x86_64", "cpus": 1, "memory_bytes": 1, "gpus": []}`, `[]`)},
+		{"more GPUs than a service keeps", hello(`{"name": "m", "os": "linux", "arch": "x86_64", "cpus": 1, "memory_bytes": 1, "gpus": [`+strings.Repeat(`{"name": "g"},`, 64)+`{"name": "g"}]}`, `[]`)},
+		{"more approvals than a service keeps", `{"type": "approved", "hashes": [` + strings.Repeat(`"`+hash+`",`, 1024) + `"` + hash + `"]}`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if m, err := Decode([]byte(c.msg)); err == nil {
 				t.Fatalf("accepted %s as %#v", c.msg, m)
 			}
 		})
+	}
+}
+
+func event(e string) string {
+	return `{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": ` + e + `}`
+}
+
+func hello(machine, approved string) string {
+	return `{"type": "hello", "protocol": 1, "app_version": "0.1.0", "machine": ` + machine + `, "state": "idle", "approved": ` + approved + `, "attempts": []}`
+}
+
+// Messages at the limits of spec §10 are fine, and a payload's size is
+// what it takes without whitespace, as the machine measured it.
+func TestDecodeAcceptsWhatIsWithinTheLimits(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	for _, msg := range []string{
+		event(`{"type": "log", "message": "` + strings.Repeat("x", 64<<10) + `"}`),
+		event(`{"type": "data", "payload": "` + strings.Repeat("x", 256<<10-2) + `"}`),
+		event(`{"type": "data", "payload": [` + strings.Repeat(" ", 256<<10) + `1]}`),
+		event(`{"type": "data", "payload": ` + strings.Repeat("[", 64) + strings.Repeat("]", 64) + `}`),
+		hello(`{"name": "`+strings.Repeat("é", 64)+`", "os": "macos", "arch": "aarch64", "cpus": 12, "memory_bytes": 1, "gpus": [{"name": "Apple M3 Pro"}]}`, `["`+hash+`"]`),
+	} {
+		if _, err := Decode([]byte(msg)); err != nil {
+			t.Errorf("%.80s…: %v", msg, err)
+		}
 	}
 }
 
@@ -178,6 +218,12 @@ func TestDecodeToleratesAdditions(t *testing.T) {
 	}
 	if ev := m.(Event); ev.Event.Type != "metric" {
 		t.Fatalf("got %#v", ev)
+	}
+	// Phases and log levels are only shown, so newer ones pass.
+	for _, event := range []string{`{"type": "phase", "phase": "compiling"}`, `{"type": "log", "level": "trace", "message": "x"}`} {
+		if _, err := Decode([]byte(`{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": ` + event + `}`)); err != nil {
+			t.Errorf("%s: %v", event, err)
+		}
 	}
 }
 

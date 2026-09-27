@@ -1,7 +1,11 @@
 package moil_test
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -211,4 +215,86 @@ func TestPanickingPoliciesAreContained(t *testing.T) {
 	if bad.State() != moil.Queued {
 		t.Fatalf("the job with a panicking policy is %s", bad.State())
 	}
+}
+
+// A retired bundle stops at once: machines are told, can't fetch it, and
+// aren't offered its jobs; waiting jobs fail; running attempts finish but
+// aren't retried.
+func TestRemovingABundle(t *testing.T) {
+	srv := newServer(t)
+	retired := loadBundle(t, srv, "minimal")
+	current := loadBundle(t, srv, "crlf-unicode")
+	first := moiltest.Pair(t, srv, "alice")
+	second := moiltest.Pair(t, srv, "alice")
+	for _, m := range []*moiltest.Machine{first, second} {
+		m.Approve(retired, current)
+		m.Connect()
+	}
+	finishing := submit(t, srv, moil.Job{Bundle: retired, Eligible: moil.OwnedBy("alice")})
+	failing := submit(t, srv, moil.Job{Bundle: retired, Eligible: moil.OwnedBy("alice")})
+	a, b := first.NextAttempt(), second.NextAttempt()
+	if a.JobID == failing.ID() {
+		a, b = b, a
+	}
+	waiting := submit(t, srv, moil.Job{Bundle: retired, Eligible: moil.OwnedBy("alice")})
+
+	srv.RemoveBundle(retired)
+	if _, err := wait(t, waiting); !errors.Is(err, moil.ErrBundleRemoved) {
+		t.Errorf("a waiting job ended with %v, want ErrBundleRemoved", err)
+	}
+	first.Sync()
+	if got := first.Bundles(); len(got) != 1 || got[0].Hash != current.Hash() {
+		t.Errorf("machines are told of the bundles %+v", got)
+	}
+	status, _ := request(t, http.MethodGet, moiltest.Serve(t, srv)+"/v1/bundles/"+retired.Hash(), first.Token(), nil)
+	if status != http.StatusNotFound {
+		t.Errorf("fetching the retired bundle: %d", status)
+	}
+	if _, err := srv.Submit(context.Background(), moil.Job{Bundle: retired, Eligible: moil.AnyMachine}); err == nil {
+		t.Error("a job for the retired bundle was accepted")
+	}
+
+	a.Succeed(nil)
+	succeeded(t, finishing)
+	b.Fail(moil.CodeInterrupted, "the owner stopped it")
+	_, err := wait(t, failing)
+	var jerr *moil.JobError
+	if !errors.Is(err, moil.ErrBundleRemoved) || !errors.As(err, &jerr) || jerr.Code != moil.CodeInterrupted {
+		t.Errorf("a failed attempt of a retired bundle ended its job with %v, want its error and ErrBundleRemoved", err)
+	}
+
+	// The machines are free for the other bundle, and were never offered
+	// the retired one's waiting job.
+	next := submit(t, srv, moil.Job{Bundle: current, Eligible: func(m moil.Machine) bool { return m.ID == first.ID() }})
+	first.NextAttempt().Succeed(nil)
+	succeeded(t, next)
+	second.Sync()
+	for _, m := range []*moiltest.Machine{first, second} {
+		for _, o := range m.Offers() {
+			if o.JobID == waiting.ID() {
+				t.Errorf("%s was offered the retired bundle's waiting job", m.ID())
+			}
+		}
+	}
+}
+
+// The Server reschedules when something it sees changes; Reschedule is for
+// changes it can't see, such as a service's own sharing rules.
+func TestRescheduleAfterEligibilityChanges(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "bob")
+	m.Approve(bundle)
+	m.Connect()
+	var shared atomic.Bool
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: func(mc moil.Machine) bool { return mc.Owner == "alice" || shared.Load() }})
+	m.Sync()
+	shared.Store(true) // alice shares the meeting with bob
+	m.Sync()
+	if n := len(m.Offers()); n != 0 {
+		t.Fatalf("%d offers before Reschedule; the test can't tell whether it works", n)
+	}
+	srv.Reschedule()
+	m.NextAttempt().Succeed(nil)
+	succeeded(t, run)
 }

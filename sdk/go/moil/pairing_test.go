@@ -226,23 +226,83 @@ func TestPairingSlowDown(t *testing.T) {
 	}
 }
 
-// Anonymous pairing requests can't pile up without bound.
+// Anonymous pairing requests can't pile up without bound, nor lock
+// others out of pairing: a new pairing replaces the oldest one nobody
+// confirmed. A confirmed one waits for its machine.
 func TestPendingPairingsAreBounded(t *testing.T) {
 	srv := newServer(t, func(c *moil.Config) { c.MaxPendingPairings = 2 })
 	base := moiltest.Serve(t, srv)
-	startPairing(t, base)
-	_, second := startPairing(t, base)
-	status, resp := post(t, base+"/v1/pair", map[string]string{"name": "third", "os": "linux", "arch": "x86_64", "app_version": "0.1.0"})
-	if status != http.StatusServiceUnavailable || resp["error"] != "temporarily_unavailable" {
-		t.Fatalf("third pairing: %d %v", status, resp)
+	firstDevice, first := startPairing(t, base)
+	secondDevice, second := startPairing(t, base)
+	_, third := startPairing(t, base)
+	if _, ok := srv.PendingPairing(first); ok {
+		t.Error("the oldest pairing survived a third on a limit of two")
 	}
-	// Settling one doesn't free its slot until the machine collects it or
-	// it expires; denying does neither, so the bound still holds.
-	if err := srv.DenyPairing(second); err != nil {
+	if got := pollError(t, base, firstDevice); got != "expired_token" {
+		t.Errorf("the replaced pairing's machine was told %q", got)
+	}
+	if _, err := srv.ConfirmPairing(context.Background(), second, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	if status, _ := post(t, base+"/v1/pair", map[string]string{"name": "third"}); status != http.StatusServiceUnavailable {
-		t.Fatalf("after a denial: %d", status)
+	startPairing(t, base) // replaces the third, not the confirmed second
+	if _, ok := srv.PendingPairing(third); ok {
+		t.Error("an unconfirmed pairing survived while a confirmed one was replaced")
+	}
+	if status, resp := pollToken(t, base, secondDevice); status != http.StatusOK || resp["token"] == nil {
+		t.Errorf("the confirmed machine couldn't collect its token: %d %v", status, resp)
+	}
+
+	// With every slot confirmed, there's nothing to replace.
+	full := newServer(t, func(c *moil.Config) { c.MaxPendingPairings = 1 })
+	fullBase := moiltest.Serve(t, full)
+	_, code := startPairing(t, fullBase)
+	if _, err := full.ConfirmPairing(context.Background(), code, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	status, resp := post(t, fullBase+"/v1/pair", map[string]string{"name": "another", "os": "linux", "arch": "x86_64", "app_version": "0.1.0"})
+	if status != http.StatusServiceUnavailable || resp["error"] != "temporarily_unavailable" {
+		t.Fatalf("pairing with every slot confirmed: %d %v", status, resp)
+	}
+}
+
+// gatedStore holds AddMachine until released.
+type gatedStore struct {
+	moil.Store
+	release chan struct{}
+}
+
+func (s gatedStore) AddMachine(ctx context.Context, m moil.MachineRecord) error {
+	<-s.release
+	return s.Store.AddMachine(ctx, m)
+}
+
+// A pairing confirmed as its code expires still reaches its machine, so
+// the Store doesn't keep a machine nobody can connect as.
+func TestPairingConfirmedAsItExpires(t *testing.T) {
+	store := gatedStore{Store: moil.NewMemoryStore(), release: make(chan struct{})}
+	srv := newServer(t, func(c *moil.Config) { c.Store = store; c.PairingTTL = 100 * time.Millisecond })
+	base := moiltest.Serve(t, srv)
+	deviceCode, userCode := startPairing(t, base)
+	p, _ := srv.PendingPairing(userCode)
+	confirmed := make(chan error, 1)
+	go func() {
+		_, err := srv.ConfirmPairing(context.Background(), userCode, "alice")
+		confirmed <- err
+	}()
+	eventually(t, "the code to expire", func() bool { return time.Now().After(p.Expires) })
+	if got := pollError(t, base, deviceCode); got != "authorization_pending" {
+		t.Fatalf("while the Store saves the machine, its code is %q", got)
+	}
+	close(store.release)
+	if err := <-confirmed; err != nil {
+		t.Fatal(err)
+	}
+	status, resp := pollToken(t, base, deviceCode)
+	if status != http.StatusOK {
+		t.Fatalf("the confirmed machine polled after its code's expiry: %d %v", status, resp)
+	}
+	if _, err := srv.Machine(context.Background(), resp["machine_id"].(string)); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,9 +112,61 @@ func TestJobRunsEndToEnd(t *testing.T) {
 	a.WaitAcked()
 }
 
-// Submitting a job the Server knows returns the same Run, while it runs and
-// after it ended, so a service can resubmit by ID without doubling work.
-func TestSubmitIsIdempotentByID(t *testing.T) {
+// Params, data and meta travel as JSON values: machines re-encode them,
+// and moiltest does as they do. What a machine wouldn't forward never
+// reaches the service.
+func TestJSONTravelsAsValuesNotBytes(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Params: json.RawMessage(`{"b": 1.0, "a": [1e2, 3]}`)})
+	a := m.NextAttempt()
+	if string(a.Params) != `{"a":[100.0,3],"b":1.0}` {
+		t.Errorf("the script would read the params as %s", a.Params)
+	}
+	a.Data(json.RawMessage(`{"z": 1, "y": 2.50}`))
+	a.Data(strings.Repeat("x", 256<<10))
+	a.Succeed(map[string]any{"deep": json.RawMessage(strings.Repeat("[", 64) + strings.Repeat("]", 64))})
+	_, err := wait(t, run)
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != moil.CodeNoResult {
+		t.Errorf("a result with meta a machine refuses ended the job with %v, want %s", err, moil.CodeNoResult)
+	}
+	evs := events(t, run)
+	if len(evs) != 4 || string(evs[2].Data) != `{"y":2.5,"z":1}` || evs[3].Kind != moil.EventLog || evs[3].Level != "warn" {
+		t.Fatalf("events %+v", evs)
+	}
+}
+
+// Phases and log levels are only shown, so the ones a newer machine
+// sends reach the service as they are, rather than ending the channel.
+func TestNewerPhasesAndLogLevelsPassThrough(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	a := m.NextAttempt()
+	a.Phase("compiling")
+	a.Log("trace", "linking")
+	a.Succeed(nil)
+	succeeded(t, run)
+	evs := events(t, run)
+	if len(evs) != 4 || evs[2].Phase != "compiling" || evs[3].Level != "trace" || evs[3].Message != "linking" {
+		t.Fatalf("events %+v", evs)
+	}
+	if !m.Connected() {
+		t.Fatal("the service closed the channel")
+	}
+}
+
+// Submitting a job while one with its ID is unfinished returns the same
+// Run, so a service can resubmit by ID without doubling work. Once the job
+// has finished, the ID runs again, as a retry button would want.
+func TestResubmittingByID(t *testing.T) {
 	srv := newServer(t)
 	bundle := loadBundle(t, srv, "minimal")
 	job := moil.Job{ID: "meeting-7-summary", Bundle: bundle, Eligible: moil.AnyMachine}
@@ -131,18 +186,31 @@ func TestSubmitIsIdempotentByID(t *testing.T) {
 	if a.Title != "" {
 		t.Errorf("the second submission changed the job: title %q", a.Title)
 	}
-	a.Succeed(nil)
-	succeeded(t, first)
 	if again := submit(t, srv, job); again != first {
-		t.Fatal("resubmitting a finished job made a second run")
+		t.Fatal("resubmitting a running job made a second run")
 	}
-	other := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
-	if other == first || other.ID() == "" {
-		t.Fatal("a job without an ID must get a new one")
+	a.ScriptError("the recording is empty", false)
+	if _, err := wait(t, first); err == nil {
+		t.Fatal("the job succeeded")
 	}
-	m.Sync()
-	if n := len(m.Offers()); n != 2 {
-		t.Errorf("the machine got %d offers; resubmissions must not be offered again", n)
+
+	retry := submit(t, srv, job)
+	if retry == first || retry.ID() != first.ID() {
+		t.Fatal("resubmitting a finished job didn't run it again")
+	}
+	if got, _ := srv.Run(job.ID); got != retry {
+		t.Fatal("Run doesn't find the latest run")
+	}
+	b := m.NextAttempt()
+	if b.Title != "a different definition" || b.Number != 2 {
+		t.Errorf("the rerun is attempt %d titled %q; attempt numbers carry on, and the new definition counts", b.Number, b.Title)
+	}
+	b.Succeed(nil)
+	if res := succeeded(t, retry); res.Attempt != 2 {
+		t.Errorf("result from attempt %d", res.Attempt)
+	}
+	if _, err := wait(t, first); err == nil {
+		t.Error("the rerun changed how the first run ended")
 	}
 }
 
@@ -175,13 +243,20 @@ func TestSubmitRejectsJobsMachinesCouldNotRun(t *testing.T) {
 		{"bundle never added", func(j *moil.Job) { j.Bundle = other }, "AddBundle"},
 		{"bad job ID", func(j *moil.Job) { j.ID = "../etc" }, "job ID"},
 		{"unsafe input name", func(j *moil.Job) { j.Inputs = map[string]moil.Download{"../a": {URL: "https://e.com/a"}} }, "input name"},
-		{"relative output URL", func(j *moil.Job) { j.Outputs = map[string]moil.Upload{"a.txt": {URL: "/upload"}} }, "absolute"},
+		{"relative output URL", func(j *moil.Job) { j.Outputs = map[string]moil.Upload{"a.txt": {URL: "/upload"}} }, "has no host"},
+		{"plain http to storage", func(j *moil.Job) { j.Inputs = map[string]moil.Download{"a": {URL: "http://s3.example.com/a"}} }, "uses http to s3.example.com"},
+		{"a scheme machines don't speak", func(j *moil.Job) { j.Outputs = map[string]moil.Upload{"a": {URL: "ftp://example.com/a"}} }, "uses ftp"},
 		{"unsupported method", func(j *moil.Job) {
 			j.Outputs = map[string]moil.Upload{"a.txt": {URL: "https://e.com", Method: "PATCH"}}
 		}, "PUT or POST"},
 		{"long title", func(j *moil.Job) { j.Title = strings.Repeat("é", 201) }, "200 characters"},
 		{"params that aren't JSON", func(j *moil.Job) { j.Params = make(chan int) }, "Params"},
 		{"params over a control message", func(j *moil.Job) { j.Params = strings.Repeat("x", 1<<20) }, "1 MiB"},
+		{"params nested too deep", func(j *moil.Job) {
+			j.Params = map[string]any{"a": json.RawMessage(strings.Repeat("[", 64) + strings.Repeat("]", 64))}
+		}, "nested more than 64 levels deep"},
+		{"params with a number beyond a double", func(j *moil.Job) { j.Params = map[string]any{"n": new(big.Int).Lsh(big.NewInt(1), 1024)} }, "beyond the range of a double"},
+		{"negative timeout", func(j *moil.Job) { j.Timeout = -time.Second }, "Timeout"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			job := ok
@@ -194,6 +269,138 @@ func TestSubmitRejectsJobsMachinesCouldNotRun(t *testing.T) {
 	}
 	if _, err := srv.Submit(context.Background(), ok); err != nil {
 		t.Fatalf("the valid job was rejected: %v", err)
+	}
+	ok.Params = map[string]any{"a": json.RawMessage(strings.Repeat("[", 63) + strings.Repeat("]", 63)), "id": uint64(1<<64 - 1)}
+	if _, err := srv.Submit(context.Background(), ok); err != nil {
+		t.Fatalf("params 64 levels deep were rejected: %v", err)
+	}
+}
+
+// The lease defaults to two minutes, so that a machine can notice a dead
+// channel and reconnect in time, and a time limit under a millisecond
+// isn't sent as none.
+func TestLeasesAndTimeLimitsReachTheMachine(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.LeaseTTL = 0 })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	for _, c := range []struct{ timeout, sent time.Duration }{
+		{0, 0},
+		{500 * time.Microsecond, time.Millisecond},
+		{1500 * time.Microsecond, 2 * time.Millisecond},
+		{time.Hour, time.Hour},
+	} {
+		run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Timeout: c.timeout})
+		a := m.NextAttempt()
+		if a.Lease != 2*time.Minute || a.Timeout != c.sent {
+			t.Errorf("Timeout %v: the machine got a lease of %v and a time limit of %v, want 2m0s and %v", c.timeout, a.Lease, a.Timeout, c.sent)
+		}
+		a.Succeed(nil)
+		succeeded(t, run)
+	}
+}
+
+func TestConfigIsChecked(t *testing.T) {
+	valid := moil.Config{Name: "klisi", VerificationURL: "https://klisi.example.com/pair", Store: moil.NewMemoryStore()}
+	for _, c := range []struct {
+		name string
+		edit func(*moil.Config)
+		want string
+	}{
+		{"no name", func(c *moil.Config) { c.Name = "" }, "Name"},
+		{"relative verification URL", func(c *moil.Config) { c.VerificationURL = "/pair" }, "VerificationURL"},
+		{"no store", func(c *moil.Config) { c.Store = nil }, "Store"},
+		{"negative duration", func(c *moil.Config) { c.BidWindow = -time.Second }, "negative"},
+		{"pings too rare for machines", func(c *moil.Config) { c.PingInterval = 21 * time.Second }, "PingInterval"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := valid
+			c.edit(&cfg)
+			if srv, err := moil.NewServer(cfg); err == nil || !strings.Contains(err.Error(), c.want) {
+				if srv != nil {
+					srv.Close()
+				}
+				t.Fatalf("err = %v, want one mentioning %s", err, c.want)
+			}
+		})
+	}
+	valid.PingInterval = 20 * time.Second
+	srv, err := moil.NewServer(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Close()
+}
+
+// Submit accepts the URLs machines accept: https, and http to loopback
+// hosts, which machines accept from a service on loopback. Plain http
+// elsewhere needs the service's explicit opt-in, as it needs the machine
+// owner's.
+func TestSubmitAcceptsURLsMachinesAccept(t *testing.T) {
+	strict := newServer(t)
+	insecure := newServer(t, func(c *moil.Config) { c.AllowInsecureHTTP = true })
+	for _, srv := range []*moil.Server{strict, insecure} {
+		bundle := loadBundle(t, srv, "minimal")
+		for _, u := range []string{"https://s3.example.com/a?X-Amz-Signature=x", "http://127.0.0.1:9000/a", "http://localhost/a", "http://[::1]:9000/a"} {
+			if _, err := srv.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Inputs: map[string]moil.Download{"a": {URL: u}}}); err != nil {
+				t.Errorf("%s was refused: %v", u, err)
+			}
+		}
+	}
+	bundle := loadBundle(t, insecure, "minimal")
+	if _, err := insecure.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Outputs: map[string]moil.Upload{"a": {URL: "http://minio:9000/a"}}}); err != nil {
+		t.Errorf("AllowInsecureHTTP didn't allow http: %v", err)
+	}
+	if _, err := insecure.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Outputs: map[string]moil.Upload{"a": {URL: "file:///etc/passwd"}}}); err == nil {
+		t.Error("AllowInsecureHTTP allowed a file URL")
+	}
+}
+
+// moiltest's machines refuse what real machines refuse: http beyond
+// loopback, unless their owner allowed it, also after a redirect.
+func TestMoiltestHoldsTransfersToTheMachinesURLPolicy(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.AllowInsecureHTTP = true })
+	bundle := loadBundle(t, srv, "minimal")
+	storage := newFileServer(t, map[string][]byte{"/in": []byte("audio")})
+	// The same storage, at an address that isn't a loopback host by the
+	// spec's definition, though it leads to one.
+	elsewhere := strings.Replace(storage.URL, "127.0.0.1", "[::ffff:127.0.0.1]", 1) + "/in"
+	redirect := httptestServer(t, http.RedirectHandler(elsewhere, http.StatusFound))
+	job := moil.Job{Bundle: bundle, Eligible: moil.OwnedBy("alice"), Inputs: map[string]moil.Download{
+		"local.ogg":      {URL: storage.URL + "/in"},
+		"remote.ogg":     {URL: elsewhere},
+		"redirected.ogg": {URL: redirect + "/in"},
+	}}
+
+	tb := &failureRecorder{TB: t}
+	strict := moiltest.Pair(tb, srv, "alice")
+	strict.Approve(bundle)
+	strict.Connect()
+	run := submit(t, srv, job)
+	a := strict.NextAttempt()
+	if got := string(a.Input("local.ogg")); got != "audio" {
+		t.Fatalf("loopback input %q", got)
+	}
+	if msg := tb.failure(func() { a.Input("remote.ogg") }); !strings.Contains(msg, "uses http to ::ffff:127.0.0.1; only https is allowed") {
+		t.Errorf("fetching an http input beyond loopback: %q", msg)
+	}
+	if msg := tb.failure(func() { a.Input("redirected.ogg") }); !strings.Contains(msg, "redirects to "+elsewhere+", which uses http") {
+		t.Errorf("following a redirect to http beyond loopback: %q", msg)
+	}
+	a.Succeed(nil)
+	succeeded(t, run)
+	strict.Disconnect()
+
+	lenient := moiltest.Pair(t, srv, "alice", moiltest.WithInsecureHTTP())
+	lenient.Approve(bundle)
+	lenient.Connect()
+	submit(t, srv, job)
+	b := lenient.NextAttempt()
+	for _, name := range []string{"remote.ogg", "redirected.ogg"} {
+		if got := string(b.Input(name)); got != "audio" {
+			t.Errorf("%s: %q", name, got)
+		}
 	}
 }
 
@@ -340,10 +547,9 @@ func TestPrepareErrorsEndTheJob(t *testing.T) {
 	}
 }
 
-// While Prepare runs, the machine is held for the job; if the job is
-// cancelled, Prepare's context ends, and if the machine leaves, the job is
-// offered again.
-func TestPrepareIsInterruptible(t *testing.T) {
+// While Prepare runs, the machine is held for the job. If the job is
+// cancelled, Prepare's context ends.
+func TestPrepareHoldsTheMachine(t *testing.T) {
 	srv := newServer(t)
 	bundle := loadBundle(t, srv, "minimal")
 	m := moiltest.Pair(t, srv, "alice")
@@ -370,35 +576,145 @@ func TestPrepareIsInterruptible(t *testing.T) {
 	<-stopped
 	m.NextAttempt().Succeed(nil) // the machine is free again
 	succeeded(t, other)
+}
 
-	release := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
-	moved := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
-		if a.Machine.ID == m.ID() {
-			<-release
+// A machine that leaves, or is removed, while Prepare makes its attempt's
+// files lets go of the job at once: Prepare's context ends, and the job
+// goes to another machine.
+func TestPrepareEndsWhenItsMachineLeaves(t *testing.T) {
+	for _, leave := range []struct {
+		name string
+		do   func(*moil.Server, *moiltest.Machine) error
+	}{
+		{"disconnected", func(_ *moil.Server, m *moiltest.Machine) error { m.Disconnect(); return nil }},
+		{"removed", func(srv *moil.Server, m *moiltest.Machine) error {
+			return srv.RemoveMachine(context.Background(), m.ID())
+		}},
+	} {
+		t.Run(leave.name, func(t *testing.T) {
+			srv := newServer(t)
+			bundle := loadBundle(t, srv, "minimal")
+			first := moiltest.Pair(t, srv, "alice")
+			first.Approve(bundle)
+			first.Connect()
+			preparing, stopped := make(chan struct{}), make(chan error, 1)
+			run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+				if a.Machine.ID == first.ID() {
+					close(preparing)
+					<-ctx.Done() // held until the machine leaves
+					stopped <- ctx.Err()
+					return nil, nil, ctx.Err()
+				}
+				return nil, nil, nil
+			}})
+			<-preparing
+			if err := leave.do(srv, first); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-stopped:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Prepare's context ended with %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Prepare's context didn't end when its machine left")
+			}
+			second := moiltest.Pair(t, srv, "alice")
+			second.Approve(bundle)
+			second.Connect()
+			second.NextAttempt().Succeed(nil)
+			if res := succeeded(t, run); res.Machine != second.ID() || res.Attempt != 2 {
+				t.Fatalf("result from %s attempt %d", res.Machine, res.Attempt)
+			}
+		})
+	}
+}
+
+// Prepare can ask for another try, as when storage is briefly down; the
+// job goes back to the queue, and the tries count toward MaxAttempts.
+func TestPrepareCanRetry(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.MaxAttempts = 3 })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	unavailable := &moil.JobError{Code: "storage_unavailable", Message: "S3 is down", Retryable: true}
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		if a.Attempt == 1 {
+			return nil, nil, unavailable
 		}
 		return nil, nil, nil
 	}})
-	m.NextOffer()
-	m.NextOffer()
-	if o := m.NextOffer(); o.JobID != moved.ID() || o.Answer != moiltest.Bid {
-		t.Fatalf("offer %+v", o)
+	a := m.NextAttempt()
+	if a.Number != 2 {
+		t.Fatalf("attempt %d", a.Number)
 	}
-	m.Disconnect()
-	eventually(t, "the machine to go offline", func() bool { return !machine(t, srv, m.ID()).Online() })
-	close(release)
-	replacement := moiltest.Pair(t, srv, "alice")
-	replacement.Approve(bundle)
-	replacement.Connect()
-	a := replacement.NextAttempt()
 	a.Succeed(nil)
-	if res := succeeded(t, moved); res.Machine != replacement.ID() || res.Attempt != 2 {
-		t.Fatalf("result from %s attempt %d", res.Machine, res.Attempt)
+	succeeded(t, run)
+	var retried []moil.JobError
+	for _, ev := range events(t, run) {
+		if ev.Kind == moil.EventRetrying {
+			retried = append(retried, *ev.Err)
+		}
+	}
+	if len(retried) != 1 || retried[0].Code != "storage_unavailable" || retried[0].Attempt != 1 || retried[0].Machine != m.ID() {
+		t.Fatalf("retries %+v", retried)
+	}
+	if unavailable.Attempt != 0 {
+		t.Error("the Server changed Prepare's error")
+	}
+
+	always := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		return nil, nil, unavailable
+	}})
+	_, err := wait(t, always)
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != "storage_unavailable" || jerr.Attempt != 3 {
+		t.Fatalf("a Prepare that always asks to retry ended the job with %v, want its error on attempt 3", err)
+	}
+}
+
+// Close ends Prepare's context and waits for it to return.
+func TestCloseWaitsForPrepare(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	started := make(chan struct{})
+	var returned atomic.Bool
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		close(started)
+		<-ctx.Done()
+		time.Sleep(20 * time.Millisecond) // cleaning up, slowly
+		returned.Store(true)
+		return nil, nil, ctx.Err()
+	}})
+	<-started
+	srv.Close()
+	if !returned.Load() {
+		t.Fatal("Close returned before Prepare did")
+	}
+	if _, err := wait(t, run); !errors.Is(err, moil.ErrClosed) {
+		t.Fatalf("Wait = %v, want ErrClosed", err)
+	}
+}
+
+// A result only ever names the job's declared outputs, whatever a machine
+// reports.
+func TestResultsNameOnlyDeclaredOutputs(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Outputs: map[string]moil.Upload{"out.txt": {URL: "https://s3.example.com/out"}}})
+	a := m.NextAttempt()
+	file := map[string]any{"size_bytes": 5, "sha256": strings.Repeat("a", 64)}
+	m.Send(map[string]any{"type": "done", "job_id": a.JobID, "attempt": a.Number, "seq": 1, "outcome": "succeeded",
+		"result": map[string]any{"files": map[string]any{"out.txt": file, "passwords.txt": file}}})
+	res := succeeded(t, run)
+	if len(res.Files) != 1 || res.Files["out.txt"].SizeBytes != 5 {
+		t.Fatalf("result files %+v, want only out.txt", res.Files)
 	}
 }
