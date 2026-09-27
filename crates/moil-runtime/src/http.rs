@@ -1,50 +1,79 @@
 //! Moving files over HTTP: inputs, outputs and assets (spec §3, §7.4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use moil_proto::{FileInfo, Upload, UploadMethod};
+use moil_proto::{FileInfo, Upload, UploadMethod, UrlPolicy, UrlRefused};
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Body, Method, redirect};
+use reqwest::{Body, Certificate, Method, redirect};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
-use url::{Host, Url};
 
 /// How long to wait for a server to accept a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a transfer may go without receiving anything.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many redirects a download follows.
+const MAX_REDIRECTS: usize = 10;
 /// How much of an error response's body a failure message quotes.
 const QUOTED_BODY_BYTES: usize = 300;
 
-/// An HTTP client that trusts the platform's roots plus any extra ones, and
-/// only goes where the URL policy allows, redirects included.
-#[derive(Debug, Clone)]
+/// HTTP clients that trust the platform's roots plus any extra ones, and
+/// only go where a transfer's URL policy allows.
+#[derive(Debug)]
 pub(crate) struct Http {
-    client: reqwest::Client,
-    allow_insecure_http: bool,
+    roots: Vec<Certificate>,
+    /// A client per policy, since a client's redirect policy is fixed when
+    /// it's built: downloads follow redirects the policy allows.
+    downloads: Mutex<HashMap<UrlPolicy, reqwest::Client>>,
+    /// Uploads follow no redirects: an HTTP client turns an upload answered
+    /// with `303` (or a `POST` with `301` or `302`) into a `GET`, which could
+    /// succeed without uploading anything.
+    uploads: reqwest::Client,
 }
 
-/// Why a download failed.
+/// Why a transfer failed.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum DownloadError {
-    #[error("{0}")]
-    Failed(String),
+pub(crate) enum TransferError {
+    /// The URL policy refused the URL, or a redirect: trying again won't
+    /// help.
+    #[error("{}", refused_message(.redirected, .why))]
+    Refused { why: UrlRefused, redirected: bool },
+    /// More arrived than the transfer allows.
     #[error("it is larger than the expected {0} bytes")]
     TooLarge(u64),
+    /// Anything else, such as a server that is down.
+    #[error("{0}")]
+    Failed(String),
+}
+
+fn refused_message(redirected: &bool, why: &UrlRefused) -> String {
+    if *redirected {
+        format!("it was redirected to a URL that {why}")
+    } else {
+        format!("its URL {why}")
+    }
+}
+
+impl TransferError {
+    /// Whether another attempt could succeed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
 }
 
 impl Http {
-    /// A client trusting `extra_roots` (PEM text) on top of the platform's
-    /// roots. Fails if an entry holds no valid certificate.
-    pub fn new(extra_roots: &[String], allow_insecure_http: bool) -> Result<Self, String> {
+    /// Clients trusting `extra_roots` (PEM text) on top of the platform's
+    /// roots. Fails if an entry holds no valid certificate, or clients
+    /// can't be built.
+    pub fn new(extra_roots: &[String]) -> Result<Self, String> {
         let mut roots = Vec::new();
         for (i, pem) in extra_roots.iter().enumerate() {
-            let certificates = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+            let certificates = Certificate::from_pem_bundle(pem.as_bytes())
                 .map_err(|e| format!("extra root certificate {}: {}", i + 1, chain(&e)))?;
             if certificates.is_empty() {
                 return Err(format!(
@@ -54,53 +83,52 @@ impl Http {
             }
             roots.extend(certificates);
         }
+        let uploads = client(&roots, redirect::Policy::none())?;
+        Ok(Self {
+            roots,
+            downloads: Mutex::default(),
+            uploads,
+        })
+    }
+
+    /// The client for downloads under `policy`.
+    fn downloads(&self, policy: UrlPolicy) -> Result<reqwest::Client, TransferError> {
+        let mut clients = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(client) = clients.get(&policy) {
+            return Ok(client.clone());
+        }
         let redirects = redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 10 {
+            if attempt.previous().len() >= MAX_REDIRECTS {
                 attempt.error("too many redirects")
-            } else if let Err(why) = check_url(attempt.url().as_str(), allow_insecure_http) {
-                attempt.error(format!("redirected to a URL that {why}"))
+            } else if let Err(why) = policy.check(attempt.url()) {
+                attempt.error(why)
             } else {
                 attempt.follow()
             }
         });
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("moil/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .redirect(redirects)
-            .tls_certs_merge(roots)
-            .build()
-            .map_err(|e| chain(&e))?;
-        Ok(Self {
-            client,
-            allow_insecure_http,
-        })
+        let client = client(&self.roots, redirects).map_err(TransferError::Failed)?;
+        clients.insert(policy, client.clone());
+        Ok(client)
     }
 
-    /// Fails unless the policy allows `url` (see [`check_url`]).
-    pub fn check(&self, url: &str) -> Result<Url, String> {
-        check_url(url, self.allow_insecure_http)
-    }
-
-    /// Downloads `url` with `GET` into `file`, returning the size and
-    /// SHA-256 of what arrived. Gives up as soon as more than `max_bytes`
-    /// arrive.
+    /// Downloads `url` with `GET` into `file`, following redirects that
+    /// `policy` allows, and returns the size and SHA-256 of what arrived.
+    /// Gives up as soon as more than `max_bytes` arrive.
     pub async fn download(
         &self,
+        policy: UrlPolicy,
         url: &str,
         headers: &BTreeMap<String, String>,
         file: &mut tokio::fs::File,
         max_bytes: Option<u64>,
-    ) -> Result<FileInfo, DownloadError> {
-        let failed = DownloadError::Failed;
-        let url = self
-            .check(url)
-            .map_err(|why| failed(format!("its URL {why}")))?;
+    ) -> Result<FileInfo, TransferError> {
+        let failed = TransferError::Failed;
+        let url = check(policy, url)?;
         let request = self
-            .client
+            .downloads(policy)?
             .get(url)
             .headers(header_map(headers).map_err(failed)?);
-        let mut response = request.send().await.map_err(|e| failed(chain(&e)))?;
+        let mut response = request.send().await.map_err(sending_failed)?;
         let status = response.status();
         if !status.is_success() {
             return Err(failed(format!(
@@ -111,7 +139,7 @@ impl Http {
         if let (Some(max), Some(length)) = (max_bytes, response.content_length())
             && length > max
         {
-            return Err(DownloadError::TooLarge(max));
+            return Err(TransferError::TooLarge(max));
         }
         let mut hasher = Sha256::new();
         let mut size = 0u64;
@@ -120,7 +148,7 @@ impl Http {
             if let Some(max) = max_bytes
                 && size > max
             {
-                return Err(DownloadError::TooLarge(max));
+                return Err(TransferError::TooLarge(max));
             }
             hasher.update(&chunk);
             file.write_all(&chunk)
@@ -136,20 +164,25 @@ impl Http {
         })
     }
 
-    /// Uploads the file at `path` to `target`, streaming it with a
-    /// `Content-Length`. Any `2xx` answer is success. Returns the size and
-    /// SHA-256 of the bytes sent.
-    pub async fn upload(&self, target: &Upload, path: &Path) -> Result<FileInfo, String> {
-        let url = self
-            .check(&target.url)
-            .map_err(|why| format!("its URL {why}"))?;
+    /// Uploads the file at `path` to `target`, whose URL `policy` must
+    /// allow, streaming it with a `Content-Length`. Any `2xx` answer is
+    /// success; a redirect is not. Returns the size and SHA-256 of the bytes
+    /// sent.
+    pub async fn upload(
+        &self,
+        policy: UrlPolicy,
+        target: &Upload,
+        path: &Path,
+    ) -> Result<FileInfo, TransferError> {
+        let failed = TransferError::Failed;
+        let url = check(policy, &target.url)?;
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|e| format!("couldn't open it: {e}"))?;
+            .map_err(|e| failed(format!("couldn't open it: {e}")))?;
         let size = file
             .metadata()
             .await
-            .map_err(|e| format!("couldn't read it: {e}"))?
+            .map_err(|e| failed(format!("couldn't read it: {e}")))?
             .len();
         let sent = Arc::new(Mutex::new((Sha256::new(), 0u64)));
         let counter = sent.clone();
@@ -158,31 +191,33 @@ impl Http {
             sent.0.update(chunk);
             sent.1 += chunk.len() as u64;
         });
-        let mut headers = header_map(&target.headers)?;
+        let mut headers = header_map(&target.headers).map_err(failed)?;
         headers.insert(CONTENT_LENGTH, HeaderValue::from(size));
         let method = match target.method {
             UploadMethod::Put => Method::PUT,
             UploadMethod::Post => Method::POST,
         };
         let response = self
-            .client
+            .uploads
             .request(method, url)
             .headers(headers)
             .body(Body::wrap_stream(body))
             .send()
             .await
-            .map_err(|e| chain(&e))?;
+            .map_err(sending_failed)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!(
+            return Err(failed(format!(
                 "the server answered {status}{}",
                 quote_body(response).await
-            ));
+            )));
         }
         let (hasher, sent_bytes) =
             std::mem::take(&mut *sent.lock().unwrap_or_else(|e| e.into_inner()));
         if sent_bytes != size {
-            return Err("the file changed while it was being uploaded".into());
+            return Err(failed(
+                "the file changed while it was being uploaded".into(),
+            ));
         }
         Ok(FileInfo {
             size_bytes: size,
@@ -191,33 +226,40 @@ impl Http {
     }
 }
 
-/// Fails unless `url` may be used to move a job's files (spec §3): `https`,
-/// or `http` to a loopback host, or `http` anywhere if `allow_insecure_http`.
-/// The error completes the sentence "its URL …".
-pub(crate) fn check_url(url: &str, allow_insecure_http: bool) -> Result<Url, String> {
-    let parsed = Url::parse(url).map_err(|e| format!("isn't valid: {e}"))?;
-    match parsed.scheme() {
-        "https" if parsed.has_host() => Ok(parsed),
-        "http" if allow_insecure_http || is_loopback(&parsed) => Ok(parsed),
-        "http" => Err(format!(
-            "uses http to {}, which isn't this machine; only https is allowed",
-            parsed.host_str().unwrap_or("no host")
-        )),
-        scheme => Err(format!("uses {scheme}; only https is allowed")),
-    }
+/// A client trusting `roots` on top of the platform's, with `redirects`.
+fn client(roots: &[Certificate], redirects: redirect::Policy) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(concat!("moil/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .redirect(redirects)
+        .tls_certs_merge(roots.iter().cloned())
+        .build()
+        .map_err(|e| chain(&e))
 }
 
-/// `localhost`, `127.0.0.0/8` or `::1`.
-fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Domain(domain)) => {
-            let domain = domain.strip_suffix('.').unwrap_or(domain);
-            domain.eq_ignore_ascii_case("localhost")
+/// Parses `url` and fails unless `policy` allows it.
+fn check(policy: UrlPolicy, url: &str) -> Result<reqwest::Url, TransferError> {
+    policy.check_str(url).map_err(|why| TransferError::Refused {
+        why,
+        redirected: false,
+    })
+}
+
+/// Why sending a request failed: a redirect the policy refused, or
+/// whatever else went wrong.
+fn sending_failed(error: reqwest::Error) -> TransferError {
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if let Some(why) = cause.downcast_ref::<UrlRefused>() {
+            return TransferError::Refused {
+                why: why.clone(),
+                redirected: true,
+            };
         }
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
+        source = cause.source();
     }
+    TransferError::Failed(chain(&error))
 }
 
 fn header_map(headers: &BTreeMap<String, String>) -> Result<HeaderMap, String> {
@@ -277,43 +319,4 @@ fn chain(error: &reqwest::Error) -> String {
         message = error.to_string();
     }
     message
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn url_policy_allows_https_and_loopback_http_only() {
-        for allowed in [
-            "https://s3.example.com/bucket/key?X-Amz-Signature=abc",
-            "http://localhost:8080/in/a",
-            "http://LOCALHOST./a",
-            "http://127.0.0.1/a",
-            "http://127.200.3.4:9/a",
-            "http://[::1]:9/a",
-        ] {
-            assert!(
-                check_url(allowed, false).is_ok(),
-                "{allowed} should be allowed"
-            );
-        }
-        for refused in [
-            "http://example.com/a",
-            "http://0.0.0.0:9/a",
-            "http://10.0.0.1/a",
-            "http://localhost.example.com/a",
-            "http://[::ffff:127.0.0.1]/a",
-            "ftp://127.0.0.1/a",
-            "file:///etc/passwd",
-            "not a url",
-        ] {
-            assert!(
-                check_url(refused, false).is_err(),
-                "{refused} should be refused"
-            );
-        }
-        assert!(check_url("http://example.com/a", true).is_ok());
-        assert!(check_url("file:///etc/passwd", true).is_err());
-    }
 }

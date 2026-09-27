@@ -182,8 +182,9 @@ pub struct RuntimeConfig {
     /// [`RuntimeConfig::bundles`], so runtimes that share this directory
     /// must share the bundle store too.
     pub environments_dir: PathBuf,
-    /// Accept `http` URLs for inputs and outputs on any host, not just
-    /// loopback. For development only.
+    /// Accept `http` URLs on any host, for inputs, outputs and assets
+    /// alike, whatever a job's [`Job::url_policy`] says. For development
+    /// only.
     pub allow_insecure_http: bool,
     /// Keep working directories after attempts end, for debugging.
     pub keep_work_dirs: bool,
@@ -252,8 +253,7 @@ impl Runtime {
         if !uv::is_executable(&config.uv) {
             return Err(ConfigError::Uv(config.uv));
         }
-        let http = http::Http::new(&config.extra_root_certificates, config.allow_insecure_http)
-            .map_err(ConfigError::Https)?;
+        let http = http::Http::new(&config.extra_root_certificates).map_err(ConfigError::Https)?;
         Ok(Self {
             assets: assets::AssetCache::new(config.assets_dir.clone()),
             environments: environments::Environments::new(config.environments_dir.clone()),
@@ -293,6 +293,14 @@ impl Runtime {
         Ok(reaped)
     }
 
+    /// `policy`, widened to `http` anywhere if the owner allowed that.
+    pub(crate) fn url_policy(&self, policy: UrlPolicy) -> UrlPolicy {
+        UrlPolicy {
+            any_http: policy.any_http || self.config.allow_insecure_http,
+            ..policy
+        }
+    }
+
     /// How this runtime runs uv.
     pub fn uv(&self) -> Uv {
         Uv::new(&self.config.uv).with_env(self.config.extra_env.iter().cloned())
@@ -314,8 +322,12 @@ impl Runtime {
         })?;
         let manifest = bundle.manifest();
         let fetch_assets = async {
+            // Assets come from the approved manifest, over https.
+            let policy = self.url_policy(UrlPolicy::HTTPS_ONLY);
             for (name, asset) in &manifest.assets {
-                self.assets.fetch(&self.http, name, asset, events).await?;
+                self.assets
+                    .fetch(&self.http, policy, name, asset, events)
+                    .await?;
             }
             Ok(())
         };

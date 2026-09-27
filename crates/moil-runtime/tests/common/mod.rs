@@ -329,6 +329,8 @@ pub enum Reply {
     Status(u16),
     /// `302` to this URL.
     Redirect(String),
+    /// `303` to this URL.
+    SeeOther(String),
     /// `200` with this HTML page.
     Html(String),
     /// Never answers.
@@ -460,6 +462,9 @@ async fn handle(
         }
         Some(Reply::Redirect(to)) => {
             (StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
+        }
+        Some(Reply::SeeOther(to)) => {
+            (StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, to)]).into_response()
         }
         Some(Reply::Html(page)) => axum::response::Html(page).into_response(),
         Some(Reply::Hang) => std::future::pending().await,

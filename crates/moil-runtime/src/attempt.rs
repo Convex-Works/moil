@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use moil_proto::{
     ErrorCode, FileInfo, FileName, JobContext, JobError, JobEvent, JobResult, Outcome, Phase,
-    SCRIPT_CONTRACT_VERSION,
+    SCRIPT_CONTRACT_VERSION, UrlPolicy,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
@@ -22,7 +22,7 @@ use crate::process::Group;
 use crate::stderr::{self, Tail};
 use crate::stdout::{self, Report};
 use crate::workdir::WorkDir;
-use crate::{EventSink, Job, Runtime, StopSignal, http, uv};
+use crate::{EventSink, Job, Runtime, StopSignal, uv};
 
 /// How long to keep reading the script's output after its process group is
 /// gone. Only a process that left the group can hold it open longer.
@@ -138,24 +138,31 @@ impl Attempt<'_> {
         })
     }
 
+    /// Which URLs the job's inputs and outputs may use (spec §3).
+    fn url_policy(&self) -> UrlPolicy {
+        self.runtime.url_policy(self.job.url_policy)
+    }
+
     /// Refuses inputs and outputs the URL policy doesn't allow before any
-    /// work is done (spec §3).
+    /// work is done (spec §3). No other attempt would do better.
     fn check_urls(&self) -> Result<(), JobError> {
-        let allow = self.runtime.config.allow_insecure_http;
+        let policy = self.url_policy();
         for (name, input) in &self.job.inputs {
-            http::check_url(&input.url, allow).map_err(|why| {
+            policy.check_str(&input.url).map_err(|why| {
                 JobError::new(
                     ErrorCode::InputDownload,
                     format!("input {name} can't be downloaded: its URL {why}"),
                 )
+                .retryable(false)
             })?;
         }
         for (name, output) in &self.job.outputs {
-            http::check_url(&output.url, allow).map_err(|why| {
+            policy.check_str(&output.url).map_err(|why| {
                 JobError::new(
                     ErrorCode::OutputUpload,
                     format!("output {name} can't be uploaded: its URL {why}"),
                 )
+                .retryable(false)
             })?;
         }
         Ok(())
@@ -165,7 +172,6 @@ impl Attempt<'_> {
         &self,
         work: &WorkDir,
     ) -> Result<BTreeMap<FileName, PathBuf>, JobError> {
-        let http = &self.runtime.http;
         let mut paths = BTreeMap::new();
         for (name, source) in &self.job.inputs {
             let failed = |why: String| {
@@ -178,9 +184,17 @@ impl Attempt<'_> {
             let mut file = tokio::fs::File::create(&path)
                 .await
                 .map_err(|e| failed(format!("couldn't create {}: {e}", path.display())))?;
-            http.download(&source.url, &source.headers, &mut file, None)
+            self.runtime
+                .http
+                .download(
+                    self.url_policy(),
+                    &source.url,
+                    &source.headers,
+                    &mut file,
+                    None,
+                )
                 .await
-                .map_err(|e| failed(e.to_string()))?;
+                .map_err(|e| failed(e.to_string()).retryable(e.is_retryable()))?;
             paths.insert(name.clone(), path);
         }
         Ok(paths)
@@ -260,18 +274,21 @@ impl Attempt<'_> {
         work: &WorkDir,
         files: &[FileName],
     ) -> Result<BTreeMap<FileName, FileInfo>, JobError> {
-        let http = &self.runtime.http;
         let mut uploaded = BTreeMap::new();
         for name in files {
             let target = &self.job.outputs[name];
-            let info = http
-                .upload(target, &work.outputs().join(name.as_str()))
+            let path = work.outputs().join(name.as_str());
+            let info = self
+                .runtime
+                .http
+                .upload(self.url_policy(), target, &path)
                 .await
-                .map_err(|why| {
+                .map_err(|e| {
                     JobError::new(
                         ErrorCode::OutputUpload,
-                        format!("couldn't upload {name}: {why}"),
+                        format!("couldn't upload {name}: {e}"),
                     )
+                    .retryable(e.is_retryable())
                 })?;
             uploaded.insert(name.clone(), info);
         }

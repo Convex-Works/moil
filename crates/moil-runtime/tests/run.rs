@@ -5,7 +5,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use moil_proto::{ErrorCode, FileInfo, JobEvent, LogLevel, Outcome, Phase, UploadMethod};
+use moil_proto::{
+    ErrorCode, FileInfo, JobEvent, LogLevel, Outcome, Phase, UploadMethod, UrlPolicy,
+};
 use moil_runtime::{Executor, StopReason};
 use serde_json::json;
 
@@ -818,6 +820,7 @@ mod transfers {
         );
         let run = h.run(job).await;
         assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(!run.error().retryable, "no other attempt would do better");
         assert!(
             run.error().message.contains("only https is allowed"),
             "{}",
@@ -831,6 +834,7 @@ mod transfers {
         job.outputs.insert(name, upload);
         let run = h.run(job).await;
         assert_eq!(run.error().code, ErrorCode::OutputUpload);
+        assert!(!run.error().retryable);
         assert!(run.phases().is_empty(), "the script didn't run");
 
         assert!(h.server.received("/in/a.txt").is_empty());
@@ -900,11 +904,102 @@ mod transfers {
         );
         let run = h.run(job).await;
         assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(!run.error().retryable);
         assert!(
             run.error().message.contains("redirected"),
             "{}",
             run.error().message
         );
         assert_eq!(h.server.received("/in/real.txt").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_remote_services_job_cant_reach_this_machine_over_http() {
+        // A service that isn't on loopback aims a job's transfers at a
+        // service that listens only on the owner's machine.
+        let h = Harness::new().await;
+        let policy =
+            UrlPolicy::for_service(&"https://klisi.example.com/moil".parse().unwrap(), false);
+        h.server.serve("/local/secret", "the owner's");
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.url_policy = policy;
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/local/secret"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .contains("on this machine, for a service that isn't"),
+            "{}",
+            error.message
+        );
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.url_policy = policy;
+        let (name, mut upload) = output(&h.server, "b.txt");
+        upload.url = h.server.url("/local/admin");
+        job.outputs.insert(name, upload);
+        let error = h.run(job).await.error().clone();
+        assert_eq!(error.code, ErrorCode::OutputUpload);
+        assert!(!error.retryable);
+
+        // Nor through a redirect from a URL it may use.
+        h.server
+            .reply("/in/a.txt", Reply::Redirect(h.server.url("/local/secret")));
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.url_policy = policy;
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.https_url("/in/a.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .contains("redirected to a URL that uses http to 127.0.0.1, on this machine"),
+            "{}",
+            error.message
+        );
+        assert_eq!(h.server.received("/in/a.txt").len(), 1);
+        assert!(h.server.received("/local/secret").is_empty());
+        assert!(h.server.received("/local/admin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upload_answered_with_a_redirect_fails() {
+        // Following it would turn the upload into a GET, which could
+        // succeed without uploading anything.
+        let h = Harness::new().await;
+        h.server.serve("/elsewhere", "fine");
+        h.server
+            .reply("/out/a.txt", Reply::SeeOther(h.server.url("/elsewhere")));
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"write": "a.txt", "text": "alpha"},
+                {"emit": {"type": "result", "files": ["a.txt"]}},
+            ])),
+        );
+        job.outputs.extend([output(&h.server, "a.txt")]);
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::OutputUpload);
+        assert!(error.message.contains("303"), "{}", error.message);
+        assert!(h.server.received("/elsewhere").is_empty());
     }
 }

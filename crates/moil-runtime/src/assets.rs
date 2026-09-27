@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use moil_bundle::Asset;
-use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel};
+use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel, UrlPolicy};
 
 use crate::EventSink;
-use crate::http::{DownloadError, Http};
+use crate::http::{Http, TransferError};
 use crate::locks::KeyedLocks;
 
 /// How the names of files still being downloaded start.
@@ -43,10 +43,12 @@ impl AssetCache {
     }
 
     /// Makes sure asset `name` is in the cache, downloading and verifying
-    /// it if it isn't. Logs to `events`, if given, when it downloads.
+    /// it if it isn't, from where `policy` allows. Logs to `events`, if
+    /// given, when it downloads.
     pub async fn fetch(
         &self,
         http: &Http,
+        policy: UrlPolicy,
         name: &str,
         asset: &Asset,
         events: Option<&EventSink>,
@@ -65,12 +67,13 @@ impl AssetCache {
                 format!("downloading asset {name}"),
             ));
         }
-        self.download(http, name, asset, &path).await
+        self.download(http, policy, name, asset, &path).await
     }
 
     async fn download(
         &self,
         http: &Http,
+        policy: UrlPolicy,
         name: &str,
         asset: &Asset,
         path: &Path,
@@ -104,13 +107,19 @@ impl AssetCache {
         let (file, partial) = partial.into_parts();
         let mut file = tokio::fs::File::from_std(file);
         let got = http
-            .download(&asset.url, &BTreeMap::new(), &mut file, asset.size_bytes)
+            .download(
+                policy,
+                &asset.url,
+                &BTreeMap::new(),
+                &mut file,
+                asset.size_bytes,
+            )
             .await
             .map_err(|e| match e {
-                DownloadError::TooLarge(expected) => mismatch(format!(
+                TransferError::TooLarge(expected) => mismatch(format!(
                     "it is larger than the {expected} bytes the manifest says"
                 )),
-                DownloadError::Failed(why) => failed(why),
+                other => failed(other.to_string()),
             })?;
         if let Some(expected) = asset.size_bytes
             && got.size_bytes != expected
