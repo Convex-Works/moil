@@ -11,7 +11,8 @@
 //     report their state, hardware and the bundles their owners approved
 //     (Machines, Machine, RemoveMachine).
 //   - Bundles. The service publishes the code machines may run
-//     (LoadBundle, AddBundle); owners review and approve each by hash.
+//     (LoadBundle, AddBundle, RemoveBundle); owners review and approve
+//     each by hash.
 //   - Jobs. Submit offers a job to every connected, idle machine that
 //     approved its bundle and that the service's policy allows (Job.Eligible),
 //     assigns it to the best bidder (Job.Prefer), and follows the attempt:

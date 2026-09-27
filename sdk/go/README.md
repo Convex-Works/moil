@@ -121,6 +121,10 @@ source, should your service want to show it as the app does.
 
 A new version of a bundle has a new hash and needs a new approval, so
 keep publishing the old version until owners have approved the new one.
+`srv.RemoveBundle(old)` then retires it, or retires at once a version
+found to be vulnerable: machines are offered none of its jobs any more,
+an attempt already running finishes without being retried, and jobs
+waiting for a machine fail with `moil.ErrBundleRemoved`.
 
 ## Submit jobs
 
@@ -152,7 +156,9 @@ res, err := run.Wait(ctx)
   inputs, so say whose machines may take it: `moil.OwnedBy(owner)`, your
   own `func(moil.Machine) bool`, or `moil.AnyMachine` when anyone may.
   Policies run on the scheduler: keep them fast and don't call the Server
-  from them.
+  from them. The Server asks them again whenever machines change; when
+  your own data changes what they answer, as when a user shares a
+  meeting, call `srv.Reschedule()`.
 - **Jobs wait** without a time limit until an eligible, connected, idle
   machine that approved the bundle bids. Among bidders, `Prefer` ranks
   (highest score wins, ties to the earliest bid); retries rank machines that

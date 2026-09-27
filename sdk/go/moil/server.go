@@ -280,6 +280,24 @@ func (s *Server) AddBundle(bundles ...*Bundle) {
 	_ = s.call(func(sc *scheduler) { sc.addBundles(bundles) })
 }
 
+// RemoveBundle retires bundles, such as a version found to be vulnerable.
+// Connected machines are told at once, machines can no longer fetch them,
+// and no machine is offered their jobs any more: jobs waiting for a
+// machine fail with ErrBundleRemoved. An attempt already running finishes,
+// but isn't retried. Removing a bundle that isn't there does nothing.
+func (s *Server) RemoveBundle(bundles ...*Bundle) {
+	_ = s.call(func(sc *scheduler) { sc.removeBundles(bundles) })
+}
+
+// Reschedule offers the jobs waiting for a machine again to every machine
+// that could take them. The Server does so by itself whenever something it
+// sees changes, such as a machine connecting or approving a bundle; call
+// Reschedule after a change in the service that makes more machines
+// eligible (Job.Eligible), such as a user sharing a meeting with another.
+func (s *Server) Reschedule() {
+	_ = s.call(func(sc *scheduler) { sc.dirty = true })
+}
+
 // Bundles returns the bundles added so far, in the order they were added.
 func (s *Server) Bundles() []*Bundle {
 	var out []*Bundle

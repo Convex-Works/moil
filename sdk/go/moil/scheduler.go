@@ -163,6 +163,31 @@ func (sc *scheduler) addBundles(bundles []*Bundle) {
 	}
 }
 
+func (sc *scheduler) removeBundles(bundles []*Bundle) {
+	removed := false
+	for _, b := range bundles {
+		if b == nil || sc.bundleByHash[b.Hash()] == nil {
+			continue
+		}
+		delete(sc.bundleByHash, b.Hash())
+		sc.bundles = slices.DeleteFunc(sc.bundles, func(x *Bundle) bool { return x.Hash() == b.Hash() })
+		removed = true
+		sc.log.Info("moil: bundle removed", "bundle", b.String())
+	}
+	if !removed {
+		return
+	}
+	msg := wire.Bundles{Bundles: sc.bundleInfos()}
+	for _, lm := range sc.machines {
+		lm.sess.send(msg)
+	}
+	for _, j := range slices.Clone(sc.queue) {
+		if j.cur == nil && sc.bundleByHash[j.bundle.Hash()] == nil {
+			sc.finish(j, Failed, nil, fmt.Errorf("%w: %s", ErrBundleRemoved, j.bundle))
+		}
+	}
+}
+
 func (sc *scheduler) bundleInfos() []wire.BundleInfo {
 	infos := make([]wire.BundleInfo, len(sc.bundles))
 	for i, b := range sc.bundles {
@@ -751,6 +776,10 @@ func (sc *scheduler) retry(j *jobState, e *JobError) {
 	}
 	if !e.Retryable || j.counted >= j.maxAttempts || j.refused >= maxRefusals {
 		sc.finish(j, Failed, nil, e)
+		return
+	}
+	if sc.bundleByHash[j.bundle.Hash()] == nil {
+		sc.finish(j, Failed, nil, fmt.Errorf("%w; it isn't retried: %w", e, ErrBundleRemoved))
 		return
 	}
 	j.phase = phaseQueued

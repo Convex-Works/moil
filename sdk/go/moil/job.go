@@ -164,6 +164,10 @@ var ErrCancelled = errors.New("moil: job cancelled")
 // was closed.
 var ErrClosed = errors.New("moil: server closed")
 
+// ErrBundleRemoved is returned by Run.Wait for a job whose bundle was
+// removed before it could run, or before it could be retried.
+var ErrBundleRemoved = errors.New("moil: the job's bundle was removed")
+
 // ErrTooMuchData is returned by Run.Wait for a job whose attempt sent more
 // data than Config.MaxDataBytes. The attempt is stopped and not retried:
 // another would send as much.
