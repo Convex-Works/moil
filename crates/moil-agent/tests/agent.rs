@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use moil_agent::{
-    Agent, AgentHandle, AgentOptions, Connection, Home, JobOutcome, JobReport, Machine,
+    Agent, AgentHandle, AgentOptions, Approval, Connection, Home, JobOutcome, JobReport, Machine,
     MachineConfig, PairedService, Settings,
 };
 use moil_bundle::Bundle;
@@ -217,6 +217,39 @@ async fn hello_describes_the_machine_and_what_it_approved_for_that_service() {
     let hello = notes.accept().await.hello().await;
     assert_eq!(hello.approved, [], "approvals are per service");
     assert_eq!(hello.state, MachineState::Paused);
+}
+
+#[tokio::test]
+async fn a_service_is_told_of_its_1024_most_recent_approvals_at_most() {
+    let mut approved = Vec::new();
+    let setup = Setup::build(&["klisi"], fast(), |machine, services| {
+        // Approved one after another, after the setup's own.
+        let mut paired = services[0].1.clone();
+        for i in 0..1029 {
+            let hash = bundle("transcribe", &format!("1.0.{i}"), "print('hi')").hash();
+            paired.approvals.push(Approval {
+                hash,
+                name: "transcribe".into(),
+                version: format!("1.0.{i}"),
+                approved_at: std::time::SystemTime::now(),
+            });
+        }
+        let all: Vec<_> = paired.approvals.iter().map(|a| a.hash).collect();
+        approved = all[all.len() - 1024..].to_vec();
+        let file = machine
+            .home()
+            .services_dir()
+            .join(format!("{}.json", paired.id));
+        std::fs::write(file, serde_json::to_vec(&paired).unwrap()).unwrap();
+    })
+    .await;
+    let hello = setup.service().accept().await.hello().await;
+    assert_eq!(hello.approved.len(), 1024);
+    assert_eq!(hello.approved, approved, "the newest, oldest first");
+    assert!(
+        !hello.approved.contains(&setup.hash()),
+        "the oldest approvals aren't announced"
+    );
 }
 
 #[tokio::test]

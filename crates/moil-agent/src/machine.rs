@@ -105,6 +105,15 @@ struct Credentials {
     token: String,
 }
 
+/// The most GPUs `hello` lists (spec §10).
+const MAX_GPUS: usize = 64;
+
+/// `text`, cut to the 64 characters services accept for the machine's
+/// name, OS, architecture and app version (spec §10).
+fn bounded(text: &str) -> String {
+    text.chars().take(64).collect()
+}
+
 /// How long unpairing waits for the service before forgetting it anyway.
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -128,6 +137,7 @@ impl Machine {
             secrets,
             app_version,
         } = config;
+        let app_version = bounded(&app_version);
         let settings = home.load_settings()?;
         let token_scope = match home.root().canonicalize() {
             Ok(root) => root.display().to_string(),
@@ -195,16 +205,17 @@ impl Machine {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The machine as `hello` describes it: its name and hardware.
+    /// The machine as `hello` describes it: its name and hardware, within
+    /// what services accept (spec §10).
     pub fn info(&self) -> MachineInfo {
         let hardware = self.inner.hardware.get_or_init(Hardware::detect);
         MachineInfo {
             name: self.name(),
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
+            os: bounded(std::env::consts::OS),
+            arch: bounded(std::env::consts::ARCH),
             cpus: hardware.cpus,
             memory_bytes: hardware.memory_bytes,
-            gpus: hardware.gpus.clone(),
+            gpus: hardware.gpus.iter().take(MAX_GPUS).cloned().collect(),
         }
     }
 
@@ -219,7 +230,7 @@ impl Machine {
                 let hardware = self.inner.hardware.get_or_init(Hardware::detect);
                 hardware.computer_name.clone()
             });
-        name.trim().chars().take(64).collect()
+        bounded(name.trim())
     }
 
     /// Every paired service, by ID.
@@ -649,5 +660,38 @@ impl Machine {
                 .map_err(|e| with_path(e, &store.dir(hash)))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemorySecrets;
+
+    #[test]
+    fn hello_stays_within_what_services_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Machine::open(MachineConfig {
+            home: Home::new(dir.path()),
+            secrets: Arc::new(MemorySecrets::default()),
+            app_version: format!("0.1.0+{}", "build".repeat(20)),
+        })
+        .unwrap();
+        let gpu = |i| moil_proto::Gpu {
+            name: format!("GPU {i}"),
+            memory_bytes: None,
+        };
+        let hardware = Hardware {
+            computer_name: format!("  Ada's {}  ", "very ".repeat(20)),
+            cpus: 256,
+            memory_bytes: 1 << 40,
+            gpus: (0..100).map(gpu).collect(),
+        };
+        machine.inner.hardware.set(hardware).unwrap();
+
+        let info = machine.info();
+        assert_eq!(info.name, format!("Ada's {}", "very ".repeat(20))[..64]);
+        assert_eq!(info.gpus, (0..64).map(gpu).collect::<Vec<_>>());
+        assert_eq!(machine.app_version().chars().count(), 64);
     }
 }

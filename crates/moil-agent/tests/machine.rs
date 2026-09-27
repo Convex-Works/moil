@@ -236,6 +236,19 @@ async fn pairing_stores_the_service_and_its_token() {
 }
 
 #[tokio::test]
+async fn a_service_learns_the_machines_name_cut_to_64_characters() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let name = format!("Ada's {}", "very ".repeat(20));
+    machine
+        .update_settings(|s| s.machine_name = Some(name.clone()))
+        .unwrap();
+    pair(&machine, &service).await;
+    assert_eq!(service.pair_requests()[0].name, name[..64]);
+}
+
+#[tokio::test]
 async fn a_rejected_pairing_stores_nothing() {
     let service = FakeService::start("klisi").await;
     let dir = tempfile::tempdir().unwrap();

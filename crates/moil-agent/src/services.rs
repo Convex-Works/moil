@@ -212,10 +212,21 @@ impl PairedService {
         self.approvals.iter().any(|a| a.hash == *hash)
     }
 
-    /// Every approved hash, oldest first, as `hello` and `approved` carry
-    /// them.
+    /// The most approved hashes a service is told about (spec §10).
+    pub const MAX_ANNOUNCED: usize = 1024;
+
+    /// The approved hashes `hello` and `approved` carry, oldest first: all
+    /// of them, or the [`MAX_ANNOUNCED`](Self::MAX_ANNOUNCED) approved most
+    /// recently.
     pub fn approved_hashes(&self) -> Vec<BundleHash> {
-        self.approvals.iter().map(|a| a.hash).collect()
+        let older = self.unannounced_approvals();
+        self.approvals[older..].iter().map(|a| a.hash).collect()
+    }
+
+    /// How many approvals are too old to be among those the service is told
+    /// about.
+    pub fn unannounced_approvals(&self) -> usize {
+        self.approvals.len().saturating_sub(Self::MAX_ANNOUNCED)
     }
 
     /// Whether the machine reaches this service over plain `http`.

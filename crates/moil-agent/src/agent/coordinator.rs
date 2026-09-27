@@ -569,6 +569,7 @@ impl Coordinator {
             return;
         };
         let approved = service.paired.approved_hashes();
+        warn_unannounced(&service.paired);
         let mut link = Link {
             outbox,
             held: false,
@@ -979,6 +980,7 @@ impl Coordinator {
                 };
                 if link.send(&message) {
                     link.approved = approved;
+                    warn_unannounced(&service.paired);
                 }
             }
         }
@@ -1120,6 +1122,19 @@ impl Coordinator {
             }
             changed
         });
+    }
+}
+
+/// Says so when `service` isn't told about every bundle approved for it.
+fn warn_unannounced(service: &PairedService) {
+    let older = service.unannounced_approvals();
+    if older > 0 {
+        tracing::warn!(
+            "{} is told only of the {} bundles approved for it most recently; {older} older \
+             approvals aren't announced, so it won't offer their jobs",
+            service.name,
+            PairedService::MAX_ANNOUNCED
+        );
     }
 }
 
