@@ -10,7 +10,7 @@ use url::{Host, Url};
 /// loopback, so that a remote service can't aim requests at services that
 /// listen only on the owner's machine. The owner can allow `http` anywhere,
 /// for development.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct UrlPolicy {
     /// Allow `http` to loopback hosts.
     pub loopback_http: bool,

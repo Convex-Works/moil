@@ -1,0 +1,24 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[manifest]
+requirements = [
+    { name = "plain", specifier = "==1.0" },
+    { name = "wheeled", specifier = "==2.0" },
+]
+
+[[package]]
+name = "plain"
+version = "1.0"
+source = { registry = "https://packages.example.com/simple" }
+sdist = { url = "https://packages.example.com/files/plain-1.0.tar.gz", hash = "sha256:441ff201eaf32e1727a1d546ddaf8846a943d5f7609f5e91fea7228e6391b004" }
+
+[[package]]
+name = "wheeled"
+version = "2.0"
+source = { registry = "https://packages.example.com/simple" }
+sdist = { url = "https://packages.example.com/files/wheeled-2.0.tar.gz", hash = "sha256:ecae1db0ef779fb6051d30e4562777d48ee6709b7e9004ee9ac0c92d477a47b6" }
+wheels = [
+    { url = "https://packages.example.com/files/wheeled-2.0-py3-none-any.whl", hash = "sha256:b789925bb79977e9a616db136be422a47d24641482dcd6bce4c32e93ce0a20dc" },
+]

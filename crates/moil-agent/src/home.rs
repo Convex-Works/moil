@@ -21,6 +21,7 @@ use crate::{Error, ServiceId};
 ///   bundles/<hash>/      approved bundles (BundleStore)
 ///   jobs/                attempts' working directories
 ///   cache/assets/        assets, by hash
+///   cache/environments/  each stored bundle's Python environment
 ///   secrets.json         tokens, when they aren't in the keychain
 ///   agent.lock           held by the process that has the home open
 /// ```

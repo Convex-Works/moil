@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use moil_bundle::Asset;
-use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel};
+use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel, UrlPolicy};
 
-use crate::EventSink;
-use crate::http::{DownloadError, Http};
+use crate::http::{Http, TransferError};
 use crate::locks::KeyedLocks;
+use crate::progress::{self, Meter};
+use crate::{EventSink, units};
 
 /// How the names of files still being downloaded start.
 const PARTIAL: &str = ".partial-";
@@ -24,15 +25,18 @@ const PARTIAL: &str = ".partial-";
 #[derive(Debug)]
 pub(crate) struct AssetCache {
     dir: PathBuf,
+    /// The most an asset whose size the manifest doesn't give may take.
+    max_unsized_bytes: u64,
     /// Held while an asset is fetched, by hash, so concurrent attempts in
     /// this process download each asset once.
     fetching: KeyedLocks<String>,
 }
 
 impl AssetCache {
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, max_unsized_bytes: u64) -> Self {
         Self {
             dir,
+            max_unsized_bytes,
             fetching: KeyedLocks::default(),
         }
     }
@@ -43,10 +47,12 @@ impl AssetCache {
     }
 
     /// Makes sure asset `name` is in the cache, downloading and verifying
-    /// it if it isn't. Logs to `events`, if given, when it downloads.
+    /// it if it isn't, from where `policy` allows. Logs to `events`, if
+    /// given, when it downloads.
     pub async fn fetch(
         &self,
         http: &Http,
+        policy: UrlPolicy,
         name: &str,
         asset: &Asset,
         events: Option<&EventSink>,
@@ -65,15 +71,18 @@ impl AssetCache {
                 format!("downloading asset {name}"),
             ));
         }
-        self.download(http, name, asset, &path).await
+        self.download(http, policy, name, asset, &path, events)
+            .await
     }
 
     async fn download(
         &self,
         http: &Http,
+        policy: UrlPolicy,
         name: &str,
         asset: &Asset,
         path: &Path,
+        events: Option<&EventSink>,
     ) -> Result<(), JobError> {
         let failed = |why: String| {
             JobError::new(
@@ -103,14 +112,27 @@ impl AssetCache {
             })?;
         let (file, partial) = partial.into_parts();
         let mut file = tokio::fs::File::from_std(file);
-        let got = http
-            .download(&asset.url, &BTreeMap::new(), &mut file, asset.size_bytes)
+        let limit = asset.size_bytes.unwrap_or(self.max_unsized_bytes);
+        let meter = Meter::default();
+        if let Some(size) = asset.size_bytes {
+            meter.set_total(size);
+        }
+        let no_headers = BTreeMap::new();
+        let download = http.download(policy, &asset.url, &no_headers, &mut file, limit, &meter);
+        let got = progress::report(events, &format!("asset {name}"), &meter, download)
             .await
             .map_err(|e| match e {
-                DownloadError::TooLarge(expected) => mismatch(format!(
-                    "it is larger than the {expected} bytes the manifest says"
+                TransferError::TooLarge(_) if asset.size_bytes.is_some() => mismatch(format!(
+                    "it is larger than the {limit} bytes the manifest says"
                 )),
-                DownloadError::Failed(why) => failed(why),
+                // Another machine would refuse it too.
+                TransferError::TooLarge(_) => failed(format!(
+                    "the manifest doesn't give its size, and it is larger than the {} \
+                     this machine accepts",
+                    units::bytes(limit)
+                ))
+                .retryable(false),
+                other => failed(other.to_string()),
             })?;
         if let Some(expected) = asset.size_bytes
             && got.size_bytes != expected
@@ -140,7 +162,8 @@ impl AssetCache {
     }
 
     /// Removes downloads that a crashed process left unfinished: partial
-    /// files nothing has written to for `idle`. Returns how many it removed.
+    /// files nothing has written to for `idle`. Returns how many it removed;
+    /// one it can't remove is logged and left for next time.
     pub fn remove_abandoned(&self, idle: Duration) -> io::Result<usize> {
         let entries = match std::fs::read_dir(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -151,13 +174,18 @@ impl AssetCache {
             let entry = entry?;
             let abandoned = entry.file_name().to_string_lossy().starts_with(PARTIAL)
                 && entry
-                    .metadata()?
-                    .modified()?
-                    .elapsed()
-                    .is_ok_and(|age| age >= idle);
-            if abandoned {
-                std::fs::remove_file(entry.path())?;
-                removed += 1;
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age >= idle));
+            if !abandoned {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    let path = entry.path();
+                    tracing::warn!(path = %path.display(), %error, "couldn't remove an abandoned download");
+                }
             }
         }
         Ok(removed)
@@ -202,7 +230,7 @@ mod tests {
     #[test]
     fn only_abandoned_downloads_are_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = AssetCache::new(dir.path().to_owned());
+        let cache = AssetCache::new(dir.path().to_owned(), u64::MAX);
         let write = |name: &str, age: Duration| {
             let file = std::fs::File::create(dir.path().join(name)).unwrap();
             file.set_modified(std::time::SystemTime::now() - age)

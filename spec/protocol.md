@@ -565,6 +565,10 @@ it `cancel`, so a hung attempt doesn't keep the machine busy.
 The runtime downloads inputs before starting the script and uploads
 outputs after it finishes (§8). Uploads send the file's bytes as the body,
 with `Content-Length` and the given headers; any `2xx` counts as success.
+Uploads don't follow redirects: an HTTP client following a `303` would
+resend the request as a `GET` without the file, so a `3xx` is a failure.
+Downloads follow redirects (§3). A machine MAY cap the size of downloads
+whose size it isn't told, to protect its disk.
 The machine sends no credentials of its own. Pre-signed URLs carry their
 own authorization.
 
@@ -630,7 +634,9 @@ prepares the bundle:
 2. It downloads each asset that isn't cached yet and checks its SHA-256.
    Assets are cached by hash and shared between bundles.
 
-The runtime runs uv with its own configuration only (`UV_NO_CONFIG=1`) and
+The runtime chooses where each bundle's environment lives and removes it
+once the bundle is no longer stored. It runs uv with its own configuration
+only (`UV_NO_CONFIG=1`) and
 with uv-managed Python (`UV_MANAGED_PYTHON=1`), so the machine's own uv or
 Python setup doesn't change what runs. It also sets `UV_SYSTEM_CERTS=1`, so
 package downloads trust the same certificate authorities as the machine.
@@ -789,9 +795,9 @@ A failed `done` carries `error`:
 | `output_missing` | machine | `result.files` named an undeclared or absent file | no |
 | `timeout` | machine | Ran past `timeout_ms` | no |
 | `environment` | machine | `uv sync` failed | yes, unless the machine can tell it's permanent, such as a lockfile that doesn't match the script |
-| `asset_download` | machine | An asset couldn't be downloaded | yes |
+| `asset_download` | machine | An asset couldn't be downloaded | yes; no when it's larger than the machine accepts |
 | `asset_mismatch` | machine | An asset's hash didn't match the manifest | no |
-| `input_download` | machine | An input couldn't be downloaded | yes; no when the URL policy (§3) refused it |
+| `input_download` | machine | An input couldn't be downloaded | yes; no when the URL policy (§3) refused it, or it's larger than the machine accepts |
 | `output_upload` | machine | An output couldn't be uploaded | yes; no when the URL policy (§3) refused it |
 | `rejected` | machine | The assignment couldn't be read (§7.2); never started | no |
 | `interrupted` | machine | Stopped by the owner, or the app quit | yes |

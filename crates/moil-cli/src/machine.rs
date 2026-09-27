@@ -428,7 +428,7 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
         .init();
     let uv = moil_runtime::find_uv()
         .context("couldn't find uv; install it (https://docs.astral.sh/uv/) or set $MOIL_UV")?;
-    let runtime = Runtime::new(machine.runtime_config(uv));
+    let runtime = Runtime::new(machine.runtime_config(uv))?;
     // As in the app: leftovers are worth a warning, not refusing to work.
     match runtime.reap_orphans() {
         Ok(0) => {}

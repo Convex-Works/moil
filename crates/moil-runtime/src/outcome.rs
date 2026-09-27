@@ -12,8 +12,13 @@ use std::time::Duration;
 use moil_proto::{ErrorCode, FileName, JobError, Outcome, Upload};
 use serde_json::Value;
 
-use crate::StopReason;
-use crate::stdout::Report;
+use crate::stdout::{Report, truncate};
+use crate::workdir::open_output;
+use crate::{StopReason, units};
+
+/// How much of a name the result gives a failure quotes: more than any
+/// output's name takes.
+const MAX_QUOTED_NAME_BYTES: usize = 200;
 
 /// Why an attempt ended before running its course.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +39,10 @@ impl Cut {
             )),
             Cut::TimedOut(limit) => Outcome::failed(JobError::new(
                 ErrorCode::Timeout,
-                format!("the attempt ran past its time limit of {}", human(limit)),
+                format!(
+                    "the attempt ran past its time limit of {}",
+                    units::duration(limit)
+                ),
             )),
         }
     }
@@ -43,8 +51,8 @@ impl Cut {
 /// What the script produced, once it's accepted as a success.
 #[derive(Debug)]
 pub(crate) struct Accepted {
-    /// The outputs to upload.
-    pub files: Vec<FileName>,
+    /// The outputs to upload, open: what was judged is what gets uploaded.
+    pub files: Vec<(FileName, std::fs::File)>,
     pub meta: Option<Value>,
 }
 
@@ -78,22 +86,23 @@ pub(crate) fn judge(
     let mut seen = BTreeSet::new();
     for name in result.files {
         let missing = |why: String| JobError::new(ErrorCode::OutputMissing, why);
-        let Some(file) = FileName::new(name.as_str())
+        let Some(output) = FileName::new(name.as_str())
             .ok()
-            .filter(|file| declared.contains_key(file))
+            .filter(|output| declared.contains_key(output))
         else {
+            // The name is the script's, of any length; outputs' names are
+            // short.
+            let name = truncate(&name, MAX_QUOTED_NAME_BYTES);
             return Err(missing(format!(
                 "the result names {name:?}, which isn't one of the job's outputs"
             )));
         };
-        if !out_dir.join(file.as_str()).is_file() {
-            return Err(missing(format!(
-                "the result names {name:?}, but the script didn't write out/{name}"
-            )));
+        if !seen.insert(output.clone()) {
+            continue;
         }
-        if seen.insert(file.clone()) {
-            files.push(file);
-        }
+        let file = open_output(out_dir, &output)
+            .map_err(|why| missing(format!("the result names {name:?}, but {why}")))?;
+        files.push((output, file));
     }
     Ok(Accepted {
         files,
@@ -113,17 +122,5 @@ fn describe(status: ExitStatus) -> String {
         (Some(code), _) => format!("exited with status {code}"),
         (None, Some(signal)) => format!("was killed by signal {signal}"),
         (None, None) => "ended in an unknown way".into(),
-    }
-}
-
-/// A duration as people write it: `1 h`, `90 s`, `1500 ms`.
-fn human(duration: Duration) -> String {
-    let ms = duration.as_millis();
-    match ms {
-        0 => "0 s".into(),
-        ms if ms % 3_600_000 == 0 => format!("{} h", ms / 3_600_000),
-        ms if ms % 60_000 == 0 => format!("{} min", ms / 60_000),
-        ms if ms % 1_000 == 0 => format!("{} s", ms / 1_000),
-        ms => format!("{ms} ms"),
     }
 }

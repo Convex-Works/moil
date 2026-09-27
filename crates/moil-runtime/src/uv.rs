@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+use moil_bundle::Bundle;
 use moil_proto::{ErrorCode, JobError};
 use tokio::process::Command;
 
 use crate::stderr::{self, Tail};
+use crate::workdir::remove_tree;
 
 /// The uv binary, and the environment every uv process gets.
 #[derive(Debug, Clone)]
@@ -78,13 +80,99 @@ fn env_or(name: &str, default: &str) -> OsString {
         .unwrap_or_else(|| default.into())
 }
 
-/// Creates the environment for the script at `script` with
-/// `uv sync --locked --script`, failing with `environment` if uv can't.
-pub(crate) async fn sync(uv: &Uv, script: &Path, echo_stderr: bool) -> Result<(), JobError> {
-    let mut command = uv.command();
+/// A stored bundle's `job.py` as uv syncs and runs it (spec §8.1): with
+/// exactly the dependencies its lockfile pins, each installed from a wheel
+/// whenever the lockfile has any, in an environment the runtime chose.
+#[derive(Debug, Clone)]
+pub(crate) struct Script {
+    path: PathBuf,
+    environment: PathBuf,
+    requires_python: Option<String>,
+    /// The packages uv must not build from source.
+    wheels_only: Vec<String>,
+}
+
+impl Script {
+    /// The script of `bundle`, stored in `dir`, with its environment at
+    /// `environment`.
+    pub fn new(bundle: &Bundle, dir: &Path, environment: PathBuf) -> Self {
+        Self {
+            path: dir.join(moil_bundle::SCRIPT),
+            environment,
+            requires_python: bundle.requires_python().map(str::to_owned),
+            wheels_only: bundle
+                .packages()
+                .iter()
+                .filter(|package| !package.builds_from_source)
+                .map(|package| package.name.clone())
+                .collect(),
+        }
+    }
+
+    /// `uv <subcommand> --locked … --script <job.py>`: `sync` installs the
+    /// dependencies, `run` runs the script (syncing first, by the same
+    /// rules).
+    pub fn command(&self, uv: &Uv, subcommand: &str) -> Command {
+        let mut command = uv.command();
+        // `--active` uses the environment at $VIRTUAL_ENV rather than one
+        // in uv's cache, where nothing would ever remove it.
+        command
+            .args([subcommand, "--locked", "--active"])
+            .env("VIRTUAL_ENV", &self.environment);
+        for name in &self.wheels_only {
+            command.arg("--no-build-package").arg(name);
+        }
+        // Last: whatever follows the script's path is the script's own.
+        command.arg("--script").arg(&self.path);
+        command
+    }
+
+    /// Whether the environment exists and its Python is still there.
+    pub fn has_environment(&self) -> bool {
+        self.environment.join("bin/python").is_file()
+    }
+}
+
+/// Makes an empty environment for `script` with `uv venv`, with a Python
+/// its lockfile allows, replacing anything in its place.
+///
+/// `uv sync` would make a missing environment itself, but wouldn't say
+/// which Python it failed to find, and never repairs one whose Python is
+/// gone.
+pub(crate) async fn create_environment(
+    uv: &Uv,
+    script: &Script,
+    echo_stderr: bool,
+) -> Result<(), JobError> {
+    remove_tree(&script.environment).map_err(|error| {
+        JobError::new(
+            ErrorCode::Internal,
+            format!("couldn't remove a broken environment: {error}"),
+        )
+    })?;
+    let mut venv = uv.command();
+    venv.args(["venv", "--no-project", "--quiet"]);
+    if let Some(versions) = &script.requires_python {
+        venv.arg("--python").arg(versions);
+    }
+    venv.arg(&script.environment);
+    run_to_end(uv, venv, &script.path, echo_stderr).await
+}
+
+/// Installs `script`'s dependencies into its environment with `uv sync`.
+pub(crate) async fn sync(uv: &Uv, script: &Script, echo_stderr: bool) -> Result<(), JobError> {
+    run_to_end(uv, script.command(uv, "sync"), &script.path, echo_stderr).await
+}
+
+/// Runs uv `command` next to the script at `script`, without input or
+/// output, and explains its failure.
+async fn run_to_end(
+    uv: &Uv,
+    mut command: Command,
+    script: &Path,
+    echo_stderr: bool,
+) -> Result<(), JobError> {
     command
-        .args(["sync", "--locked", "--script"])
-        .arg(script)
         .current_dir(script.parent().unwrap_or(Path::new("/")))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -102,7 +190,7 @@ pub(crate) async fn sync(uv: &Uv, script: &Path, echo_stderr: bool) -> Result<()
     if status.success() {
         return Ok(());
     }
-    let mut error = JobError::new(ErrorCode::Environment, sync_failure(&tail));
+    let mut error = sync_failure(&tail);
     if let Some(code) = status.code() {
         error = error.with_exit_code(code);
     }
@@ -113,26 +201,48 @@ pub(crate) async fn sync(uv: &Uv, script: &Path, echo_stderr: bool) -> Result<()
 /// another machine may well succeed.
 pub(crate) fn cant_start(uv: &Uv, error: &std::io::Error) -> JobError {
     JobError::new(
-        ErrorCode::Environment,
+        ErrorCode::Internal,
         format!("couldn't run uv ({}): {error}", uv.program.display()),
     )
-    .retryable(true)
 }
 
-/// Explains a failed `uv sync` from its stderr.
-fn sync_failure(stderr: &str) -> String {
+/// Explains a failed `uv venv` or `uv sync` from its stderr. Retryable, as an index
+/// that is down may be back for the next attempt, unless the bundle itself
+/// is at fault (spec §9).
+fn sync_failure(stderr: &str) -> JobError {
     if stderr.contains("needs to be updated") {
-        return "job.py.lock doesn't match the dependencies job.py declares; \
-                the bundle's author must run `uv lock --script job.py`"
-            .into();
+        return JobError::new(
+            ErrorCode::Environment,
+            "job.py.lock doesn't match the dependencies job.py declares; \
+             the bundle's author must run `uv lock --script job.py`",
+        )
+        .retryable(false);
     }
-    match stderr
+    let reason = stderr
         .lines()
         .find_map(|line| line.trim().strip_prefix("error:"))
-    {
-        Some(reason) => format!("uv couldn't create the environment: {}", reason.trim()),
+        .map(str::trim);
+    let message = match reason {
+        // Another machine may have a platform the wheels fit.
+        Some(reason) if reason.contains("marked as `--no-build`") => match no_wheel_for(reason) {
+            Some(package) => format!(
+                "job.py.lock has wheels for {package}, but none for this machine's platform; \
+                 moil installs a package from source only when the lockfile has no wheel for it"
+            ),
+            None => format!("uv couldn't create the environment: {reason}"),
+        },
+        Some(reason) => format!("uv couldn't create the environment: {reason}"),
         None => "uv couldn't create the environment".into(),
-    }
+    };
+    JobError::new(ErrorCode::Environment, message)
+}
+
+/// The package in uv's "Distribution `name==version @ source` can't be
+/// installed because it is marked as `--no-build`…", as `name==version`.
+fn no_wheel_for(reason: &str) -> Option<&str> {
+    let (_, rest) = reason.split_once("Distribution `")?;
+    let (distribution, _) = rest.split_once('`')?;
+    Some(distribution.split(" @ ").next().unwrap_or(distribution))
 }
 
 /// Where uv is: `explicit` (`$MOIL_UV`) if given, else a `uv` next to
@@ -161,7 +271,7 @@ pub(crate) fn locate(
         .find(|candidate| is_executable(candidate))
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }

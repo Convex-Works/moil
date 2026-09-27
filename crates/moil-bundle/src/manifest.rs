@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use moil_proto::ids::{is_asset_name, is_bundle_name, is_sha256_hex};
 use serde::{Deserialize, Serialize};
 
-/// A bundle's `manifest.json` (spec §5.3). Parsing is strict: unknown fields
-/// anywhere make the manifest invalid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A bundle's `manifest.json` (spec §5.3). Read one with
+/// [`Manifest::parse`], which is strict: unknown fields or duplicate keys
+/// anywhere make the manifest invalid. It deliberately doesn't implement
+/// `Deserialize`, which would skip those checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Manifest {
     pub moil: u32,
     pub name: String,
@@ -102,8 +103,8 @@ impl Manifest {
         if !value.is_object() {
             return Err(ManifestError::NotAnObject);
         }
-        let manifest: Self =
-            serde_json::from_value(value).map_err(|e| ManifestError::Json(e.to_string()))?;
+        let manifest =
+            ManifestFields::deserialize(value).map_err(|e| ManifestError::Json(e.to_string()))?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -153,6 +154,21 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// How serde reads a [`Manifest`], for [`Manifest::parse`] alone.
+#[derive(Deserialize)]
+#[serde(remote = "Manifest", deny_unknown_fields)]
+struct ManifestFields {
+    moil: u32,
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    assets: BTreeMap<String, Asset>,
+    #[serde(default)]
+    resources: Resources,
 }
 
 /// No control characters (except line feeds, if `line_feeds`) and no
@@ -325,6 +341,20 @@ mod tests {
         );
         let fine = ["w", "whisper.bin", "whisper/model.bin", "whisper/vocab.txt"];
         assert_eq!(layout_conflict(fine.into_iter()), None);
+    }
+
+    #[test]
+    fn manifests_can_only_be_read_by_parse() {
+        // `serde_json::from_str::<Manifest>` would skip the duplicate-key
+        // and validity checks, so it must not compile. The call below
+        // resolves only while exactly one of these impls applies: it stops
+        // compiling if `Manifest` implements `Deserialize`.
+        trait Ambiguous<A> {
+            fn check() {}
+        }
+        impl<T> Ambiguous<()> for T {}
+        impl<T: serde::de::DeserializeOwned> Ambiguous<u8> for T {}
+        <Manifest as Ambiguous<_>>::check();
     }
 
     #[test]

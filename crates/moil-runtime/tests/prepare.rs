@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use moil_bundle::{Bundle, BundleStore};
-use moil_proto::{ErrorCode, LogLevel, Phase};
+use moil_proto::{ErrorCode, JobEvent, LogLevel, Phase};
 use moil_runtime::{Executor, Runtime};
 use serde_json::{Value, json};
 
@@ -141,7 +141,7 @@ mod assets {
         let mut config = h.runtime.config().clone();
         config.bundles = BundleStore::new(other_home.path().join("bundles"));
         config.jobs_dir = other_home.path().join("jobs");
-        let other = Runtime::try_new(config).unwrap();
+        let other = Runtime::new(config).unwrap();
 
         let (a, b) = tokio::join!(h.runtime.prepare(&bundle), other.prepare(&bundle));
         a.unwrap();
@@ -225,11 +225,94 @@ mod assets {
     }
 
     #[tokio::test]
+    async fn fetching_an_asset_reports_how_far_it_got() {
+        let h = Harness::new().await;
+        let weights = vec![7; 4 << 20];
+        let gate = Gate::default();
+        h.server.reply(
+            "/model.bin",
+            Reply::Gated {
+                body: weights.clone(),
+                at: 1 << 20,
+                gate: gate.clone(),
+            },
+        );
+        let bundle = asset_manifest(json!({
+            "url": h.server.https_url("/model.bin"),
+            "sha256": sha256(&weights),
+            "size_bytes": weights.len(),
+        }));
+        let mut running = h.start(h.job(&bundle, steps(json!([{"emit": {"type": "result"}}]))));
+
+        // Held back after a quarter, the download says how far it got.
+        loop {
+            let (fraction, message) = running.progress().await;
+            if fraction == Some(0.25) {
+                assert_eq!(message, "asset model.bin: 1 MiB of 4 MiB");
+                break;
+            }
+            assert!(fraction.is_some_and(|f| f < 0.25), "{fraction:?}");
+        }
+        gate.open();
+        let run = running.finish().await;
+        run.result();
+        assert_eq!(
+            run.progress().last(),
+            Some(&(Some(1.0), "asset model.bin: 4 MiB of 4 MiB".to_owned()))
+        );
+        let preparing_ended = run
+            .events
+            .iter()
+            .position(|e| {
+                *e == JobEvent::Phase {
+                    phase: Phase::Downloading,
+                }
+            })
+            .unwrap();
+        assert!(
+            run.events[preparing_ended..]
+                .iter()
+                .all(|e| !matches!(e, JobEvent::Progress { .. })),
+            "it all happened while preparing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_asset_without_a_size_is_held_to_the_machines_limit() {
+        let h = Harness::with(|c| c.max_download_bytes = 1000).await;
+        let big = vec![b'w'; 2000];
+        h.server.reply("/model.bin", Reply::Chunked(big.clone()));
+        let unsized_asset = asset_manifest(json!({
+            "url": h.server.https_url("/model.bin"),
+            "sha256": sha256(&big),
+        }));
+        let error = h.runtime.prepare(&unsized_asset).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::AssetDownload);
+        assert!(!error.retryable, "another machine would refuse it too");
+        assert!(
+            error
+                .message
+                .contains("larger than the 1000 bytes this machine accepts"),
+            "{}",
+            error.message
+        );
+        assert!(is_empty_dir(&h.runtime.config().assets_dir));
+
+        // A size the owner approved in the manifest is what counts.
+        let sized = asset_manifest(json!({
+            "url": h.server.https_url("/model.bin"),
+            "sha256": sha256(&big),
+            "size_bytes": big.len(),
+        }));
+        h.runtime.prepare(&sized).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unusable_extra_roots_are_reported_up_front() {
         let home = tempfile::tempdir().unwrap();
         let mut config = moil_runtime::RuntimeConfig::new(uv(), home.path());
         config.extra_root_certificates = vec!["-----BEGIN CERTIFICATE-----\nnope\n".into()];
-        let error = Runtime::try_new(config.clone()).unwrap_err();
+        let error = Runtime::new(config.clone()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -238,22 +321,10 @@ mod assets {
         );
 
         config.extra_root_certificates = vec!["just some text".into()];
-        let error = Runtime::try_new(config.clone()).unwrap_err();
+        let error = Runtime::new(config).unwrap_err();
         assert!(
             error.to_string().contains("holds no PEM certificate"),
             "{error}"
-        );
-
-        // Runtime::new accepts the config, and fails the attempts that need
-        // HTTPS instead.
-        let h = Harness::new().await;
-        let bundle = with_assets(&h, &[("model.bin", "/model.bin", "weights")]);
-        let error = Runtime::new(config).prepare(&bundle).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::Internal);
-        assert!(
-            error.message.contains("holds no PEM certificate"),
-            "{}",
-            error.message
         );
     }
 
@@ -316,6 +387,8 @@ mod assets {
 }
 
 mod environment {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -400,19 +473,39 @@ mod environment {
         .unwrap();
         let error = h.runtime.prepare(&bundle).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::Environment);
+        assert!(error.retryable);
         assert!(error.message.contains("3.99"), "{}", error.message);
         assert!(error.stderr_tail.as_deref().unwrap().contains("3.99"));
         assert!(error.exit_code.is_some_and(|code| code != 0));
     }
 
+    #[test]
+    fn a_uv_that_isnt_a_program_is_refused_up_front() {
+        let home = tempfile::tempdir().unwrap();
+        for uv in [home.path().join("missing"), home.path().to_owned()] {
+            let config = moil_runtime::RuntimeConfig::new(uv.clone(), home.path());
+            let error = Runtime::new(config).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{} can't be uv: it isn't an executable file", uv.display())
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn a_machine_without_uv_fails_retryably() {
-        let h = Harness::with(|c| c.uv = "/nonexistent/uv".into()).await;
+    async fn uv_that_cant_start_is_an_internal_error() {
+        // An executable that can't be run, as when uv's install is broken.
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("uv");
+        std::fs::write(&broken, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let h = Harness::with(|c| c.uv = broken.clone()).await;
+
         let error = h.runtime.prepare(&probe()).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::Environment);
-        assert!(error.retryable, "another machine may have uv");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.retryable, "another machine may have a working uv");
         assert!(
-            error.message.contains("/nonexistent/uv"),
+            error.message.contains(broken.to_str().unwrap()),
             "{}",
             error.message
         );
@@ -427,5 +520,144 @@ mod environment {
             h.runtime.config().bundles.get(&bundle.hash()).unwrap(),
             Some(bundle)
         );
+    }
+}
+
+mod packages {
+    use super::*;
+    use common::index::{Index, Offer};
+
+    #[tokio::test]
+    async fn a_package_the_lockfile_has_wheels_for_is_never_built_from_source() {
+        // As when the wheels don't cover this platform. Building the sdist
+        // would run build tools the lockfile doesn't pin (spec §5.1).
+        let index = Index::start(&[("trap", Offer::SdistAndForeignWheel)]).await;
+        let h = Harness::with(|c| c.extra_env.push(index.uv_env())).await;
+        let bundle = index.bundle(&["trap"]).await;
+        assert!(!bundle.packages()[0].builds_from_source);
+
+        let prepared = h.runtime.prepare(&bundle).await;
+        assert!(!index.was_built("trap"), "uv built trap from its sdist");
+        let error = prepared.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Environment);
+        assert!(error.retryable, "the wheels may fit another machine");
+        assert!(
+            error
+                .message
+                .contains("wheels for trap==1.0, but none for this machine's platform"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_package_the_lockfile_has_no_wheel_for_is_built_from_source() {
+        let index = Index::start(&[("plain", Offer::Sdist)]).await;
+        let h = Harness::with(|c| c.extra_env.push(index.uv_env())).await;
+        let bundle = index.bundle(&["plain"]).await;
+        assert!(bundle.packages()[0].builds_from_source);
+
+        let run = h.run(h.job(&bundle, Value::Null)).await;
+        assert_eq!(run.result().meta, Some(json!({"plain": "built"})));
+        assert!(index.was_built("plain"));
+    }
+
+    #[tokio::test]
+    async fn an_index_that_is_down_is_a_retryable_environment_failure() {
+        let index = Index::start(&[("plain", Offer::Sdist)]).await;
+        let retries = ("UV_HTTP_RETRIES".into(), "0".into());
+        let h = Harness::with(|c| c.extra_env.extend([index.uv_env(), retries])).await;
+        let bundle = index.bundle(&["plain"]).await;
+        index.go_down();
+
+        let error = h.runtime.prepare(&bundle).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Environment);
+        assert!(
+            error.retryable,
+            "the index may be back for the next attempt"
+        );
+        assert!(!index.was_built("plain"));
+    }
+}
+
+mod environments {
+    use super::*;
+
+    #[tokio::test]
+    async fn each_bundle_has_an_environment_that_goes_with_it() {
+        let h = Harness::new().await;
+        let (gone, kept) = (
+            probe(),
+            probe_with_manifest(json!({"moil": 1, "name": "probe", "version": "2"})),
+        );
+        let run = h
+            .run(h.job(
+                &gone,
+                steps(json!([{"prefix": true}, {"emit": {"type": "result"}}])),
+            ))
+            .await;
+        let environments = &h.runtime.config().environments_dir;
+        let environment = environments.join(gone.hash().to_string());
+        let prefix = std::path::PathBuf::from(run.data("prefix").as_str().unwrap());
+        assert_eq!(
+            prefix.canonicalize().unwrap(),
+            environment.canonicalize().unwrap(),
+            "the script ran in its bundle's environment"
+        );
+        h.runtime.prepare(&kept).await.unwrap();
+
+        // The owner revoked `gone`, so its bundle is no longer stored.
+        h.runtime.config().bundles.remove(&gone.hash()).unwrap();
+        h.runtime.reap_orphans().unwrap();
+
+        assert!(!environment.exists());
+        assert!(environments.join(kept.hash().to_string()).is_dir());
+    }
+
+    #[tokio::test]
+    async fn runtimes_sharing_environments_can_make_one_at_once() {
+        // As `moil run`s of one bundle do, each with a runtime of its own.
+        let h = Harness::new().await;
+        let homes: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        let runtimes: Vec<Runtime> = homes
+            .iter()
+            .map(|home| {
+                let mut config = h.runtime.config().clone();
+                config.bundles = BundleStore::new(home.path().join("bundles"));
+                config.jobs_dir = home.path().join("jobs");
+                Runtime::new(config).unwrap()
+            })
+            .collect();
+        // Several fresh bundles, each giving a race another chance.
+        for version in 1..=3 {
+            let bundle = probe_with_manifest(
+                json!({"moil": 1, "name": "probe", "version": version.to_string()}),
+            );
+            let prepared =
+                futures::future::join_all(runtimes.iter().map(|r| r.prepare(&bundle))).await;
+            for result in prepared {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_environment_whose_python_is_gone_is_rebuilt() {
+        // As when the owner uninstalls the Python uv made it with.
+        let h = Harness::new().await;
+        let bundle = probe();
+        h.runtime.prepare(&bundle).await.unwrap();
+        let python = h
+            .runtime
+            .config()
+            .environments_dir
+            .join(bundle.hash().to_string())
+            .join("bin/python");
+        std::fs::remove_file(&python).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/python3", &python).unwrap();
+
+        h.run(h.job(&bundle, steps(json!([{"emit": {"type": "result"}}]))))
+            .await
+            .result();
     }
 }

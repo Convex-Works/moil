@@ -2,27 +2,28 @@
 //! (spec §8).
 
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moil_proto::{
     ErrorCode, FileInfo, FileName, JobContext, JobError, JobEvent, JobResult, Outcome, Phase,
-    SCRIPT_CONTRACT_VERSION,
+    SCRIPT_CONTRACT_VERSION, UrlPolicy,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
+use crate::http::TransferError;
+use crate::limits::Limits;
 use crate::orphans::Registration;
 use crate::outcome::{self, Accepted, Cut};
 use crate::process::Group;
+use crate::progress::{self, Meter};
 use crate::stderr::{self, Tail};
 use crate::stdout::{self, Report};
 use crate::workdir::WorkDir;
-use crate::{EventSink, Job, Runtime, StopSignal, http, uv};
+use crate::{EventSink, Job, Runtime, StopSignal, units, uv};
 
 /// How long to keep reading the script's output after its process group is
 /// gone. Only a process that left the group can hold it open longer.
@@ -42,12 +43,28 @@ pub(crate) async fn run(
         events: &events,
         ran: None,
     };
-    let outcome = match attempt.run(&mut limits).await {
+    let ended = attempt.run(&mut limits).await;
+    attempt.with_script_facts(outcome(&limits, ended))
+}
+
+/// How an attempt that ended as `ended` turns out (spec §8.5). A stop wins
+/// over any other ending, even one that came as a transfer failed or once
+/// the outputs were up.
+fn outcome(limits: &Limits, ended: Result<JobResult, Ending>) -> Outcome {
+    if let Some(reason) = limits.stopped() {
+        return Cut::Stopped(reason).outcome();
+    }
+    match ended {
         Ok(result) => Outcome::Succeeded { result },
         Err(Ending::Cut(cut)) => cut.outcome(),
-        Err(Ending::Failed(error)) => Outcome::failed(error),
-    };
-    attempt.with_script_facts(outcome)
+        // Some messages quote what the service or the script sent: a
+        // `done` too large for a control message would be refused on every
+        // replay.
+        Err(Ending::Failed(mut error)) => {
+            error.message = stdout::truncate(&error.message, stdout::MAX_MESSAGE_BYTES);
+            Outcome::failed(error)
+        }
+    }
 }
 
 struct Attempt<'a> {
@@ -88,7 +105,7 @@ impl Attempt<'_> {
         self.check_urls()?;
 
         self.phase(Phase::Preparing);
-        let bundle_dir = limits
+        let script = limits
             .guard(runtime.prepare_bundle(&job.bundle, Some(self.events)))
             .await??;
         let work_path = runtime.work_dir(&job.id, job.attempt);
@@ -127,35 +144,42 @@ impl Attempt<'_> {
             assets,
         };
         let accepted = self
-            .run_script(&bundle_dir, &work, &context, limits, &mut registration)
+            .run_script(&script, &work, &context, limits, &mut registration)
             .await?;
 
         self.phase(Phase::Uploading);
-        let files = limits.guard(self.upload(&work, &accepted.files)).await??;
+        let files = limits.guard(self.upload(accepted.files)).await??;
         Ok(JobResult {
             meta: accepted.meta,
             files,
         })
     }
 
+    /// Which URLs the job's inputs and outputs may use (spec §3).
+    fn url_policy(&self) -> UrlPolicy {
+        self.runtime.url_policy(self.job.url_policy)
+    }
+
     /// Refuses inputs and outputs the URL policy doesn't allow before any
-    /// work is done (spec §3).
+    /// work is done (spec §3). No other attempt would do better.
     fn check_urls(&self) -> Result<(), JobError> {
-        let allow = self.runtime.config.allow_insecure_http;
+        let policy = self.url_policy();
         for (name, input) in &self.job.inputs {
-            http::check_url(&input.url, allow).map_err(|why| {
+            policy.check_str(&input.url).map_err(|why| {
                 JobError::new(
                     ErrorCode::InputDownload,
                     format!("input {name} can't be downloaded: its URL {why}"),
                 )
+                .retryable(false)
             })?;
         }
         for (name, output) in &self.job.outputs {
-            http::check_url(&output.url, allow).map_err(|why| {
+            policy.check_str(&output.url).map_err(|why| {
                 JobError::new(
                     ErrorCode::OutputUpload,
                     format!("output {name} can't be uploaded: its URL {why}"),
                 )
+                .retryable(false)
             })?;
         }
         Ok(())
@@ -166,10 +190,6 @@ impl Attempt<'_> {
         work: &WorkDir,
     ) -> Result<BTreeMap<FileName, PathBuf>, JobError> {
         let mut paths = BTreeMap::new();
-        if self.job.inputs.is_empty() {
-            return Ok(paths);
-        }
-        let http = self.runtime.http()?;
         for (name, source) in &self.job.inputs {
             let failed = |why: String| {
                 JobError::new(
@@ -181,9 +201,32 @@ impl Attempt<'_> {
             let mut file = tokio::fs::File::create(&path)
                 .await
                 .map_err(|e| failed(format!("couldn't create {}: {e}", path.display())))?;
-            http.download(&source.url, &source.headers, &mut file, None)
-                .await
-                .map_err(|e| failed(e.to_string()))?;
+            let limit = self.runtime.config.max_download_bytes;
+            let meter = Meter::default();
+            let download = self.runtime.http.download(
+                self.url_policy(),
+                &source.url,
+                &source.headers,
+                &mut file,
+                limit,
+                &meter,
+            );
+            progress::report(
+                Some(self.events),
+                &format!("input {name}"),
+                &meter,
+                download,
+            )
+            .await
+            .map_err(|e| match e {
+                // Another machine would refuse it too.
+                TransferError::TooLarge(_) => failed(format!(
+                    "it is larger than the {} this machine accepts",
+                    units::bytes(limit)
+                ))
+                .retryable(false),
+                e => failed(e.to_string()).retryable(e.is_retryable()),
+            })?;
             paths.insert(name.clone(), path);
         }
         Ok(paths)
@@ -192,7 +235,7 @@ impl Attempt<'_> {
     /// Runs the script to its end and judges it (rules 1–7 of spec §8.5).
     async fn run_script(
         &mut self,
-        bundle_dir: &Path,
+        script: &uv::Script,
         work: &WorkDir,
         context: &JobContext,
         limits: &mut Limits,
@@ -200,10 +243,8 @@ impl Attempt<'_> {
     ) -> Result<Accepted, Ending> {
         let config = &self.runtime.config;
         let uv = self.runtime.uv();
-        let mut command = uv.command();
+        let mut command = script.command(&uv, "run");
         command
-            .args(["run", "--locked", "--script"])
-            .arg(bundle_dir.join(moil_bundle::SCRIPT))
             .env("TMPDIR", work.tmp())
             .env("PYTHONUNBUFFERED", "1")
             .current_dir(work.root())
@@ -262,26 +303,27 @@ impl Attempt<'_> {
 
     async fn upload(
         &self,
-        work: &WorkDir,
-        files: &[FileName],
+        files: Vec<(FileName, std::fs::File)>,
     ) -> Result<BTreeMap<FileName, FileInfo>, JobError> {
         let mut uploaded = BTreeMap::new();
-        if files.is_empty() {
-            return Ok(uploaded);
-        }
-        let http = self.runtime.http()?;
-        for name in files {
-            let target = &self.job.outputs[name];
-            let info = http
-                .upload(target, &work.outputs().join(name.as_str()))
-                .await
-                .map_err(|why| {
-                    JobError::new(
-                        ErrorCode::OutputUpload,
-                        format!("couldn't upload {name}: {why}"),
-                    )
-                })?;
-            uploaded.insert(name.clone(), info);
+        for (name, file) in files {
+            let target = &self.job.outputs[&name];
+            let meter = Meter::default();
+            let upload = self
+                .runtime
+                .http
+                .upload(self.url_policy(), target, file, &meter);
+            let info =
+                progress::report(Some(self.events), &format!("output {name}"), &meter, upload)
+                    .await
+                    .map_err(|e| {
+                        JobError::new(
+                            ErrorCode::OutputUpload,
+                            format!("couldn't upload {name}: {e}"),
+                        )
+                        .retryable(e.is_retryable())
+                    })?;
+            uploaded.insert(name, info);
         }
         Ok(uploaded)
     }
@@ -306,56 +348,6 @@ impl Attempt<'_> {
     }
 }
 
-/// What can cut an attempt short: the stop signal and the time limit.
-struct Limits {
-    stop: StopSignal,
-    timeout: Option<Duration>,
-    deadline: Option<Instant>,
-}
-
-impl Limits {
-    fn new(stop: StopSignal, timeout: Option<Duration>) -> Self {
-        Self {
-            stop,
-            timeout,
-            deadline: timeout.map(|limit| Instant::now() + limit),
-        }
-    }
-
-    /// Resolves once the attempt must end early. Cancel-safe.
-    async fn reached(&mut self) -> Cut {
-        let (deadline, timeout) = (self.deadline, self.timeout);
-        let expired = async move {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
-                None => std::future::pending().await,
-            }
-        };
-        let cut = tokio::select! {
-            biased;
-            reason = self.stop.stopped() => Cut::Stopped(reason),
-            () = expired => Cut::TimedOut(timeout.unwrap_or_default()),
-        };
-        self.decide(Some(cut)).unwrap_or(cut)
-    }
-
-    /// Rules 1–3 of spec §8.5: a stop, whenever it came, wins over running
-    /// out of time, which wins over everything else.
-    fn decide(&self, cut: Option<Cut>) -> Option<Cut> {
-        self.stop.reason().map(Cut::Stopped).or(cut)
-    }
-
-    /// Runs `work` unless the attempt must end first, in which case `work`
-    /// is dropped.
-    async fn guard<T>(&mut self, work: impl Future<Output = T>) -> Result<T, Cut> {
-        tokio::select! {
-            biased;
-            cut = self.reached() => Err(cut),
-            value = work => Ok(value),
-        }
-    }
-}
-
 /// Waits for a task reading the script's output to finish, but not for long.
 async fn drain(task: JoinHandle<()>) {
     let abort = task.abort_handle();
@@ -367,4 +359,36 @@ async fn drain(task: JoinHandle<()>) {
 
 fn internal(what: &'static str) -> impl FnOnce(std::io::Error) -> JobError {
     move |error| JobError::new(ErrorCode::Internal, format!("{what}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StopReason, stop_signal};
+
+    #[tokio::test]
+    async fn a_stop_wins_over_however_else_the_attempt_ended() {
+        let (stopper, stop) = stop_signal();
+        let limits = Limits::new(stop, None);
+        let failed = || {
+            Err(Ending::Failed(JobError::new(
+                ErrorCode::InputDownload,
+                "the connection was reset",
+            )))
+        };
+        let succeeded = || {
+            Ok(JobResult {
+                meta: None,
+                files: BTreeMap::new(),
+            })
+        };
+        assert!(matches!(
+            outcome(&limits, failed()),
+            Outcome::Failed { error } if error.code == ErrorCode::InputDownload
+        ));
+
+        stopper.stop(StopReason::Cancelled);
+        assert_eq!(outcome(&limits, failed()), Outcome::Cancelled);
+        assert_eq!(outcome(&limits, succeeded()), Outcome::Cancelled);
+    }
 }

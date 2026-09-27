@@ -3,7 +3,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use moil_proto::JobId;
+use moil_proto::{FileName, JobId};
+
+use crate::sys;
 
 /// A fresh working directory for one attempt:
 ///
@@ -55,6 +57,34 @@ impl WorkDir {
 
     pub fn tmp(&self) -> PathBuf {
         self.root.join("tmp")
+    }
+}
+
+/// Opens output `name` for uploading, if it is a regular file right in
+/// `out_dir`, reached through no symbolic link: a script that extracts
+/// an archive from an input could otherwise be tricked into uploading any
+/// file of the owner's. The error says why not, as in "out/a.txt isn't a
+/// regular file".
+pub(crate) fn open_output(out_dir: &Path, name: &FileName) -> Result<std::fs::File, String> {
+    let path = out_dir.join(name.as_str());
+    let is_link =
+        |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let why_not = |error: io::Error| {
+        if is_link(out_dir) {
+            "out/ is a symbolic link; outputs must be regular files in out/".to_owned()
+        } else if is_link(&path) {
+            format!("out/{name} is a symbolic link; outputs must be regular files in out/")
+        } else if error.kind() == io::ErrorKind::NotFound {
+            format!("the script didn't write out/{name}")
+        } else {
+            format!("out/{name} couldn't be opened: {error}")
+        }
+    };
+    let file = sys::open_in(out_dir, name.as_str()).map_err(why_not)?;
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(file),
+        Ok(_) => Err(format!("out/{name} isn't a regular file")),
+        Err(error) => Err(format!("out/{name} couldn't be read: {error}")),
     }
 }
 

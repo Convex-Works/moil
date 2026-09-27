@@ -10,12 +10,19 @@
 //!
 //! - A job's time limit covers the whole attempt, preparation and transfers
 //!   included, since that is what bounds how long the service waits.
-//! - A `data` event whose payload is over 256 KiB is dropped with a
-//!   warning; a `result` whose meta is, is refused, so the attempt fails as
-//!   `no_result` rather than succeed without the meta the service expects.
+//! - A `data` event whose payload is over 256 KiB, or nested more than 64
+//!   levels deep, is dropped with a warning; a `result` whose meta is, is
+//!   refused, so the attempt fails as `no_result` rather than succeed
+//!   without the meta the service expects.
 //! - Nothing the script starts outlives the attempt: when the script ends,
 //!   whatever is left in its process group is killed.
-//! - A redirect is followed only to a URL the policy of spec §3 allows.
+//! - Downloads follow a redirect only to a URL the job's policy (spec §3)
+//!   allows. Uploads follow none, since following one could turn the upload
+//!   into a `GET`.
+//! - Inputs, and assets whose manifest gives no size, are held to
+//!   [`RuntimeConfig::max_download_bytes`].
+//! - Each bundle has a uv environment of its own, which goes once the
+//!   bundle is no longer stored.
 //!
 //! Unix only: scripts run in their own process group.
 
@@ -33,14 +40,18 @@ use tokio::sync::{mpsc, watch};
 
 mod assets;
 mod attempt;
+mod environments;
 mod http;
+mod limits;
 mod locks;
 mod orphans;
 mod outcome;
 mod process;
+mod progress;
 mod stderr;
 mod stdout;
 mod sys;
+mod units;
 pub mod uv;
 mod workdir;
 
@@ -176,8 +187,18 @@ pub struct RuntimeConfig {
     pub jobs_dir: PathBuf,
     /// Where assets are cached, by hash.
     pub assets_dir: PathBuf,
-    /// Accept `http` URLs for inputs and outputs on any host, not just
-    /// loopback. For development only.
+    /// The most an input, or an asset whose size the manifest doesn't give,
+    /// may take, so that a service can't fill the machine's disk. Assets of
+    /// a given size are held to exactly that size instead.
+    pub max_download_bytes: u64,
+    /// Where bundles' uv environments are kept, by hash.
+    /// [`Runtime::reap_orphans`] removes those of bundles not in
+    /// [`RuntimeConfig::bundles`], so runtimes that share this directory
+    /// must share the bundle store too.
+    pub environments_dir: PathBuf,
+    /// Accept `http` URLs on any host, for inputs, outputs and assets
+    /// alike, whatever a job's [`Job::url_policy`] says. For development
+    /// only.
     pub allow_insecure_http: bool,
     /// Keep working directories after attempts end, for debugging.
     pub keep_work_dirs: bool,
@@ -206,6 +227,8 @@ impl RuntimeConfig {
             bundles: BundleStore::new(home.join("bundles")),
             jobs_dir: home.join("jobs"),
             assets_dir: home.join("cache").join("assets"),
+            max_download_bytes: 64 << 30,
+            environments_dir: home.join("cache").join("environments"),
             allow_insecure_http: false,
             keep_work_dirs: false,
             kill_grace: Duration::from_secs(10),
@@ -216,46 +239,43 @@ impl RuntimeConfig {
     }
 }
 
-/// A [`RuntimeConfig`] that can't work.
+/// Why a [`RuntimeConfig`] can't work.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("couldn't set up HTTPS: {0}")]
-pub struct ConfigError(String);
+pub enum ConfigError {
+    #[error("{} can't be uv: it isn't an executable file", .0.display())]
+    Uv(PathBuf),
+    #[error("couldn't set up HTTPS: {0}")]
+    Https(String),
+}
 
 /// Runs attempts for real, with uv.
 #[derive(Debug)]
 pub struct Runtime {
     config: RuntimeConfig,
-    /// The client, or why it couldn't be built, reported by every attempt
-    /// that needs it.
-    http: Result<http::Http, ConfigError>,
+    http: http::Http,
     assets: assets::AssetCache,
+    environments: environments::Environments,
     /// Held while a bundle is stored and its environment synced, by hash:
     /// preparing it after approval and for an attempt may overlap.
     preparing: locks::KeyedLocks<BundleHash>,
 }
 
 impl Runtime {
-    /// A runtime for `config`. If the config can't work (see
-    /// [`Runtime::try_new`]), attempts that move files fail as `internal`.
-    pub fn new(config: RuntimeConfig) -> Self {
-        let http = http::Http::new(&config.extra_root_certificates, config.allow_insecure_http)
-            .map_err(ConfigError);
-        Self {
-            assets: assets::AssetCache::new(config.assets_dir.clone()),
+    /// A runtime for `config`, or why the config can't work, such as an
+    /// extra root certificate that isn't valid PEM. Checked up front, so
+    /// that a machine that can't run jobs doesn't bid for them.
+    pub fn new(config: RuntimeConfig) -> Result<Self, ConfigError> {
+        if !uv::is_executable(&config.uv) {
+            return Err(ConfigError::Uv(config.uv));
+        }
+        let http = http::Http::new(&config.extra_root_certificates).map_err(ConfigError::Https)?;
+        Ok(Self {
+            assets: assets::AssetCache::new(config.assets_dir.clone(), config.max_download_bytes),
+            environments: environments::Environments::new(config.environments_dir.clone()),
             http,
             preparing: locks::KeyedLocks::default(),
             config,
-        }
-    }
-
-    /// A runtime for `config`, or why it can't work, such as an extra root
-    /// certificate that isn't valid PEM.
-    pub fn try_new(config: RuntimeConfig) -> Result<Self, ConfigError> {
-        let runtime = Self::new(config);
-        match &runtime.http {
-            Ok(_) => Ok(runtime),
-            Err(error) => Err(error.clone()),
-        }
+        })
     }
 
     pub fn config(&self) -> &RuntimeConfig {
@@ -276,11 +296,28 @@ impl Runtime {
     /// Attempts whose supervising process is still alive, including this
     /// one's, are left alone, so calling it while attempts run is safe. It
     /// also removes asset downloads that were abandoned mid-way, going by
-    /// files nothing has written to for an hour.
+    /// files nothing has written to for an hour, and the environments of
+    /// bundles no longer stored. What it can't clean up is logged and left
+    /// for next time; it fails only if it can't look at all.
     pub fn reap_orphans(&self) -> std::io::Result<usize> {
-        let reaped = orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs)?;
-        self.assets.remove_abandoned(Duration::from_secs(60 * 60))?;
-        Ok(reaped)
+        // Each cleans up what it can, whatever the others run into.
+        let reaped = orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs);
+        let abandoned = self.assets.remove_abandoned(Duration::from_secs(60 * 60));
+        let pruned = self.environments.prune(&self.config.bundles);
+        if let Ok(pruned @ 1..) = pruned {
+            tracing::info!("removed the environments of {pruned} bundles no longer stored");
+        }
+        abandoned?;
+        pruned?;
+        reaped
+    }
+
+    /// `policy`, widened to `http` anywhere if the owner allowed that.
+    pub(crate) fn url_policy(&self, policy: UrlPolicy) -> UrlPolicy {
+        UrlPolicy {
+            any_http: policy.any_http || self.config.allow_insecure_http,
+            ..policy
+        }
     }
 
     /// How this runtime runs uv.
@@ -288,19 +325,13 @@ impl Runtime {
         Uv::new(&self.config.uv).with_env(self.config.extra_env.iter().cloned())
     }
 
-    fn http(&self) -> Result<&http::Http, JobError> {
-        self.http
-            .as_ref()
-            .map_err(|error| JobError::new(ErrorCode::Internal, error.to_string()))
-    }
-
     /// Stores `bundle`, creates its environment and fetches its assets.
-    /// Returns the stored bundle's directory.
+    /// Returns the stored bundle's script, ready to run.
     async fn prepare_bundle(
         &self,
         bundle: &Bundle,
         events: Option<&EventSink>,
-    ) -> Result<PathBuf, JobError> {
+    ) -> Result<uv::Script, JobError> {
         let _preparing = self.preparing.lock(&bundle.hash()).await;
         let dir = self.config.bundles.put(bundle).map_err(|e| {
             JobError::new(
@@ -310,19 +341,23 @@ impl Runtime {
         })?;
         let manifest = bundle.manifest();
         let fetch_assets = async {
-            if manifest.assets.is_empty() {
-                return Ok(());
-            }
-            let http = self.http()?;
+            // Assets come from the approved manifest, over https.
+            let policy = self.url_policy(UrlPolicy::HTTPS_ONLY);
             for (name, asset) in &manifest.assets {
-                self.assets.fetch(http, name, asset, events).await?;
+                self.assets
+                    .fetch(&self.http, policy, name, asset, events)
+                    .await?;
             }
             Ok(())
         };
-        let (uv, script) = (self.uv(), dir.join(moil_bundle::SCRIPT));
-        let sync = uv::sync(&uv, &script, self.config.echo_stderr);
+        let environment = self.environments.path(&bundle.hash());
+        let script = uv::Script::new(bundle, &dir, environment);
+        let uv = self.uv();
+        let sync = self
+            .environments
+            .sync(&uv, &script, self.config.echo_stderr);
         tokio::try_join!(sync, fetch_assets)?;
-        Ok(dir)
+        Ok(script)
     }
 }
 

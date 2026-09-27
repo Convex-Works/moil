@@ -31,7 +31,7 @@ async fn supervise_until_killed() {
     let (Some(home), Ok(steps)) = (std::env::var_os(HOME_VAR), std::env::var(STEPS_VAR)) else {
         return;
     };
-    let runtime = Runtime::try_new(config(Path::new(&home))).unwrap();
+    let runtime = Runtime::new(config(Path::new(&home))).unwrap();
     let job = Job {
         id: JobId::new("crashing").unwrap(),
         attempt: 1,
@@ -96,7 +96,7 @@ async fn a_crashed_runs_script_is_killed_and_its_directory_removed() {
     let home = tempfile::tempdir().unwrap();
     let (uv, script, stubborn) = crash_after(home.path(), json!([{"spawn": true}, {"sleep": 600}]));
     assert!(process_exists(uv) && process_exists(script) && process_exists(stubborn));
-    let runtime = Runtime::new(config(home.path()));
+    let runtime = Runtime::new(config(home.path())).unwrap();
     assert_eq!(work_dirs(&runtime.config().jobs_dir), ["crashing.1"]);
 
     assert_eq!(runtime.reap_orphans().unwrap(), 1);
@@ -124,7 +124,7 @@ async fn leftovers_are_killed_after_the_script_itself_has_exited() {
     assert!(gone(script).await && gone(uv).await);
     assert!(process_exists(stubborn));
 
-    let runtime = Runtime::new(config(home.path()));
+    let runtime = Runtime::new(config(home.path())).unwrap();
     assert_eq!(runtime.reap_orphans().unwrap(), 1);
 
     assert!(gone(stubborn).await, "the leftover grandchild survived");
@@ -137,7 +137,7 @@ async fn kept_working_directories_are_kept_by_reaping_too() {
     let (_, script, _) = crash_after(home.path(), json!([{"spawn": true}, {"sleep": 600}]));
     let mut config = config(home.path());
     config.keep_work_dirs = true;
-    let runtime = Runtime::new(config);
+    let runtime = Runtime::new(config).unwrap();
 
     assert_eq!(runtime.reap_orphans().unwrap(), 1);
 
