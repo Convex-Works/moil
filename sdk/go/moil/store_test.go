@@ -2,8 +2,10 @@ package moil_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -127,5 +129,79 @@ func TestOnlyTheLatestReportWaitsForTheStore(t *testing.T) {
 	defer store.mu.Unlock()
 	if store.saves > 3 {
 		t.Errorf("the Store saved %d reports of 402; only the latest should wait", store.saves)
+	}
+}
+
+// A FileStore reads files in the format it has always written, which is
+// its own: the public types don't decide it.
+func TestFileStoreFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "machines.json")
+	saved := `{
+  "version": 1,
+  "machines": [
+    {
+      "id": "m_1",
+      "owner": "alice",
+      "token_hash": "` + strings.Repeat("ab", 32) + `",
+      "paired_at": "2026-09-26T10:00:00Z",
+      "report": {
+        "name": "Ada's desktop", "os": "linux", "arch": "x86_64", "app_version": "0.1.0",
+        "cpus": 16, "memory_bytes": 68719476736,
+        "gpus": [{"name": "RTX 4090", "memory_bytes": 25769803776}],
+        "approved": ["` + strings.Repeat("a", 64) + `"],
+        "last_seen": "2026-09-26T11:00:00Z"
+      }
+    }
+  ]
+}
+`
+	if err := os.WriteFile(path, []byte(saved), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := moil.NewFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Machine(context.Background(), "m_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := got.Report
+	if got.Owner != "alice" || got.PairedAt.Hour() != 10 || r.Name != "Ada's desktop" || r.CPUs != 16 ||
+		!slices.Equal(r.GPUs, []moil.GPU{{Name: "RTX 4090", MemoryBytes: 24 << 30}}) || len(r.Approved) != 1 || r.LastSeen.Hour() != 11 {
+		t.Fatalf("read %+v", got)
+	}
+	// Writing it back keeps the format.
+	if err := s.SaveReport(context.Background(), "m_1", r); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want, have any
+	if json.Unmarshal([]byte(saved), &want) != nil || json.Unmarshal(written, &have) != nil || !reflect.DeepEqual(want, have) {
+		t.Fatalf("rewrote the file as\n%s", written)
+	}
+}
+
+// A Machine marshals with one naming throughout, the Go field names, so a
+// service can hand it to its own frontend.
+func TestMachineMarshalsConsistently(t *testing.T) {
+	data, err := json.Marshal(moil.Machine{ID: "m_1", MachineReport: moil.MachineReport{Name: "desk", GPUs: []moil.GPU{{Name: "RTX"}}}, State: moil.Idle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"ID", "Owner", "PairedAt", "Name", "OS", "Arch", "AppVersion", "CPUs", "MemoryBytes", "GPUs", "Approved", "LastSeen", "State"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("%s is missing from %s", key, data)
+		}
+	}
+	if len(fields) != 13 {
+		t.Errorf("unexpected fields in %s", data)
 	}
 }
