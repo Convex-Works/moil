@@ -8,7 +8,8 @@
 //! and gets a `renew` when its running attempt has been quiet for a third
 //! of its lease. Deriving what to send from state, rather than sending as
 //! things happen, is what makes reconnecting and resuming (spec §7.5) fall
-//! out naturally.
+//! out naturally. Inputs that arrive together make one round, after which
+//! the owner gets one new [`Snapshot`], however many there were.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -97,6 +98,8 @@ impl fmt::Display for AttemptKey {
 const MIN_RENEW_INTERVAL: Duration = Duration::from_millis(50);
 /// ...and at least this often, however long.
 const MAX_RENEW_INTERVAL: Duration = Duration::from_secs(3600);
+/// The most inputs handled in one round, between two snapshots.
+const MAX_ROUND: usize = 256;
 /// How long the coordinator waits for a connection to close. The
 /// connection gives up on its own after [`connection::CLOSE_TIMEOUT`]; this
 /// only guards against a bug there.
@@ -349,6 +352,15 @@ impl Coordinator {
                 () = sleep_until(deliver_by) => {}
             }
             self.reconcile();
+            // What else has arrived meanwhile, such as a burst of progress
+            // from a chatty script, makes one round, and one snapshot.
+            for _ in 1..MAX_ROUND {
+                let Ok(input) = inputs.try_recv() else {
+                    break;
+                };
+                self.handle(input);
+                self.reconcile();
+            }
             self.publish();
             for reply in self.replies.drain(..) {
                 let _ = reply.send(());
@@ -785,7 +797,7 @@ impl Coordinator {
                         status.message.clone_from(message);
                     }
                     if let Some(message) = message {
-                        tracing::info!("{key}: {message}");
+                        tracing::debug!("{key}: {message}");
                     }
                 }
                 JobEvent::Log { .. } | JobEvent::Data { .. } => {}
