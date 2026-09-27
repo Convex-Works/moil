@@ -11,10 +11,15 @@ params: {"steps": [step, ...]}. Each step is an object with one of:
   {"raw": [byte, ...]}           write raw bytes to stdout
   {"stderr": "text", "times": n} write a line to stderr, n times
   {"write": "name", "text": "."} write out/<name>
+  {"fill": "name", "bytes": n}   write n bytes to out/<name>
+  {"symlink": "path", "to": "."} make a symbolic link at <work dir>/<path>,
+                                 replacing an empty directory there
+  {"fifo": "path"}               make a FIFO at <work dir>/<path>
   {"input": "name"}              send an input's contents as data
   {"asset": "name"}              send an asset's contents as data
   {"context": true}              send the job context as data
   {"environ": true}              send the environment as data
+  {"prefix": true}               send the environment's sys.prefix as data
   {"spawn": true}                start a grandchild that ignores SIGTERM,
                                  then send its pid, the script's and uv's
   {"on_sigterm": "message",      on SIGTERM, log the message, wait
@@ -56,6 +61,16 @@ def run(step, job):
     elif "write" in step:
         with open(os.path.join(job["output_dir"], step["write"]), "w") as f:
             f.write(step["text"])
+    elif "fill" in step:
+        with open(os.path.join(job["output_dir"], step["fill"]), "wb") as f:
+            f.write(b"\0" * step["bytes"])
+    elif "symlink" in step:
+        path = os.path.join(job["work_dir"], step["symlink"])
+        if os.path.isdir(path):
+            os.rmdir(path)
+        os.symlink(step["to"], path)
+    elif "fifo" in step:
+        os.mkfifo(os.path.join(job["work_dir"], step["fifo"]))
     elif "input" in step:
         with open(job["inputs"][step["input"]], "rb") as f:
             data({"input": f.read().decode()})
@@ -66,6 +81,8 @@ def run(step, job):
         data({"context": job})
     elif "environ" in step:
         data({"environ": dict(os.environ)})
+    elif "prefix" in step:
+        data({"prefix": sys.prefix})
     elif "spawn" in step:
         stubborn = (
             "import signal, time\n"

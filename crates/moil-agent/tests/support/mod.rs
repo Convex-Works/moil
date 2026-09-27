@@ -22,7 +22,8 @@ use axum::{Json, Router};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use moil_agent::{
-    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, PairedService, Snapshot,
+    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, PairedService,
+    SecretStore, Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::control::{BundleInfo, Hello, Resume, Welcome};
@@ -47,14 +48,67 @@ pub async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
+/// Waits until `condition` holds, checking every few milliseconds, for
+/// what the agent does without telling: files it writes.
+pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    within(what, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
 /// Timings that keep tests fast: reconnects in milliseconds.
 pub fn fast() -> AgentOptions {
     AgentOptions {
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(40),
-        receive_timeout: Duration::from_secs(5),
+        channel_timeout: Duration::from_secs(5),
         shutdown_grace: Duration::from_secs(5),
         ..AgentOptions::default()
+    }
+}
+
+/// Tokens in a file, read as slowly as a keychain that asks the owner
+/// first, once [`slow_down`](Self::slow_down) says so.
+#[derive(Debug)]
+pub struct SlowSecrets {
+    file: FileSecrets,
+    delay: Mutex<Duration>,
+}
+
+impl SlowSecrets {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            file: FileSecrets::new(path),
+            delay: Mutex::new(Duration::ZERO),
+        }
+    }
+
+    pub fn slow_down(&self, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+    }
+
+    fn wait(&self) {
+        std::thread::sleep(*self.delay.lock().unwrap());
+    }
+}
+
+impl SecretStore for SlowSecrets {
+    fn get(&self, key: &str) -> Result<Option<String>, moil_agent::Error> {
+        self.wait();
+        self.file.get(key)
+    }
+
+    fn set(&self, key: &str, secret: &str) -> Result<(), moil_agent::Error> {
+        self.wait();
+        self.file.set(key, secret)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), moil_agent::Error> {
+        self.wait();
+        self.file.delete(key)
     }
 }
 
@@ -201,6 +255,8 @@ struct Shared {
     listed: Mutex<Vec<BundleInfo>>,
     forgotten: Mutex<Vec<String>>,
     refuse_upgrades: Mutex<Option<StatusCode>>,
+    /// While true, `DELETE /v1/machine` doesn't answer.
+    hold_forgets: tokio::sync::watch::Sender<bool>,
     /// Open channels, by token, for closing them from the service's side.
     open: Mutex<Vec<(String, mpsc::UnboundedSender<Out>)>>,
     connections: mpsc::UnboundedSender<Conn>,
@@ -237,6 +293,7 @@ impl FakeService {
             listed: Mutex::default(),
             forgotten: Mutex::default(),
             refuse_upgrades: Mutex::default(),
+            hold_forgets: tokio::sync::watch::Sender::new(false),
             open: Mutex::default(),
             connections,
         });
@@ -312,6 +369,12 @@ impl FakeService {
     /// Tokens machines sent with `DELETE /v1/machine`.
     pub fn forgotten(&self) -> Vec<String> {
         self.shared.forgotten.lock().unwrap().clone()
+    }
+
+    /// Makes `DELETE /v1/machine` wait, as a slow service would, until
+    /// called again with `false`.
+    pub fn hold_forgets(&self, hold: bool) {
+        self.shared.hold_forgets.send_replace(hold);
     }
 
     /// Tokens the service currently accepts.
@@ -459,6 +522,7 @@ async fn bundle_handler(
 }
 
 async fn forget_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let _ = shared.hold_forgets.subscribe().wait_for(|held| !held).await;
     let Some(token) = shared.authorized(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "unauthorized");
     };
@@ -495,6 +559,9 @@ enum Out {
     Close(u16),
     /// Drop the connection without a close frame.
     Drop,
+    /// Stop or resume reading what the machine sends, as a stuck service
+    /// would. Writing goes on.
+    Read(bool),
 }
 
 async fn relay(socket: WebSocket, shared: Arc<Shared>, token: String) {
@@ -511,9 +578,10 @@ async fn relay(socket: WebSocket, shared: Arc<Shared>, token: String) {
         to_machine,
     });
     let (mut sink, mut stream) = socket.split();
+    let mut reading = true;
     loop {
         tokio::select! {
-            frame = stream.next() => match frame {
+            frame = stream.next(), if reading => match frame {
                 Some(Ok(Message::Text(text))) => {
                     let frame = match serde_json::from_str::<MachineMessage>(&text) {
                         Ok(MachineMessage::Unknown) => Frame::Invalid(format!("unknown type: {text}")),
@@ -545,6 +613,7 @@ async fn relay(socket: WebSocket, shared: Arc<Shared>, token: String) {
                     let _ = frames.send(Frame::Closed(Some(code)));
                     return;
                 }
+                Some(Out::Read(read)) => reading = read,
                 Some(Out::Drop) | None => return,
             },
         }
@@ -606,6 +675,17 @@ impl Conn {
 
     pub fn ping(&self) {
         let _ = self.to_machine.send(Out::Ping);
+    }
+
+    /// Stops reading what the machine sends, leaving it to pile up in the
+    /// network's buffers until the machine can't write any more. Sending
+    /// and pinging go on.
+    pub fn stop_reading(&self) {
+        let _ = self.to_machine.send(Out::Read(false));
+    }
+
+    pub fn resume_reading(&self) {
+        let _ = self.to_machine.send(Out::Read(true));
     }
 
     /// Closes the channel with a close code, as the service.

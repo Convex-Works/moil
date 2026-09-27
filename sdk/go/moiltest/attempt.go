@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -27,7 +29,9 @@ type Attempt struct {
 	Number     int
 	BundleHash string
 	Title      string
-	// Params is the job's params, as JSON.
+	// Params is the job's params, as the script would read them: the
+	// same JSON value the service submitted, re-encoded as the app does,
+	// so not necessarily the same bytes.
 	Params  json.RawMessage
 	Inputs  map[string]moil.Download
 	Outputs map[string]moil.Upload
@@ -66,7 +70,6 @@ func newAttempt(m *Machine, msg wire.Assign) *Attempt {
 		Number:     msg.Attempt,
 		BundleHash: msg.BundleHash,
 		Title:      msg.Title,
-		Params:     msg.Params,
 		Inputs:     make(map[string]moil.Download, len(msg.Inputs)),
 		Outputs:    make(map[string]moil.Upload, len(msg.Outputs)),
 		Lease:      time.Duration(msg.LeaseMS) * time.Millisecond,
@@ -89,7 +92,8 @@ func newAttempt(m *Machine, msg wire.Assign) *Attempt {
 func (a *Attempt) running() bool { return a.started && !a.finished && !a.abandoned }
 
 // Phase reports that the runtime entered a phase: "preparing",
-// "downloading", "running" or "uploading".
+// "downloading", "running" or "uploading", or another, as a newer machine
+// might.
 func (a *Attempt) Phase(phase string) {
 	a.m.t.Helper()
 	a.event(wire.JobEvent{Type: "phase", Phase: phase})
@@ -106,20 +110,42 @@ func (a *Attempt) Progress(fraction float64, message string) {
 	a.event(e)
 }
 
-// Log reports a log line at level "debug", "info", "warn" or "error".
+// Log reports a log line at level "debug", "info", "warn" or "error", or
+// another, as a newer machine might.
 func (a *Attempt) Log(level, message string) {
 	a.m.t.Helper()
 	a.event(wire.JobEvent{Type: "log", Level: level, Message: &message})
 }
 
-// Data sends service-specific JSON, as the script's data events do.
+// Data sends service-specific JSON, as the script's data events do. Like
+// the app, the machine re-encodes it, and sends a warning instead if the
+// payload is over 256 KiB, nested more than 64 levels deep, or holds a
+// number beyond the range of a double.
 func (a *Attempt) Data(payload any) {
 	a.m.t.Helper()
 	data, err := json.Marshal(payload)
 	if err != nil {
 		a.m.t.Fatal(err)
 	}
+	if data, err = forwardable(data); err != nil {
+		message := "ignored a data event: its payload " + err.Error()
+		a.event(wire.JobEvent{Type: "log", Level: "warn", Message: &message})
+		return
+	}
 	a.event(wire.JobEvent{Type: "data", Payload: data})
+}
+
+// forwardable returns a payload or meta as a machine forwards it, or why
+// it wouldn't, completing the sentence "the payload …".
+func forwardable(raw []byte) (json.RawMessage, error) {
+	data, err := reencode(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > wire.MaxPayloadBytes {
+		return nil, fmt.Errorf("is %d bytes, over the 256 KiB limit", len(data))
+	}
+	return data, nil
 }
 
 func (a *Attempt) event(e wire.JobEvent) {
@@ -159,7 +185,9 @@ func (a *Attempt) sendLocked(msg wire.Message) {
 }
 
 // Input downloads an input the way the runtime does, and returns its
-// bytes. It fails the test unless the download answers 2xx.
+// bytes. It fails the test unless the download answers 2xx, and if the
+// URL, or one it redirects to, is one machines refuse (see
+// WithInsecureHTTP).
 func (a *Attempt) Input(name string) []byte {
 	a.m.t.Helper()
 	in, ok := a.Inputs[name]
@@ -173,7 +201,7 @@ func (a *Attempt) Input(name string) []byte {
 	for k, v := range in.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := a.m.client.Do(req)
+	resp, err := a.transfer("input", name, req)
 	if err != nil {
 		a.m.t.Fatalf("moiltest: downloading input %q: %v", name, err)
 	}
@@ -187,7 +215,8 @@ func (a *Attempt) Input(name string) []byte {
 
 // Output uploads a declared output the way the runtime does: the bytes as
 // the body, with the declared method and headers. It fails the test unless
-// the upload answers 2xx. Succeed reports every uploaded output.
+// the upload answers 2xx, and if the URL is one machines refuse (see
+// WithInsecureHTTP). Succeed reports every uploaded output.
 func (a *Attempt) Output(name string, data []byte) {
 	a.m.t.Helper()
 	out, ok := a.Outputs[name]
@@ -205,7 +234,7 @@ func (a *Attempt) Output(name string, data []byte) {
 	for k, v := range out.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := a.m.client.Do(req)
+	resp, err := a.transfer("output", name, req)
 	if err != nil {
 		a.m.t.Fatalf("moiltest: uploading output %q: %v", name, err)
 	}
@@ -219,20 +248,58 @@ func (a *Attempt) Output(name string, data []byte) {
 	a.uploaded[name] = wire.FileInfo{SizeBytes: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
 }
 
+// transfer sends an input or output request as the runtime does, holding
+// its URL and every redirect to the machine's URL policy (spec §3). It
+// fails the test if the policy refuses a URL.
+func (a *Attempt) transfer(kind, name string, req *http.Request) (*http.Response, error) {
+	a.m.t.Helper()
+	policy := wire.ServicePolicy(a.m.baseURL, a.m.insecureHTTP)
+	if err := policy.Check(req.URL.String()); err != nil {
+		a.m.t.Fatalf("moiltest: a machine would refuse %s %q: the URL %v", kind, name, err)
+	}
+	var refused error
+	client := *a.m.client
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if err := policy.Check(req.URL.String()); err != nil {
+			refused = fmt.Errorf("it redirects to %s, which %w", req.URL.Redacted(), err)
+			return refused
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
+	if refused != nil {
+		a.m.t.Fatalf("moiltest: a machine would refuse %s %q: %v", kind, name, refused)
+	}
+	return resp, err
+}
+
 // Succeed ends the attempt successfully, with meta (nil for none) and
-// every output uploaded with Output.
+// every output uploaded with Output. Like the app, the machine re-encodes
+// meta; it refuses meta it couldn't forward, as Data does, and the
+// attempt fails with moil.CodeNoResult instead.
 func (a *Attempt) Succeed(meta any) {
 	a.m.t.Helper()
 	var raw json.RawMessage
+	var refused error
 	if meta != nil {
-		var err error
-		if raw, err = json.Marshal(meta); err != nil {
+		data, err := json.Marshal(meta)
+		if err != nil {
 			a.m.t.Fatal(err)
 		}
+		raw, refused = forwardable(data)
 	}
 	a.m.mu.Lock()
 	defer a.m.mu.Unlock()
 	a.mustRunLocked()
+	if refused != nil {
+		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
+			Code: string(moil.CodeNoResult), Message: "the script's result was refused: its meta " + refused.Error(),
+		}})
+		return
+	}
 	files := make(map[string]wire.FileInfo, len(a.uploaded))
 	for name, f := range a.uploaded {
 		files[name] = f

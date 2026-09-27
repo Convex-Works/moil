@@ -80,10 +80,14 @@ Error responses carry a JSON body `{"error": "<code>", "message": "..."}`
 (`message` is optional and for humans).
 
 Machines MUST use `https` base URLs, except for loopback hosts
-(`localhost`, `127.0.0.0/8`, `::1`), which MAY use `http`. The same rule
-applies to input and output URLs (§7.4). A machine owner MAY switch this
-check off for development; the app then says so wherever it shows the
-service.
+(`localhost`, `127.0.0.0/8`, `::1`), which MAY use `http`. Input and output
+URLs (§7.4) MUST use `https` too; they MAY use `http` to a loopback host
+only when the service's own base URL is loopback, as in local development,
+so that a remote service can't aim requests at services that listen only
+on the owner's machine. Redirects are held to the same rule at every hop.
+A machine owner MAY switch these checks off for development; the app then
+says so wherever it shows the service. Services SHOULD refuse, when a job
+is submitted, URLs that machines would refuse.
 
 ### 3.1 Info
 
@@ -133,6 +137,9 @@ POST /v1/pair
 - `name` is what the user calls the machine (at most 64 characters). `os`
   and `arch` use Rust's `std::env::consts` values (`macos`, `linux`,
   `windows`; `aarch64`, `x86_64`).
+- `service.name` is how the app names the service: 1–64 characters, with
+  no control characters. Machines show it with hidden characters revealed
+  (§5.5), since the service chooses it.
 - `user_code` is 8 characters from `BCDFGHJKLMNPQRSTVWXZ` with a hyphen in
   the middle. The service compares codes case-insensitively and ignores the
   hyphen.
@@ -183,6 +190,19 @@ A version 1 bundle is exactly these three files, all UTF-8 text:
 | `job.py.lock` | The lockfile `uv lock --script job.py` writes: every package at an exact version, with the hash of every artifact. |
 | `manifest.json` | Metadata and model assets (§5.3). |
 
+The lockfile must pin everything it can, because the owner approves what it
+names:
+
+- Every sdist and wheel it lists MUST carry a SHA-256 `hash`.
+- Every package MUST come from an `https` package index (`registry`), an
+  `https` URL (`url`), or a git repository over `https` pinned to a full
+  40-character commit (`git`). Path, directory and editable sources are
+  invalid: they name files on the author's machine.
+- A package the lockfile gives no wheel for is built from source on the
+  machine. Its build requirements are resolved when it's built rather than
+  pinned by the lockfile, so the approval screen marks it. Every other
+  package is installed only from a wheel (§8.1).
+
 ### 5.2 Bundle hash
 
 The bundle hash is the SHA-256 of the text produced by listing, for each
@@ -230,11 +250,24 @@ MUST NOT rely on a hash a service claims without recomputing it.
 | `name` | yes | Bundle name (§2). Versions of a bundle share a name. |
 | `version` | yes | Free-form version label, 1–32 characters. |
 | `description` | no | At most 500 characters. |
-| `assets` | no | Files the runtime downloads, verifies and hands to the script (§8.4), keyed by asset name. No name may be a directory of another (`a` and `a/b`). `url` MUST be `https`. `size_bytes` is optional. |
+| `assets` | no | Files the runtime downloads, verifies and hands to the script (§8.4), keyed by asset name. No name may be a directory of another (`a` and `a/b`). `url` follows the grammar below. `size_bytes` is optional. |
 | `resources` | no | Informational in v1, shown to the machine owner. `memory_bytes` is an integer; `gpu` is `none`, `optional` or `required`. |
 
+`version` and `description` contain no control characters (a
+`description` may contain line feeds) and no bidirectional formatting
+characters (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069).
+
+An asset `url` is `https://` host [`:` port] [path] [`?` query]. The host
+is a DNS name of ASCII letters, digits, hyphens and dots, or an IPv4
+address; the port is 1–65535; the path and query use only RFC 3986
+unreserved characters, percent-encodings, sub-delimiters, `:`, `@`, `/`
+and `?`. So there is no user info, fragment, whitespace or backslash. The
+grammar is deliberately narrower than what URL parsers accept, so that
+every implementation agrees on which manifests are valid.
+
 Manifests are strict: a manifest with unknown fields or duplicate keys, at
-any level, is invalid. The approval screen shows the manifest in full, but a
+any level, is invalid. So is one that isn't valid UTF-8, including `\u`
+escapes of unpaired surrogates. The approval screen shows the manifest in full, but a
 field the app doesn't understand could carry meaning the owner never sees explained,
 and a duplicate key could show the owner one value while a parser uses
 another.
@@ -269,7 +302,12 @@ The machine owner approves a bundle for one service at a time: approval is
 a (service, bundle hash) pair. Before approving, the app shows the
 service, the three files in full, the bundle hash, the command from §5.2,
 and a diff against the most recently approved bundle with the same name
-from the same service.
+from the same service. Everything the service or the bundle controls is
+shown with hidden characters revealed: control characters other than tab
+and line feed (including carriage returns and terminal escapes),
+bidirectional formatting characters, and invisible or default-ignorable
+code points, any of which could make code read differently from how it
+runs.
 
 On approval the machine stores the verified files locally and runs jobs
 only from that stored copy, re-checking the hash before each run. A
@@ -293,8 +331,9 @@ that hasn't sent one within its ping interval.
 ### 6.1 Liveness
 
 The service sends a WebSocket ping at least every 20 seconds. A machine
-that receives nothing (pings included) for 60 seconds MUST treat the
-channel as dead. The service treats a missed pong as a dead channel.
+that receives nothing (pings included) for 45 seconds MUST treat the
+channel as dead, and a machine whose writes stall for as long does the
+same. The service treats a missed pong as a dead channel.
 
 After a lost channel the machine reconnects with exponential backoff
 (1 second doubling to 60 seconds, with jitter), except as noted in §6.4.
@@ -442,8 +481,9 @@ app may display. The machine answers with `bid` or `decline` before
 - `outputs` maps the file names the script may produce to URLs the runtime
   uploads them to, with `method` `PUT` (the default) or `POST`.
 - `headers` are optional in both.
-- `timeout_ms` is optional; without it the attempt has no time limit. It
-  covers the whole attempt: preparation, transfers and the script.
+- `timeout_ms` is optional; without it the attempt has no time limit.
+  When present it is at least 1. It covers the whole attempt: preparation,
+  transfers and the script.
 
 **ack** acknowledges a `done`.
 
@@ -498,6 +538,10 @@ paused) or `not_approved`. Those two
 codes mean the attempt never started, so services SHOULD NOT count it
 toward their retry limit.
 
+If the machine can read an `assign`'s `job_id` and `attempt` but not the
+rest of it (for example `params` beyond the limits of §10), it sends a
+`done` with outcome `failed` and code `rejected`, which is not retryable.
+
 A machine runs at most one attempt at a time, across all services.
 
 ### 7.3 Leases
@@ -506,6 +550,10 @@ Each attempt has a lease of `lease_ms`. Every job-scoped message the
 service receives for the attempt (`event`, `renew`, `done`) renews it. A
 connected machine sends `renew` whenever `lease_ms / 3` passes without
 another message for the attempt, for as long as the attempt runs.
+
+Services SHOULD use a lease of at least 90 seconds (the Go SDK's default
+is 120), so that a machine can notice a silently dead channel (§6.1) and
+reconnect before the lease runs out.
 
 A lease keeps running while the machine is disconnected. If it runs out,
 the service fails the attempt with code `lease_expired`, which is
@@ -517,6 +565,10 @@ it `cancel`, so a hung attempt doesn't keep the machine busy.
 The runtime downloads inputs before starting the script and uploads
 outputs after it finishes (§8). Uploads send the file's bytes as the body,
 with `Content-Length` and the given headers; any `2xx` counts as success.
+Uploads don't follow redirects: an HTTP client following a `303` would
+resend the request as a `GET` without the file, so a `3xx` is a failure.
+Downloads follow redirects (§3). A machine MAY cap the size of downloads
+whose size it isn't told, to protect its disk.
 The machine sends no credentials of its own. Pre-signed URLs carry their
 own authorization.
 
@@ -544,7 +596,10 @@ attempt with code `lost`, which is retryable. Removing a machine fails its
 attempt the same way.
 
 A machine MAY bound what it keeps. If it had to drop events, it replays
-what it has and `seq` has a gap. It MUST keep `done`.
+what it has and `seq` has a gap. It MUST keep the `done` of an attempt that
+started. It MAY drop the `done` of an attempt it refused (§7.2); if that
+`done` is lost, the service fails the attempt as `lost` when the machine
+reconnects, or as `lease_expired` when its lease runs out.
 
 ### 7.6 Cancellation and interruption
 
@@ -572,11 +627,16 @@ prepares the bundle:
 1. It creates the environment with
    `uv sync --locked --script <bundle dir>/job.py`. `--locked` makes uv
    refuse a lockfile that doesn't match the script's inline metadata, so
-   the dependencies the owner read in `job.py` are the ones installed.
+   the dependencies the owner read in `job.py` are the ones installed. For
+   every package the lockfile has a wheel for, it adds
+   `--no-build-package <name>`, so uv never builds one from source instead,
+   for example on a platform the wheels don't cover.
 2. It downloads each asset that isn't cached yet and checks its SHA-256.
    Assets are cached by hash and shared between bundles.
 
-The runtime runs uv with its own configuration only (`UV_NO_CONFIG=1`) and
+The runtime chooses where each bundle's environment lives and removes it
+once the bundle is no longer stored. It runs uv with its own configuration
+only (`UV_NO_CONFIG=1`) and
 with uv-managed Python (`UV_MANAGED_PYTHON=1`), so the machine's own uv or
 Python setup doesn't change what runs. It also sets `UV_SYSTEM_CERTS=1`, so
 package downloads trust the same certificate authorities as the machine.
@@ -646,7 +706,10 @@ The script writes events to stdout as JSON objects, one per line:
 | `result` | `files` (output names, default `[]`), `meta` (any JSON, optional) | folded into `done` |
 | `error` | `message`, `retryable` (default `false`) | folded into `done` |
 
-The runtime adds one event type of its own, which scripts can't send:
+During the `preparing`, `downloading` and `uploading` phases the runtime
+MAY send `progress` events about its own transfers; the phase tells them
+apart from the script's. It adds one event type of its own, which scripts
+can't send:
 
 | Type | Fields |
 |---|---|
@@ -663,9 +726,10 @@ stray `print` or a chatty library can't break a job:
   describing the problem.
 - A second `result` or `error`, or a `result` after an `error`, is ignored
   with a warning: the first one counts.
-- A `data` event whose payload is over the limit (§10) is dropped with a
-  warning. A `result` whose `meta` is over the limit is refused, so the
-  attempt fails with `no_result` rather than succeeding without its meta.
+- A `data` event whose payload is over the size or depth limits (§10) is
+  dropped with a warning. A `result` whose `meta` is over them is refused,
+  so the attempt fails with `no_result` rather than succeeding without its
+  meta.
 - `message` fields are truncated to 64 KiB.
 
 stderr is not forwarded. The runtime keeps its tail for error reports
@@ -691,8 +755,9 @@ rule that applies:
 5. It exited with a nonzero status or was killed by a signal: `failed`,
    `exit`. (uv reports a script killed by signal N as exit status 128+N.)
 6. It sent no `result`: `failed`, `no_result`.
-7. `result.files` names a file that isn't a declared output or isn't in
-   `out/`: `failed`, `output_missing`.
+7. `result.files` names a file that isn't a declared output, or isn't a
+   regular file in `out/` (a symbolic link doesn't count): `failed`,
+   `output_missing`.
 8. Uploading an output failed: `failed`, `output_upload`.
 9. Otherwise: `succeeded`, with `meta` and each uploaded file's size and
    SHA-256.
@@ -729,11 +794,12 @@ A failed `done` carries `error`:
 | `no_result` | machine | Exited without a `result` | no |
 | `output_missing` | machine | `result.files` named an undeclared or absent file | no |
 | `timeout` | machine | Ran past `timeout_ms` | no |
-| `environment` | machine | `uv sync` failed | no |
-| `asset_download` | machine | An asset couldn't be downloaded | yes |
+| `environment` | machine | `uv sync` failed | yes, unless the machine can tell it's permanent, such as a lockfile that doesn't match the script |
+| `asset_download` | machine | An asset couldn't be downloaded | yes; no when it's larger than the machine accepts |
 | `asset_mismatch` | machine | An asset's hash didn't match the manifest | no |
-| `input_download` | machine | An input couldn't be downloaded | yes |
-| `output_upload` | machine | An output couldn't be uploaded | yes |
+| `input_download` | machine | An input couldn't be downloaded | yes; no when the URL policy (§3) refused it, or it's larger than the machine accepts |
+| `output_upload` | machine | An output couldn't be uploaded | yes; no when the URL policy (§3) refused it |
+| `rejected` | machine | The assignment couldn't be read (§7.2); never started | no |
 | `interrupted` | machine | Stopped by the owner, or the app quit | yes |
 | `busy` | machine | Assigned while not idle; never started | yes |
 | `not_approved` | machine | Bundle not approved or not stored; never started | yes |
@@ -749,6 +815,10 @@ A failed `done` carries `error`:
 | Script stdout line | 1 MiB; longer lines are dropped with a warning |
 | `data.payload`, `result.meta` | 256 KiB each when serialized |
 | Event `message` fields | 64 KiB |
+| Arbitrary JSON (`params`, `payload`, `meta`) | nested at most 64 levels deep, counting containers (a scalar is 0, `[[1]]` is 2); numbers within an IEEE 754 double (§2) |
+| `service.name`; `hello`'s machine `name`, `os`, `arch`, `app_version` | 64 characters each |
+| `hello.machine.gpus` | 64 entries |
+| `hello.approved`, `approved.hashes` | 1024 hashes; a machine with more approvals for one service announces the most recent |
 | Bundle, all three files | 8 MiB |
 | `stderr_tail` | 8 KiB |
 | Pending pairings per service | an SDK-chosen bound, to resist abuse |
@@ -760,6 +830,10 @@ The protocol version is the `v1` in every path and the `protocol` field of
 optional fields, new event types that fall back to warnings) don't change
 it. Anything else gets a new version, served under a new path prefix so
 that a service can support two versions side by side.
+
+Receivers SHOULD accept unknown values of enumerations that are only
+displayed (`phase`, log `level`) and show them as they are; an unknown
+value of any other enumeration is a protocol error.
 
 The manifest format (`moil` field) and the script contract (`v` field)
 are versioned separately, for the same reason.

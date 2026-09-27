@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 )
 
 // A MemoryStore is a Store that keeps machines in memory, for tests and
@@ -128,9 +129,60 @@ type FileStore struct {
 	path string
 }
 
+// The FileStore's file, version 1. Its encoding is its own, so that the
+// public types can change without breaking stored files.
 type fileStoreData struct {
-	Version  int             `json:"version"`
-	Machines []MachineRecord `json:"machines"`
+	Version  int           `json:"version"`
+	Machines []fileMachine `json:"machines"`
+}
+
+type fileMachine struct {
+	ID        string     `json:"id"`
+	Owner     string     `json:"owner"`
+	TokenHash string     `json:"token_hash"`
+	PairedAt  time.Time  `json:"paired_at"`
+	Report    fileReport `json:"report"`
+}
+
+type fileReport struct {
+	Name        string    `json:"name"`
+	OS          string    `json:"os"`
+	Arch        string    `json:"arch"`
+	AppVersion  string    `json:"app_version"`
+	CPUs        int       `json:"cpus,omitempty"`
+	MemoryBytes int64     `json:"memory_bytes,omitempty"`
+	GPUs        []fileGPU `json:"gpus,omitempty"`
+	Approved    []string  `json:"approved,omitempty"`
+	LastSeen    time.Time `json:"last_seen,omitzero"`
+}
+
+type fileGPU struct {
+	Name        string `json:"name"`
+	MemoryBytes int64  `json:"memory_bytes,omitempty"`
+}
+
+func toFile(m MachineRecord) fileMachine {
+	r := m.Report
+	f := fileMachine{ID: m.ID, Owner: m.Owner, TokenHash: m.TokenHash, PairedAt: m.PairedAt, Report: fileReport{
+		Name: r.Name, OS: r.OS, Arch: r.Arch, AppVersion: r.AppVersion, CPUs: r.CPUs, MemoryBytes: r.MemoryBytes,
+		Approved: r.Approved, LastSeen: r.LastSeen,
+	}}
+	for _, g := range r.GPUs {
+		f.Report.GPUs = append(f.Report.GPUs, fileGPU(g))
+	}
+	return f
+}
+
+func (f fileMachine) record() MachineRecord {
+	r := f.Report
+	m := MachineRecord{ID: f.ID, Owner: f.Owner, TokenHash: f.TokenHash, PairedAt: f.PairedAt, Report: MachineReport{
+		Name: r.Name, OS: r.OS, Arch: r.Arch, AppVersion: r.AppVersion, CPUs: r.CPUs, MemoryBytes: r.MemoryBytes,
+		Approved: r.Approved, LastSeen: r.LastSeen,
+	}}
+	for _, g := range r.GPUs {
+		m.Report.GPUs = append(m.Report.GPUs, GPU(g))
+	}
+	return m
 }
 
 // NewFileStore opens the store saved at path, or starts an empty one if the
@@ -154,16 +206,15 @@ func NewFileStore(path string) (*FileStore, error) {
 		return nil, fmt.Errorf("moil: the machine store %s has version %d; this SDK reads version 1", path, file.Version)
 	}
 	for _, m := range file.Machines {
-		s.machines[m.ID] = m
+		s.machines[m.ID] = m.record()
 	}
 	return s, nil
 }
 
 func (s *FileStore) write(machines map[string]MachineRecord) error {
-	file := fileStoreData{Version: 1, Machines: slices.Collect(maps.Values(machines))}
-	slices.SortFunc(file.Machines, func(a, b MachineRecord) int { return cmp.Compare(a.ID, b.ID) })
-	if file.Machines == nil {
-		file.Machines = []MachineRecord{}
+	file := fileStoreData{Version: 1, Machines: []fileMachine{}}
+	for _, id := range slices.Sorted(maps.Keys(machines)) {
+		file.Machines = append(file.Machines, toFile(machines[id]))
 	}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {

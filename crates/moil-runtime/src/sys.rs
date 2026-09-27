@@ -1,7 +1,13 @@
 //! The few Unix calls process supervision needs that std and tokio don't
 //! offer.
 
+use std::ffi::CString;
+use std::fs::File;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 pub(crate) use libc::{SIGKILL, SIGTERM};
 
@@ -44,6 +50,25 @@ pub(crate) fn wait_exited(pid: i32) -> io::Result<()> {
             return Err(error);
         }
     }
+}
+
+/// Opens the file `name` in the directory `dir` for reading without
+/// following a symbolic link on the way: fails if `dir` or `name` is one.
+/// Never blocks, even on a FIFO; check what it opened.
+pub(crate) fn open_in(dir: &Path, name: &str) -> io::Result<File> {
+    let dir = File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let name = CString::new(std::ffi::OsStr::new(name).as_bytes())?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `name` is a valid C string and `dir` an open directory.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// When process `pid` started, as a token that differs between two

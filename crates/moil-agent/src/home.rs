@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::fs::{PUBLIC, read_json, with_path, write_json};
 use crate::{Error, ServiceId};
 
-/// A machine's state directory:
+/// A machine's state directory, readable only by the owner: it holds job
+/// inputs and outputs, which other users of the computer mustn't read.
 ///
 /// ```text
 /// <root>/
@@ -20,6 +21,7 @@ use crate::{Error, ServiceId};
 ///   bundles/<hash>/      approved bundles (BundleStore)
 ///   jobs/                attempts' working directories
 ///   cache/assets/        assets, by hash
+///   cache/environments/  each stored bundle's Python environment
 ///   secrets.json         tokens, when they aren't in the keychain
 ///   agent.lock           held by the process that has the home open
 /// ```
@@ -116,8 +118,10 @@ impl Home {
     }
 
     /// Creates the home's directories and takes its lock, which lasts as
-    /// long as the returned file stays open.
+    /// long as the returned file stays open. A home others can read, such
+    /// as one an older moil created, is made private.
     pub(crate) fn lock(&self) -> Result<File, Error> {
+        create_private(&self.root).map_err(|e| with_path(e, &self.root))?;
         fs::create_dir_all(self.services_dir()).map_err(|e| with_path(e, &self.root))?;
         let path = self.lock_file();
         let file = File::options()
@@ -152,4 +156,24 @@ impl Home {
     pub(crate) fn save_settings(&self, settings: &Settings) -> Result<(), Error> {
         write_json(&self.settings_file(), settings, PUBLIC)
     }
+}
+
+/// Creates `dir`, and any missing parents, readable only by the owner, and
+/// takes other users' access to it if it already exists.
+fn create_private(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let mode = fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode & !0o077))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)
 }

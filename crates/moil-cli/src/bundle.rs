@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use moil_bundle::{Bundle, PackageSource};
-use moil_proto::{FileName, JobEvent, JobId, LogLevel, Outcome, Phase};
+use moil_proto::{FileName, JobEvent, JobId, LogLevel, Outcome, Phase, UrlPolicy};
 use moil_runtime::{Executor, Job, Runtime, RuntimeConfig, StopReason, Uv, stop_signal};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
@@ -44,8 +44,9 @@ pub enum Command {
     ///
     /// Inputs are served, and outputs received, by a local HTTP server, so
     /// they move as they would for a real job. Without --home the job runs
-    /// in a temporary home, but bundles and assets stay cached (in
-    /// $XDG_CACHE_HOME/moil, ~/Library/Caches/moil on macOS) between runs.
+    /// in a temporary home, but bundles, their environments and assets stay
+    /// cached (in $XDG_CACHE_HOME/moil, ~/Library/Caches/moil on macOS)
+    /// between runs.
     Run(RunArgs),
 }
 
@@ -131,8 +132,13 @@ async fn check(dir: &Path) -> anyhow::Result<()> {
         println!("packages");
         for package in bundle.packages() {
             let version = package.version.as_deref().unwrap_or("(no version)");
+            let built = if package.builds_from_source {
+                "  (no wheel: built from source on each machine, with build tools it doesn't pin)"
+            } else {
+                ""
+            };
             println!(
-                "  {} {version}  {}",
+                "  {} {version}  {}{built}",
                 package.name,
                 describe_source(&package.source)
             );
@@ -159,15 +165,6 @@ async fn check(dir: &Path) -> anyhow::Result<()> {
     }
 
     let mut problems = Vec::new();
-    for package in bundle.packages() {
-        if let PackageSource::Path(path) = &package.source {
-            problems.push(format!(
-                "{} comes from {path}, a path on this computer that other machines won't have; \
-                 depend on a published version or a git repository instead",
-                package.name
-            ));
-        }
-    }
     if let Err(problem) = check_lockfile(dir).await? {
         problems.push(problem);
     }
@@ -192,8 +189,6 @@ fn describe_source(source: &PackageSource) -> String {
         PackageSource::Registry(index) => format!("from {index}"),
         PackageSource::Git(url) => format!("from git {url}"),
         PackageSource::Url(url) => format!("from {url}"),
-        PackageSource::Path(path) => format!("from the local path {path}"),
-        PackageSource::Other(other) => format!("from {other}"),
     }
 }
 
@@ -280,7 +275,30 @@ async fn init(dir: &Path, name: Option<String>) -> anyhow::Result<()> {
             );
         }
     }
+    let created = !dir.exists();
     std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
+    let bundle = match scaffold(dir, &name).await {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            // Leave nothing half-made that would stop a second try.
+            for file in moil_bundle::FILE_NAMES {
+                let _ = std::fs::remove_file(dir.join(file));
+            }
+            if created {
+                let _ = std::fs::remove_dir(dir);
+            }
+            return Err(error);
+        }
+    };
+    println!("created bundle {name} in {}", dir.display());
+    println!("hash {}", bundle.hash());
+    println!();
+    println!("next: edit job.py, then `moil check` and `moil run` in that directory");
+    Ok(())
+}
+
+/// Writes a bundle named `name` into `dir`, which holds none of its files.
+async fn scaffold(dir: &Path, name: &str) -> anyhow::Result<Bundle> {
     // Written out rather than serialized, to keep the fields in the order
     // people read them. The name has been checked to need no escaping.
     let manifest = format!(
@@ -294,7 +312,7 @@ async fn init(dir: &Path, name: Option<String>) -> anyhow::Result<()> {
     );
     std::fs::write(
         dir.join(moil_bundle::SCRIPT),
-        TEMPLATE.replace("__NAME__", &name),
+        TEMPLATE.replace("__NAME__", name),
     )?;
     std::fs::write(dir.join(moil_bundle::MANIFEST), manifest)?;
     let output = uv()?
@@ -310,12 +328,7 @@ async fn init(dir: &Path, name: Option<String>) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let bundle = load(dir)?;
-    println!("created bundle {name} in {}", dir.display());
-    println!("hash {}", bundle.hash());
-    println!();
-    println!("next: edit job.py, then `moil check` and `moil run` in that directory");
-    Ok(())
+    load(dir)
 }
 
 /// A bundle name made from the name of `dir`.
@@ -358,9 +371,10 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("couldn't create {}", args.out_dir.display()))?;
 
-    // A throwaway home unless one is given. Bundles and assets are stored by
-    // hash and verified, so they can be kept between runs all the same: a
-    // bundle's environment is then reused, and big assets fetched once.
+    // A throwaway home unless one is given. Bundles, environments and assets
+    // are kept by hash, and bundles and assets verified, so they can be kept
+    // between runs all the same: a bundle's environment is then reused, and
+    // big assets fetched once.
     let mut temporary = None;
     let home = match &globals.home {
         Some(home) => home.clone(),
@@ -375,11 +389,12 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     {
         config.bundles = moil_bundle::BundleStore::new(cache.join("bundles"));
         config.assets_dir = cache.join("assets");
+        config.environments_dir = cache.join("environments");
     }
     config.extra_env.extend(uv_cache_env());
     config.keep_work_dirs = args.keep;
     config.echo_stderr = true;
-    let runtime = Runtime::try_new(config)?;
+    let runtime = Runtime::new(config)?;
     if globals.home.is_some() {
         runtime.reap_orphans()?;
     }
@@ -401,6 +416,11 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
             .map(|name| (name.clone(), storage.upload(name)))
             .collect(),
         timeout: args.timeout,
+        // Inputs and outputs move through this command's own loopback server.
+        url_policy: UrlPolicy {
+            loopback_http: true,
+            any_http: false,
+        },
     };
     let work_dir = runtime.work_dir(&job.id, job.attempt);
 

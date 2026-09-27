@@ -9,6 +9,9 @@ pub enum Error {
     UnknownService(String),
     #[error("{query:?} matches more than one service: {matches}")]
     AmbiguousService { query: String, matches: String },
+    /// An address that can't be a service's, as a sentence for the owner.
+    #[error("{0}")]
+    InvalidAddress(String),
     #[error("{url} isn't a moil service: {reason}")]
     NotAService { url: String, reason: String },
     #[error("{0} must use https; only loopback addresses may use http")]

@@ -10,6 +10,10 @@
   </table>
   <p>Check that the app on that machine shows this code:</p>
   <div class="code">{{.Pairing.Code}}</div>
+  <p class="warning"><b>Only confirm a code your own moil app shows you.</b>
+    If someone sent you this link, or you didn't just add this service in
+    the moil app, deny it: the machine you confirm runs your jobs and sees
+    their data.</p>
   <form method="post" action="/pair" class="row">
     <input type="hidden" name="code" value="{{.Pairing.Code}}">
     <button class="primary" name="action" value="confirm">Confirm</button>

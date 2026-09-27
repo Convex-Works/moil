@@ -5,7 +5,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use moil_proto::{ErrorCode, FileInfo, JobEvent, LogLevel, Outcome, Phase, UploadMethod};
+use moil_proto::{
+    ErrorCode, FileInfo, JobEvent, LogLevel, Outcome, Phase, UploadMethod, UrlPolicy,
+};
 use moil_runtime::{Executor, StopReason};
 use serde_json::json;
 
@@ -260,11 +262,53 @@ mod outcome {
         let run = h.run(job).await;
         let error = run.error();
         assert_eq!(error.code, ErrorCode::OutputMissing);
-        assert!(error.message.contains("out/b.txt"), "{}", error.message);
+        assert!(
+            error.message.contains("the script didn't write out/b.txt"),
+            "{}",
+            error.message
+        );
         assert!(
             h.server.received("/out/a.txt").is_empty(),
             "nothing is uploaded"
         );
+    }
+
+    #[tokio::test]
+    async fn outputs_must_be_regular_files_in_out() {
+        // As a script extracting an archive from an input could be tricked
+        // into leaving them.
+        let h = Harness::new().await;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let secret = elsewhere.path().join("result.txt");
+        std::fs::write(&secret, "the owner's secret").unwrap();
+        let secret = secret.to_str().unwrap();
+        let dir = elsewhere.path().to_str().unwrap();
+
+        for (make, why) in [
+            (
+                json!({"symlink": "out/result.txt", "to": secret}),
+                "out/result.txt is a symbolic link",
+            ),
+            (
+                json!({"symlink": "out", "to": dir}),
+                "out/ is a symbolic link",
+            ),
+            (
+                json!({"fifo": "out/result.txt"}),
+                "out/result.txt isn't a regular file",
+            ),
+        ] {
+            let mut job = h.job(
+                &probe(),
+                steps(json!([make, {"emit": {"type": "result", "files": ["result.txt"]}}])),
+            );
+            job.outputs.extend([output(&h.server, "result.txt")]);
+            let run = h.run(job).await;
+            let error = run.error();
+            assert_eq!(error.code, ErrorCode::OutputMissing, "{make}");
+            assert!(error.message.contains(why), "{make}: {}", error.message);
+        }
+        assert!(h.server.received("/out/result.txt").is_empty());
     }
 
     #[tokio::test]
@@ -324,25 +368,29 @@ mod outcome {
 
     #[tokio::test]
     async fn a_cancel_during_the_grace_period_wins_over_the_timeout() {
-        // A grace period long enough for the script to clean up in, however
-        // busy the machine running the tests.
-        let h = Harness::with(|c| c.kill_grace = Duration::from_secs(60)).await;
+        let h = Harness::new().await;
+        let limit = Duration::from_secs(3600);
         let mut job = h.job(
             &probe(),
             steps(json!([
-                {"on_sigterm": "terminating", "linger": 1},
-                {"emit": {"type": "result"}},
-                {"sleep": 60},
+                {"on_sigterm": "terminating", "linger": 3600},
+                {"emit": {"type": "data", "payload": {"ready": true}}},
+                {"sleep": 3600},
             ])),
         );
-        // Long enough for the script to be listening for SIGTERM by then,
-        // however busy the machine running the tests.
-        job.timeout = Some(Duration::from_secs(3));
+        job.timeout = Some(limit);
         let mut running = h.start(job);
-        // The time limit passed and the script is still cleaning up when
-        // the service cancels: rule 1 beats rule 3.
+        running.data("ready").await;
+        // The time limit passes only now, with the script listening for
+        // SIGTERM. The paused clock moves only when told to: waiting for
+        // the script keeps it from skipping ahead.
+        tokio::time::pause();
+        tokio::time::advance(limit).await;
         running.log("terminating").await;
+        // The script is still cleaning up when the service cancels: rule 1
+        // beats rule 3. Then its grace period, half a second here, runs out.
         running.stop(StopReason::Cancelled);
+        tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(running.finish().await.outcome, Outcome::Cancelled);
     }
 }
@@ -678,6 +726,95 @@ mod stdout {
         assert_eq!(run.logs(LogLevel::Warn).len(), 2);
     }
 
+    /// `[[…[1]…]]`, `depth` arrays deep.
+    fn nested(depth: usize) -> serde_json::Value {
+        (0..depth).fold(json!(1), |inner, _| json!([inner]))
+    }
+
+    #[tokio::test]
+    async fn payloads_nested_more_than_64_levels_deep_are_refused() {
+        let h = Harness::new().await;
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "data", "payload": nested(64)}},
+                    {"emit": {"type": "data", "payload": nested(65)}},
+                    {"emit": {"type": "result", "meta": nested(65)}},
+                ])),
+            ))
+            .await;
+        let data: Vec<_> = run
+            .script_events()
+            .into_iter()
+            .filter(|e| matches!(e, JobEvent::Data { .. }))
+            .collect();
+        assert_eq!(
+            data,
+            [JobEvent::Data {
+                payload: nested(64)
+            }]
+        );
+        assert_eq!(
+            run.logs(LogLevel::Warn),
+            [
+                "ignored stdout line 2: the data payload is nested more than 64 levels deep",
+                "ignored stdout line 3: the result's meta is nested more than 64 levels deep",
+            ]
+        );
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::NoResult);
+        assert!(
+            error.message.contains("nested more than 64"),
+            "{}",
+            error.message
+        );
+
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([{"emit": {"type": "result", "meta": nested(64)}}])),
+            ))
+            .await;
+        assert_eq!(run.result().meta, Some(nested(64)));
+    }
+
+    #[tokio::test]
+    async fn a_refused_result_is_still_the_first() {
+        let h = Harness::new().await;
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "result", "meta": "z".repeat(300 << 10)}},
+                    {"emit": {"type": "result", "meta": "small"}},
+                ])),
+            ))
+            .await;
+        assert_eq!(run.error().code, ErrorCode::NoResult);
+        assert!(
+            run.logs(LogLevel::Warn)
+                .contains(&"ignored stdout line 2: a second result".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_quotes_a_long_name_briefly() {
+        // A `done` over the 1 MiB limit of a control message would be
+        // refused every time it's sent.
+        let h = Harness::new().await;
+        let name = "n".repeat(900_000);
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([{"emit": {"type": "result", "files": [name]}}])),
+            ))
+            .await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::OutputMissing);
+        assert!(error.message.len() < 1000, "{} bytes", error.message.len());
+    }
+
     #[tokio::test]
     async fn a_result_after_an_error_is_ignored() {
         let h = Harness::new().await;
@@ -777,6 +914,101 @@ mod transfers {
     }
 
     #[tokio::test]
+    async fn an_input_larger_than_the_machine_accepts_is_refused() {
+        let h = Harness::with(|c| c.max_download_bytes = 1000).await;
+        let big = vec![b'x'; 2000];
+        h.server.serve("/in/said.bin", big.clone());
+        h.server.reply("/in/unsaid.bin", Reply::Chunked(big));
+        for path in ["/in/said.bin", "/in/unsaid.bin"] {
+            let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+            job.inputs.insert(
+                "big.bin".parse().unwrap(),
+                moil_proto::Download {
+                    url: h.server.url(path),
+                    headers: Default::default(),
+                },
+            );
+            let run = h.run(job).await;
+            let error = run.error();
+            assert_eq!(error.code, ErrorCode::InputDownload, "{path}");
+            assert!(!error.retryable, "another machine would refuse it too");
+            assert_eq!(
+                error.message,
+                "couldn't download input big.bin: it is larger than the 1000 bytes this machine accepts"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inputs_and_outputs_report_how_far_they_got() {
+        let h = Harness::new().await;
+        let (down, up) = (Gate::default(), Gate::default());
+        h.server.reply(
+            "/in/big.in",
+            Reply::Gated {
+                body: vec![b'i'; 4 << 20],
+                at: 1 << 20,
+                gate: down.clone(),
+            },
+        );
+        h.server.reply(
+            "/out/big.out",
+            Reply::Receive {
+                at: 1 << 20,
+                gate: up.clone(),
+            },
+        );
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"fill": "big.out", "bytes": 32 << 20},
+                {"emit": {"type": "result", "files": ["big.out"]}},
+            ])),
+        );
+        job.inputs.insert(
+            "big.in".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/big.in"),
+                headers: Default::default(),
+            },
+        );
+        job.outputs.extend([output(&h.server, "big.out")]);
+        let mut running = h.start(job);
+
+        running.phase(Phase::Downloading).await;
+        loop {
+            let (fraction, message) = running.progress().await;
+            if fraction == Some(0.25) {
+                assert_eq!(message, "input big.in: 1 MiB of 4 MiB");
+                break;
+            }
+            assert!(fraction.is_some_and(|f| f < 0.25), "{fraction:?}");
+        }
+        down.open();
+
+        // The server stops reading the upload after a mebibyte.
+        running.phase(Phase::Uploading).await;
+        let (fraction, message) = running.progress().await;
+        assert!(fraction.is_some_and(|f| f > 0.0 && f < 1.0), "{fraction:?}");
+        assert!(
+            message.starts_with("output big.out: ") && message.ends_with(" of 32 MiB"),
+            "{message}"
+        );
+        up.open();
+
+        let run = running.finish().await;
+        assert_eq!(run.result().files["big.out"].size_bytes, 32 << 20);
+        assert_eq!(
+            run.progress().last(),
+            Some(&(Some(1.0), "output big.out: 32 MiB of 32 MiB".to_owned()))
+        );
+        assert!(
+            run.progress()
+                .contains(&(Some(1.0), "input big.in: 4 MiB of 4 MiB".to_owned()))
+        );
+    }
+
+    #[tokio::test]
     async fn inputs_come_over_https_with_their_headers() {
         let h = Harness::new().await;
         h.server.serve("/in/secret.txt", "classified");
@@ -818,6 +1050,7 @@ mod transfers {
         );
         let run = h.run(job).await;
         assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(!run.error().retryable, "no other attempt would do better");
         assert!(
             run.error().message.contains("only https is allowed"),
             "{}",
@@ -831,6 +1064,7 @@ mod transfers {
         job.outputs.insert(name, upload);
         let run = h.run(job).await;
         assert_eq!(run.error().code, ErrorCode::OutputUpload);
+        assert!(!run.error().retryable);
         assert!(run.phases().is_empty(), "the script didn't run");
 
         assert!(h.server.received("/in/a.txt").is_empty());
@@ -900,11 +1134,122 @@ mod transfers {
         );
         let run = h.run(job).await;
         assert_eq!(run.error().code, ErrorCode::InputDownload);
+        assert!(!run.error().retryable);
         assert!(
             run.error().message.contains("redirected"),
             "{}",
             run.error().message
         );
         assert_eq!(h.server.received("/in/real.txt").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_remote_services_job_cant_reach_this_machine_over_http() {
+        // A service that isn't on loopback aims a job's transfers at a
+        // service that listens only on the owner's machine.
+        let h = Harness::new().await;
+        let policy =
+            UrlPolicy::for_service(&"https://klisi.example.com/moil".parse().unwrap(), false);
+        h.server.serve("/local/secret", "the owner's");
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.url_policy = policy;
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/local/secret"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .contains("on this machine, for a service that isn't"),
+            "{}",
+            error.message
+        );
+
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.url_policy = policy;
+        let (name, mut upload) = output(&h.server, "b.txt");
+        upload.url = h.server.url("/local/admin");
+        job.outputs.insert(name, upload);
+        let error = h.run(job).await.error().clone();
+        assert_eq!(error.code, ErrorCode::OutputUpload);
+        assert!(!error.retryable);
+
+        // Nor through a redirect from a URL it may use.
+        h.server
+            .reply("/in/a.txt", Reply::Redirect(h.server.url("/local/secret")));
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.url_policy = policy;
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.https_url("/in/a.txt"),
+                headers: Default::default(),
+            },
+        );
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .contains("redirected to a URL that uses http to 127.0.0.1, on this machine"),
+            "{}",
+            error.message
+        );
+        assert_eq!(h.server.received("/in/a.txt").len(), 1);
+        assert!(h.server.received("/local/secret").is_empty());
+        assert!(h.server.received("/local/admin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_quoting_the_service_stays_under_the_message_limit() {
+        let h = Harness::new().await;
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/a.txt"),
+                headers: [("not a header ".repeat(70_000), "x".into())].into(),
+            },
+        );
+        let error = h.run(job).await.error().clone();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(
+            error.message.len() <= 64 << 10,
+            "{} bytes",
+            error.message.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_answered_with_a_redirect_fails() {
+        // Following it would turn the upload into a GET, which could
+        // succeed without uploading anything.
+        let h = Harness::new().await;
+        h.server.serve("/elsewhere", "fine");
+        h.server
+            .reply("/out/a.txt", Reply::SeeOther(h.server.url("/elsewhere")));
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"write": "a.txt", "text": "alpha"},
+                {"emit": {"type": "result", "files": ["a.txt"]}},
+            ])),
+        );
+        job.outputs.extend([output(&h.server, "a.txt")]);
+        let run = h.run(job).await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::OutputUpload);
+        assert!(error.message.contains("303"), "{}", error.message);
+        assert!(h.server.received("/elsewhere").is_empty());
     }
 }

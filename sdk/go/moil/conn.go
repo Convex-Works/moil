@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -18,7 +19,15 @@ type session struct {
 	conn      *websocket.Conn
 	out       *queue[outbound]
 	log       *slog.Logger
+	// abort stops the writer, which then closes the connection.
+	abort    context.CancelFunc
+	overflow sync.Once
 }
+
+// maxOutbound bounds the messages waiting to be sent to a machine. A
+// machine that lets more pile up isn't reading them, and is disconnected
+// rather than let the service hold them.
+const maxOutbound = 1024
 
 // outbound is a message to send, or, if closeCode is set, a request to
 // close the channel after the messages queued before it.
@@ -29,11 +38,22 @@ type outbound struct {
 }
 
 // send queues a message without waiting for the network.
-func (se *session) send(m wire.Message) { se.out.push(outbound{msg: m}) }
+func (se *session) send(m wire.Message) { se.push(outbound{msg: m}) }
 
 // close queues the close handshake after the messages already queued.
 func (se *session) close(code websocket.StatusCode, reason string) {
-	se.out.push(outbound{closeCode: code, reason: reason})
+	se.push(outbound{closeCode: code, reason: reason})
+}
+
+// push queues ob, or, if the machine lets too much pile up, disconnects
+// it. It never waits, so the scheduler can call it.
+func (se *session) push(ob outbound) {
+	if !se.out.push(ob) {
+		se.overflow.Do(func() {
+			se.log.Warn("moil: a machine isn't reading what the service sends; disconnecting it", "machine", se.machineID)
+			se.abort()
+		})
+	}
 }
 
 // handleConnect serves GET /v1/connect: it authenticates the machine,
@@ -57,7 +77,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept has answered the request
 	}
-	conn.SetReadLimit(maxMessageBytes)
+	conn.SetReadLimit(wire.MaxMessageBytes)
 	s.serveChannel(conn, rec)
 }
 
@@ -75,7 +95,9 @@ func (s *Server) serveChannel(conn *websocket.Conn, rec MachineRecord) {
 		return
 	}
 
-	sess := &session{machineID: rec.ID, conn: conn, out: newQueue[outbound](), log: s.log}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	sess := &session{machineID: rec.ID, conn: conn, out: newQueue[outbound](maxOutbound), log: s.log, abort: stop}
 	var regErr error
 	if err := s.call(func(sc *scheduler) { regErr = sc.register(sess, rec, hello) }); err != nil {
 		regErr = err
@@ -89,7 +111,6 @@ func (s *Server) serveChannel(conn *websocket.Conn, rec MachineRecord) {
 		return
 	}
 
-	ctx, stop := context.WithCancel(context.Background())
 	writerDone, pingerDone := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(writerDone)
@@ -179,8 +200,9 @@ func (s *Server) read(sess *session) error {
 }
 
 // write sends queued messages until it's asked to close the channel, a
-// write fails or ctx is done.
+// write fails or ctx is done, and closes the connection.
 func (se *session) write(ctx context.Context, timeout time.Duration) {
+	defer se.conn.CloseNow()
 	for {
 		ob, ok := se.out.pop(ctx.Done())
 		if !ok {
@@ -199,7 +221,6 @@ func (se *session) write(ctx context.Context, timeout time.Duration) {
 		err = se.conn.Write(wctx, websocket.MessageText, data)
 		cancel()
 		if err != nil {
-			se.conn.CloseNow()
 			return
 		}
 	}

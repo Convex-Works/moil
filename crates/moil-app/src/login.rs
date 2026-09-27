@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use auto_launch::AutoLaunch;
 
@@ -65,6 +66,46 @@ impl LoginItem for SystemLoginItem {
     }
 }
 
+/// A login item whose state is remembered for a while once read. Asking
+/// the system (`SMAppService`) takes a couple of milliseconds, and the
+/// tray asks every time it redraws, which a job's progress makes it do
+/// often. A change made here shows at once; one made in System Settings
+/// shows within `max_age`.
+#[derive(Debug)]
+pub struct Cached<L> {
+    item: L,
+    max_age: Duration,
+    known: Cell<Option<(Option<bool>, Instant)>>,
+}
+
+impl<L: LoginItem> Cached<L> {
+    pub fn new(item: L, max_age: Duration) -> Self {
+        Self {
+            item,
+            max_age,
+            known: Cell::new(None),
+        }
+    }
+}
+
+impl<L: LoginItem> LoginItem for Cached<L> {
+    fn enabled(&self) -> Option<bool> {
+        match self.known.get() {
+            Some((enabled, at)) if at.elapsed() < self.max_age => enabled,
+            _ => {
+                let enabled = self.item.enabled();
+                self.known.set(Some((enabled, Instant::now())));
+                enabled
+            }
+        }
+    }
+
+    fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.known.set(None);
+        self.item.set_enabled(enabled)
+    }
+}
+
 /// An Open at Login setting that only lives in memory, so the demo never
 /// touches the system's login items.
 #[derive(Debug, Default)]
@@ -96,6 +137,45 @@ pub fn app_bundle(exe: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A login item that counts how often the system is asked.
+    #[derive(Debug, Default)]
+    struct Counting {
+        enabled: Cell<bool>,
+        asked: Cell<usize>,
+    }
+
+    impl LoginItem for &Counting {
+        fn enabled(&self) -> Option<bool> {
+            self.asked.set(self.asked.get() + 1);
+            Some(self.enabled.get())
+        }
+
+        fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+            self.enabled.set(enabled);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_system_is_asked_once_until_something_changes() {
+        let system = Counting::default();
+        let item = Cached::new(&system, Duration::from_secs(60));
+        for _ in 0..100 {
+            assert_eq!(item.enabled(), Some(false));
+        }
+        assert_eq!(system.asked.get(), 1, "one redraw after another");
+
+        item.set_enabled(true).unwrap();
+        assert_eq!(item.enabled(), Some(true), "a change here shows at once");
+        assert_eq!(system.asked.get(), 2);
+
+        // A change made elsewhere shows once what's known is old enough.
+        let item = Cached::new(&system, Duration::ZERO);
+        system.enabled.set(false);
+        assert_eq!(item.enabled(), Some(false));
+        assert_eq!(system.asked.get(), 3);
+    }
 
     #[test]
     fn only_executables_inside_an_app_bundle_have_one() {

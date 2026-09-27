@@ -111,7 +111,8 @@ type Event struct {
 
 // JobEvent is an event a machine forwards: phase, progress, log or data
 // (spec §8.3). Types from newer machines decode without error so that
-// receivers can ignore them.
+// receivers can ignore them, and so do phases and log levels, which
+// receivers show as they are (spec §11).
 type JobEvent struct {
 	Type     string          `json:"type"`
 	Phase    string          `json:"phase,omitempty"`
@@ -409,12 +410,35 @@ func isNull(raw json.RawMessage) bool {
 	return string(bytes.TrimSpace(raw)) == "null"
 }
 
+// Bounds on what a machine reports about itself, where the spec gives
+// none: far beyond what a real machine reports, and small enough that a
+// service can keep a report for every machine.
+const (
+	MaxFieldChars = 64   // a machine's name (spec §4), OS, architecture and app version
+	MaxGPUs       = 64   // GPUs in hello
+	MaxGPUChars   = 256  // a GPU's name
+	MaxApproved   = 1024 // approved bundle hashes
+)
+
 func (m Hello) validate() error {
 	if m.Protocol != Protocol {
 		return fmt.Errorf("protocol %d isn't supported here; this is v%d", m.Protocol, Protocol)
 	}
 	if err := validState(m.State); err != nil {
 		return err
+	}
+	for _, field := range []string{m.Machine.Name, m.Machine.OS, m.Machine.Arch, m.AppVersion} {
+		if Chars(field) > MaxFieldChars {
+			return fmt.Errorf("the machine's name, OS, architecture and app version must be at most %d characters", MaxFieldChars)
+		}
+	}
+	if len(m.Machine.GPUs) > MaxGPUs {
+		return fmt.Errorf("%d GPUs are more than the %d a service keeps", len(m.Machine.GPUs), MaxGPUs)
+	}
+	for _, g := range m.Machine.GPUs {
+		if Chars(g.Name) > MaxGPUChars {
+			return fmt.Errorf("a GPU's name must be at most %d characters", MaxGPUChars)
+		}
 	}
 	if err := validHashes(m.Approved); err != nil {
 		return err
@@ -457,11 +481,9 @@ func (e JobEvent) validate() error {
 	case "":
 		return errors.New("event has no type")
 	case "phase":
-		switch e.Phase {
-		case "preparing", "downloading", "running", "uploading":
-			return nil
+		if e.Phase == "" {
+			return errors.New("phase event has no phase")
 		}
-		return fmt.Errorf("unknown phase %q", e.Phase)
 	case "progress":
 		if e.Fraction == nil && e.Message == nil {
 			return errors.New("progress needs a fraction or a message")
@@ -473,15 +495,14 @@ func (e JobEvent) validate() error {
 		if e.Message == nil {
 			return errors.New("log needs a message")
 		}
-		switch e.Level {
-		case "", "debug", "info", "warn", "error":
-		default:
-			return fmt.Errorf("unknown log level %q", e.Level)
-		}
 	case "data":
 		if e.Payload == nil {
 			return errors.New("data needs a payload")
 		}
+		return checkPayload("the payload", e.Payload)
+	}
+	if e.Message != nil && len(*e.Message) > MaxEventMessageBytes {
+		return fmt.Errorf("the message is %d bytes, over the 64 KiB limit", len(*e.Message))
 	}
 	// Other types come from newer machines; receivers ignore them.
 	return nil
@@ -507,9 +528,15 @@ func (m Done) validate() error {
 				return fmt.Errorf("invalid output name %q", name)
 			}
 		}
+		if m.Result.Meta != nil {
+			return checkPayload("the result's meta", m.Result.Meta)
+		}
 	case OutcomeFailed:
 		if m.Error == nil || m.Error.Code == "" {
 			return errors.New("a failed done needs an error with a code")
+		}
+		if len(m.Error.StderrTail) > MaxStderrTailBytes {
+			return fmt.Errorf("stderr_tail is %d bytes, over the 8 KiB limit", len(m.Error.StderrTail))
 		}
 	case OutcomeCancelled:
 	default:
@@ -607,6 +634,9 @@ func validState(s string) error {
 }
 
 func validHashes(hashes []string) error {
+	if len(hashes) > MaxApproved {
+		return fmt.Errorf("%d approved bundles are more than the %d a service keeps", len(hashes), MaxApproved)
+	}
 	for _, h := range hashes {
 		if !IsSHA256(h) {
 			return fmt.Errorf("invalid bundle hash %q", h)

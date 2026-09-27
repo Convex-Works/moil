@@ -6,7 +6,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use moil_agent::{Error, Home, Machine, MachineConfig, MemorySecrets, Settings};
+use moil_agent::{Error, FileSecrets, Home, Machine, MachineConfig, MemorySecrets, Settings};
 use moil_bundle::{BundleError, LineKind, LoadError};
 use support::*;
 
@@ -32,6 +32,52 @@ fn a_home_is_open_in_one_process_at_a_time() {
     Machine::open(config()).expect("the lock is released with the last clone");
 }
 
+#[tokio::test]
+async fn a_machine_can_be_read_while_another_process_has_it_open() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    service.host(&bundle);
+
+    let config = || MachineConfig {
+        home: Home::new(dir.path()),
+        secrets: std::sync::Arc::new(FileSecrets::new(dir.path().join("secrets.json"))),
+        app_version: "0.1.0-test".into(),
+    };
+    assert!(matches!(
+        Machine::open(config()),
+        Err(Error::AlreadyRunning(_))
+    ));
+    let reader = Machine::open_read_only(config()).unwrap();
+    assert_eq!(reader.services().unwrap(), std::slice::from_ref(&paired));
+    assert_eq!(reader.find_service("klisi").unwrap(), paired);
+    assert_eq!(reader.bundles(&paired.id).await.unwrap(), [info(&bundle)]);
+    let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
+    assert_eq!((&review.bundle, review.approved), (&bundle, false));
+
+    // It sees what the process that has the machine open changes.
+    machine.approve(&review).unwrap();
+    assert!(reader.services().unwrap()[0].is_approved(&bundle.hash()));
+    let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
+    assert!(review.approved);
+}
+
+#[test]
+fn reading_a_machine_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("moil");
+    let reader = Machine::open_read_only(MachineConfig {
+        home: Home::new(&root),
+        secrets: std::sync::Arc::new(MemorySecrets::default()),
+        app_version: "0.1.0-test".into(),
+    })
+    .unwrap();
+    assert_eq!(reader.services().unwrap(), []);
+    assert!(!root.exists(), "a home that wasn't there still isn't");
+}
+
 #[test]
 fn opening_creates_the_home() {
     let dir = tempfile::tempdir().unwrap();
@@ -41,6 +87,23 @@ fn opening_creates_the_home() {
     assert!(root.join("agent.lock").is_file());
     assert_eq!(machine.home().root(), root);
     assert_eq!(machine.settings(), Settings::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn only_the_owner_can_read_the_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("share").join("moil");
+    drop(open_machine(&root));
+    assert_eq!(mode(&root), 0o700, "a new home");
+
+    // An older moil left it readable by everyone.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(open_machine(&root));
+    assert_eq!(mode(&root), 0o700, "a home made private");
 }
 
 #[test]
@@ -173,6 +236,19 @@ async fn pairing_stores_the_service_and_its_token() {
 }
 
 #[tokio::test]
+async fn a_service_learns_the_machines_name_cut_to_64_characters() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let name = format!("Ada's {}", "very ".repeat(20));
+    machine
+        .update_settings(|s| s.machine_name = Some(name.clone()))
+        .unwrap();
+    pair(&machine, &service).await;
+    assert_eq!(service.pair_requests()[0].name, name[..64]);
+}
+
+#[tokio::test]
 async fn a_rejected_pairing_stores_nothing() {
     let service = FakeService::start("klisi").await;
     let dir = tempfile::tempdir().unwrap();
@@ -276,6 +352,35 @@ async fn pairing_only_starts_with_a_moil_service() {
 }
 
 #[tokio::test]
+async fn a_service_is_paired_only_under_a_name_that_hides_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    for name in [
+        "klisi\x1b[2J\x1b[Hyour-bank",
+        "klisi\r",
+        "",
+        &"x".repeat(65),
+    ] {
+        let service = FakeService::start(name).await;
+        match machine.pair(&service.base_url).await {
+            Err(Error::NotAService { reason, .. }) => {
+                assert!(reason.contains("calls itself"), "{reason}");
+            }
+            other => panic!("paired with {name:?}: {other:?}"),
+        }
+        assert_eq!(service.pair_requests(), [], "{name:?}");
+    }
+    assert_eq!(machine.services().unwrap(), []);
+
+    // What isn't a control character is shown revealed instead (spec
+    // §5.5).
+    for name in ["é".repeat(64), "klisi\u{202e}".to_owned()] {
+        let service = FakeService::start(&name).await;
+        assert_eq!(pair(&machine, &service).await.name, name);
+    }
+}
+
+#[tokio::test]
 async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
@@ -283,7 +388,7 @@ async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
     let err = machine.pair("http://moil.invalid/moil").await.unwrap_err();
     assert!(matches!(err, Error::InsecureUrl(_)), "{err}");
     let err = machine.pair("ftp://moil.invalid/moil").await.unwrap_err();
-    assert!(matches!(err, Error::NotAService { .. }), "{err}");
+    assert!(matches!(err, Error::InvalidAddress(_)), "{err}");
 
     // With the owner's permission the machine goes on and tries to reach it.
     machine
@@ -311,8 +416,11 @@ async fn pairing_again_replaces_the_token_and_keeps_the_approvals() {
     assert_eq!(machine.services().unwrap(), [second]);
 
     // The service is asked to forget the machine it knew by the old token,
-    // and the new token is the only one kept.
-    assert_eq!(service.forgotten(), ["moil_token_1"]);
+    // in the background, and the new token is the only one kept.
+    until("the old token to be forgotten", || {
+        service.forgotten() == ["moil_token_1"]
+    })
+    .await;
     let secrets: BTreeMap<String, String> =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("secrets.json")).unwrap())
             .unwrap();

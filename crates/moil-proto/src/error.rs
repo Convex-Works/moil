@@ -18,7 +18,8 @@ pub enum ErrorCode {
     OutputMissing,
     /// The attempt ran past `timeout_ms`.
     Timeout,
-    /// `uv sync` couldn't create the environment.
+    /// `uv sync` couldn't create the environment. Retryable unless the
+    /// runtime can tell the failure is permanent.
     Environment,
     /// An asset couldn't be downloaded.
     AssetDownload,
@@ -34,6 +35,8 @@ pub enum ErrorCode {
     Busy,
     /// The bundle isn't approved or stored on the machine; it never started.
     NotApproved,
+    /// The machine couldn't read the assignment; it never started.
+    Rejected,
     /// A bug in the runtime.
     Internal,
     /// The service's lease on the attempt ran out.
@@ -55,9 +58,10 @@ impl ErrorCode {
             | Self::NoResult
             | Self::OutputMissing
             | Self::Timeout
-            | Self::Environment
-            | Self::AssetMismatch => false,
-            Self::AssetDownload
+            | Self::AssetMismatch
+            | Self::Rejected => false,
+            Self::Environment
+            | Self::AssetDownload
             | Self::InputDownload
             | Self::OutputUpload
             | Self::Interrupted
@@ -91,6 +95,7 @@ impl ErrorCode {
             Self::Interrupted => "interrupted",
             Self::Busy => "busy",
             Self::NotApproved => "not_approved",
+            Self::Rejected => "rejected",
             Self::Internal => "internal",
             Self::LeaseExpired => "lease_expired",
             Self::Lost => "lost",

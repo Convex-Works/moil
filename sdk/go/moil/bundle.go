@@ -10,12 +10,11 @@ import (
 	"io"
 	"io/fs"
 	"maps"
-	"net/url"
 	"slices"
+	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
-
-	"github.com/BurntSushi/toml"
 
 	"git.convex.works/ConvexWorks/moil/sdk/go/internal/wire"
 )
@@ -41,6 +40,7 @@ var bundleFiles = [...]string{ScriptFile, LockFile, ManifestFile}
 type Bundle struct {
 	hash     string
 	manifest Manifest
+	packages []Package
 	files    [len(bundleFiles)][]byte
 }
 
@@ -92,9 +92,8 @@ func NewBundle(files map[string][]byte) (*Bundle, error) {
 		return nil, err
 	}
 	b.manifest = *m
-	var lock map[string]any
-	if _, err := toml.Decode(string(b.files[1]), &lock); err != nil {
-		return nil, fmt.Errorf("moil: job.py.lock isn't valid TOML: %w", err)
+	if b.packages, err = parseLockfile(string(b.files[1])); err != nil {
+		return nil, err
 	}
 	b.hash = hashFiles(b.files)
 	return &b, nil
@@ -130,6 +129,10 @@ func (b *Bundle) Manifest() Manifest {
 	m.Assets = maps.Clone(m.Assets)
 	return m
 }
+
+// Packages returns the packages the bundle's lockfile pins, in lockfile
+// order.
+func (b *Bundle) Packages() []Package { return slices.Clone(b.packages) }
 
 // File returns a copy of the named bundle file's exact bytes, or nil if name
 // isn't one of the three bundle files.
@@ -194,6 +197,9 @@ type Resources struct {
 // the owner approving a bundle must see exactly what the machine will act
 // on.
 func ParseManifest(data []byte) (*Manifest, error) {
+	if !utf8.Valid(data) {
+		return nil, errors.New("moil: manifest.json isn't UTF-8 text")
+	}
 	if err := checkManifestShape(data); err != nil {
 		return nil, fmt.Errorf("moil: manifest.json isn't valid: %w", err)
 	}
@@ -227,10 +233,16 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	if n := wire.Chars(raw.Version); n < 1 || n > 32 {
 		return invalid("version must be 1–32 characters")
 	}
+	if !isPlainText(raw.Version, false) {
+		return invalid(hiddenCharacters, "version")
+	}
 	m := &Manifest{Moil: raw.Moil, Name: raw.Name, Version: raw.Version}
 	if raw.Description != nil {
 		if wire.Chars(*raw.Description) > 500 {
 			return invalid("description must be at most 500 characters")
+		}
+		if !isPlainText(*raw.Description, true) {
+			return invalid(hiddenCharacters, "description")
 		}
 		m.Description = *raw.Description
 	}
@@ -241,8 +253,8 @@ func ParseManifest(data []byte) (*Manifest, error) {
 		if !wire.IsAssetName(name) {
 			return invalid("asset name %q must be a relative path of segments made of A-Z, a-z, 0-9, '.', '_' and '-'", name)
 		}
-		if u, err := url.Parse(a.URL); err != nil || u.Scheme != "https" || u.Host == "" {
-			return invalid("asset %q must be fetched over https, not %q", name, a.URL)
+		if !isAssetURL(a.URL) {
+			return invalid("asset %q must be fetched from a plain https URL (https://host[:port]/path[?query]), not %q", name, a.URL)
 		}
 		if !wire.IsSHA256(a.SHA256) {
 			return invalid("asset %q has an invalid sha256 (expected 64 lowercase hex characters)", name)
@@ -268,6 +280,80 @@ func ParseManifest(data []byte) (*Manifest, error) {
 		}
 	}
 	return m, nil
+}
+
+const hiddenCharacters = "%s contains control or bidirectional formatting characters, which could make it read differently from what it is"
+
+// isPlainText reports whether s has no control characters, except line
+// feeds if lineFeeds, and no bidirectional formatting characters (spec
+// §5.3).
+func isPlainText(s string, lineFeeds bool) bool {
+	for _, r := range s {
+		if (unicode.IsControl(r) && !(lineFeeds && r == '\n')) || unicode.Is(unicode.Bidi_Control, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isAssetURL reports whether s is an asset URL as spec §5.3 defines it:
+// https:// host [":" port] [path] ["?" query], where the host is a DNS
+// name or an IPv4 address, and the path and query use only unreserved
+// characters, percent-encodings, sub-delimiters, ":", "@", "/" and "?".
+// The grammar is narrower than what URL parsers accept, so that every
+// implementation agrees on which manifests are valid.
+func isAssetURL(s string) bool {
+	rest, ok := strings.CutPrefix(s, "https://")
+	if !ok {
+		return false
+	}
+	end := strings.IndexAny(rest, "/?")
+	if end < 0 {
+		end = len(rest)
+	}
+	host, port, hasPort := strings.Cut(rest[:end], ":")
+	if host == "" {
+		return false
+	}
+	for label := range strings.SplitSeq(host, ".") {
+		if label == "" || strings.ContainsFunc(label, func(r rune) bool { return !isASCIIAlnum(r) && r != '-' }) {
+			return false
+		}
+	}
+	if hasPort {
+		n, err := strconv.Atoi(port)
+		digits := !strings.ContainsFunc(port, func(r rune) bool { return r < '0' || r > '9' })
+		if !digits || len(port) > 5 || err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	return isPathAndQuery(rest[end:])
+}
+
+// isPathAndQuery reports whether s uses only RFC 3986 unreserved
+// characters, percent-encodings, sub-delimiters, ":", "@", "/" and "?".
+func isPathAndQuery(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '%':
+			if i+2 >= len(s) || !isHexDigit(s[i+1]) || !isHexDigit(s[i+2]) {
+				return false
+			}
+			i += 2
+		case isASCIIAlnum(rune(c)) || strings.IndexByte("-._~!$&'()*+,;=:@/?", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlnum(r rune) bool {
+	return 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9'
+}
+
+func isHexDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
 }
 
 // assetLayoutConflict finds two assets that can't both be laid out on disk,
@@ -308,21 +394,80 @@ var manifestShape = &shape{fields: map[string]*shape{
 // checkManifestShape rejects what encoding/json would let through: a
 // document that isn't an object, duplicate keys, unknown keys (which
 // encoding/json would also match case-insensitively), null where an object
-// belongs, and trailing data.
+// belongs, escapes of unpaired surrogates (which it would replace with
+// U+FFFD), and trailing data.
 func checkManifestShape(data []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := walkJSON(dec, manifestShape, "manifest"); err != nil {
+	w := &walker{dec: json.NewDecoder(bytes.NewReader(data)), data: data}
+	w.dec.UseNumber()
+	if err := w.walk(manifestShape, "manifest"); err != nil {
 		return err
 	}
-	if _, err := dec.Token(); err != io.EOF {
+	if _, err := w.dec.Token(); err != io.EOF {
 		return errors.New("unexpected data after the manifest object")
 	}
 	return nil
 }
 
-func walkJSON(dec *json.Decoder, s *shape, path string) error {
-	tok, err := dec.Token()
+// A walker reads a JSON document token by token.
+type walker struct {
+	dec  *json.Decoder
+	data []byte
+}
+
+// token returns the next token, refusing strings that escape half of a
+// UTF-16 surrogate pair, which encodes no character.
+func (w *walker) token() (json.Token, error) {
+	start := w.dec.InputOffset()
+	tok, err := w.dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	// Between two tokens there's only whitespace and punctuation, so every
+	// escape in the span is in the string.
+	if _, ok := tok.(string); ok && hasLoneSurrogate(w.data[start:w.dec.InputOffset()]) {
+		return nil, fmt.Errorf("the string %q escapes half of a surrogate pair, which isn't a character", tok)
+	}
+	return tok, nil
+}
+
+// hasLoneSurrogate reports whether raw JSON text holds a \u escape of a
+// surrogate that isn't followed or preceded by its other half.
+func hasLoneSurrogate(raw []byte) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		r, ok := unicodeEscape(raw[i:])
+		if !ok {
+			i++ // skip the escaped character, which may be a backslash
+			continue
+		}
+		i += 5 // the escape's last hex digit
+		switch {
+		case r < 0xD800 || r > 0xDFFF:
+		case r >= 0xDC00:
+			return true // a low surrogate without a high one before it
+		default:
+			if low, ok := unicodeEscape(raw[i+1:]); !ok || low < 0xDC00 || low > 0xDFFF {
+				return true
+			}
+			i += 6
+		}
+	}
+	return false
+}
+
+// unicodeEscape decodes the \uXXXX escape at the start of b.
+func unicodeEscape(b []byte) (rune, bool) {
+	if len(b) < 6 || b[0] != '\\' || b[1] != 'u' {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(string(b[2:6]), 16, 16)
+	return rune(n), err == nil
+}
+
+func (w *walker) walk(s *shape, path string) error {
+	tok, err := w.token()
 	if err != nil {
 		return err
 	}
@@ -333,18 +478,18 @@ func walkJSON(dec *json.Decoder, s *shape, path string) error {
 			return fmt.Errorf("%s must be a JSON object", path)
 		}
 		if ok && delim == '[' {
-			for dec.More() {
-				if err := walkJSON(dec, nil, path+"[]"); err != nil {
+			for w.dec.More() {
+				if err := w.walk(nil, path+"[]"); err != nil {
 					return err
 				}
 			}
-			_, err = dec.Token()
+			_, err = w.dec.Token()
 		}
 		return err
 	}
 	seen := make(map[string]bool)
-	for dec.More() {
-		tok, err := dec.Token()
+	for w.dec.More() {
+		tok, err := w.token()
 		if err != nil {
 			return err
 		}
@@ -365,10 +510,10 @@ func walkJSON(dec *json.Decoder, s *shape, path string) error {
 		case s != nil && s.values != nil:
 			child = s.values
 		}
-		if err := walkJSON(dec, child, path+"."+key); err != nil {
+		if err := w.walk(child, path+"."+key); err != nil {
 			return err
 		}
 	}
-	_, err = dec.Token()
+	_, err = w.dec.Token()
 	return err
 }

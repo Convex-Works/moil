@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod index;
+
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -15,9 +17,11 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use moil_bundle::Bundle;
 use moil_proto::{
     FileName, JobError, JobEvent, JobId, JobResult, LogLevel, Outcome, Phase, Upload, UploadMethod,
+    UrlPolicy,
 };
 use moil_runtime::{Executor, Job, Runtime, RuntimeConfig, StopReason, Stopper, stop_signal};
 use serde_json::{Value, json};
@@ -37,9 +41,9 @@ pub fn uv() -> PathBuf {
         .expect("these tests run real uv: install it, or set MOIL_UV to it")
 }
 
-/// A uv cache under `target/`: every test home stores its bundles at a new
-/// path, and uv keeps an environment per script path, which shouldn't pile
-/// up in the developer's own cache. Python installs are shared regardless.
+/// A uv cache under `target/`, so that what the tests install doesn't land
+/// in the developer's own cache. Environments live in each test's home, and
+/// Python installs are shared regardless.
 pub fn uv_cache_env() -> Vec<(OsString, OsString)> {
     let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("uv-cache");
     vec![("UV_CACHE_DIR".into(), cache.into())]
@@ -99,7 +103,7 @@ impl Harness {
         config.extra_root_certificates = vec![server.ca_pem.clone()];
         config.extra_env = uv_cache_env();
         configure(&mut config);
-        let runtime = Arc::new(Runtime::try_new(config).unwrap());
+        let runtime = Arc::new(Runtime::new(config).unwrap());
         Self {
             home,
             runtime,
@@ -119,6 +123,10 @@ impl Harness {
             inputs: BTreeMap::new(),
             outputs: BTreeMap::new(),
             timeout: None,
+            url_policy: UrlPolicy {
+                loopback_http: true,
+                any_http: false,
+            },
         }
     }
 
@@ -187,6 +195,22 @@ impl Running {
             self.seen.push(next.clone());
             if next == event {
                 return;
+            }
+        }
+    }
+
+    /// Waits for the next `progress` event, and returns its fraction and
+    /// message.
+    pub async fn progress(&mut self) -> (Option<f64>, String) {
+        loop {
+            let event = self
+                .events
+                .recv()
+                .await
+                .expect("the attempt ended without reporting progress");
+            self.seen.push(event.clone());
+            if let JobEvent::Progress { fraction, message } = event {
+                return (fraction, message.unwrap_or_default());
             }
         }
     }
@@ -279,6 +303,19 @@ impl Run {
             .unwrap_or_else(|| panic!("no data {key:?} in {:#?}", self.events))
     }
 
+    /// The `progress` events, as fractions and messages.
+    pub fn progress(&self) -> Vec<(Option<f64>, String)> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::Progress { fraction, message } => {
+                    Some((*fraction, message.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The events the script sent, without the runtime's phases.
     pub fn script_events(&self) -> Vec<JobEvent> {
         self.events
@@ -318,10 +355,26 @@ pub fn is_empty_dir(dir: &Path) -> bool {
 pub enum Reply {
     /// `200` with this body.
     Body(Vec<u8>),
+    /// `200` with this body, without saying how long it is.
+    Chunked(Vec<u8>),
+    /// `200` with this body, of which only the first `at` bytes are sent
+    /// until `gate` opens.
+    Gated {
+        body: Vec<u8>,
+        at: usize,
+        gate: Gate,
+    },
+    /// `200` once the whole upload has arrived, but reading only its first
+    /// `at` bytes until `gate` opens.
+    Receive { at: usize, gate: Gate },
     /// This status, with a short body.
     Status(u16),
     /// `302` to this URL.
     Redirect(String),
+    /// `303` to this URL.
+    SeeOther(String),
+    /// `200` with this HTML page.
+    Html(String),
     /// Never answers.
     Hang,
 }
@@ -434,27 +487,89 @@ async fn handle(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let path = uri.path().to_owned();
+    let reply = state.replies.lock().unwrap().get(&path).cloned();
+    let body = match &reply {
+        Some(Reply::Receive { at, gate }) => receive(body, *at, gate).await,
+        _ => axum::body::to_bytes(body, usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    };
     state.received.lock().unwrap().push(Received {
         method: method.clone(),
-        path: path.clone(),
+        path,
         headers,
-        body: body.to_vec(),
+        body,
     });
-    let reply = state.replies.lock().unwrap().get(&path).cloned();
     match reply {
         Some(Reply::Body(body)) => Body::from(body).into_response(),
+        Some(Reply::Gated { body, at, gate }) => {
+            let length = body.len();
+            let rest = Bytes::from(body[at..].to_vec());
+            let first = futures::stream::once(async move { Ok(Bytes::from(body[..at].to_vec())) });
+            let then = futures::stream::once(async move {
+                gate.passed().await;
+                Ok::<_, std::io::Error>(rest)
+            });
+            (
+                [(axum::http::header::CONTENT_LENGTH, length)],
+                Body::from_stream(first.chain(then)),
+            )
+                .into_response()
+        }
+        Some(Reply::Receive { .. }) => StatusCode::OK.into_response(),
+        Some(Reply::Chunked(body)) => {
+            Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(
+                Bytes::from(body),
+            )]))
+            .into_response()
+        }
         Some(Reply::Status(code)) => {
             (StatusCode::from_u16(code).unwrap(), "no luck").into_response()
         }
         Some(Reply::Redirect(to)) => {
             (StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
         }
+        Some(Reply::SeeOther(to)) => {
+            (StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, to)]).into_response()
+        }
+        Some(Reply::Html(page)) => axum::response::Html(page).into_response(),
         Some(Reply::Hang) => std::future::pending().await,
         None if method == Method::GET => StatusCode::NOT_FOUND.into_response(),
         None => StatusCode::OK.into_response(),
+    }
+}
+
+/// Reads an upload's body, stopping once `at` bytes have arrived until
+/// `gate` opens.
+async fn receive(body: Body, at: usize, gate: &Gate) -> Vec<u8> {
+    let mut stream = body.into_data_stream();
+    let mut received = Vec::new();
+    let mut waited = false;
+    while let Some(chunk) = stream.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+        if !waited && received.len() >= at {
+            gate.passed().await;
+            waited = true;
+        }
+    }
+    received
+}
+
+/// Holds part of a reply, or of an upload, back until opened.
+#[derive(Debug, Clone, Default)]
+pub struct Gate(Arc<tokio::sync::Notify>);
+
+impl Gate {
+    pub fn open(&self) {
+        self.0.notify_one();
+    }
+
+    async fn passed(&self) {
+        self.0.notified().await;
     }
 }
 

@@ -34,15 +34,15 @@ func (m Machine) HasApproved(hash string) bool { return slices.Contains(m.Approv
 // in hello, and its owner's approvals in hello and approved (spec §6.2).
 // Pairing seeds the name, OS, architecture and app version.
 type MachineReport struct {
-	Name        string    `json:"name"`
-	OS          string    `json:"os"`   // e.g. macos, linux, windows
-	Arch        string    `json:"arch"` // e.g. aarch64, x86_64
-	AppVersion  string    `json:"app_version"`
-	CPUs        int       `json:"cpus,omitempty"`
-	MemoryBytes int64     `json:"memory_bytes,omitempty"`
-	GPUs        []GPU     `json:"gpus,omitempty"`
-	Approved    []string  `json:"approved,omitempty"` // bundle hashes the owner approved for this service
-	LastSeen    time.Time `json:"last_seen,omitzero"` // when the machine last connected, reported or disconnected
+	Name        string
+	OS          string // e.g. macos, linux, windows
+	Arch        string // e.g. aarch64, x86_64
+	AppVersion  string
+	CPUs        int
+	MemoryBytes int64
+	GPUs        []GPU
+	Approved    []string  // bundle hashes the owner approved for this service
+	LastSeen    time.Time // when the machine last connected, reported or disconnected
 }
 
 func (r MachineReport) clone() MachineReport {
@@ -54,8 +54,8 @@ func (r MachineReport) clone() MachineReport {
 // A GPU is one of a machine's GPUs. MemoryBytes is 0 when the machine
 // didn't say.
 type GPU struct {
-	Name        string `json:"name"`
-	MemoryBytes int64  `json:"memory_bytes,omitempty"`
+	Name        string
+	MemoryBytes int64
 }
 
 // MachineState is what a machine is doing, as it reports it.
@@ -111,13 +111,13 @@ type Store interface {
 
 // A MachineRecord is what a Store keeps about a paired machine.
 type MachineRecord struct {
-	ID    string `json:"id"`
-	Owner string `json:"owner"`
+	ID    string
+	Owner string
 	// TokenHash is the hex SHA-256 of the machine's token. The token
 	// itself is never stored.
-	TokenHash string        `json:"token_hash"`
-	PairedAt  time.Time     `json:"paired_at"`
-	Report    MachineReport `json:"report"`
+	TokenHash string
+	PairedAt  time.Time
+	Report    MachineReport
 }
 
 func (r MachineRecord) clone() MachineRecord {

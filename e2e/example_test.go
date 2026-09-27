@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -100,12 +99,17 @@ func startExample(t *testing.T) *example {
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 	t.Cleanup(func() {
-		cmd.Process.Signal(os.Interrupt)
+		// As a service manager stops it.
+		cmd.Process.Signal(syscall.SIGTERM)
 		select {
-		case <-exited:
+		case err := <-exited:
+			if err != nil {
+				t.Errorf("the example service didn't shut down cleanly on SIGTERM: %v", err)
+			}
 		case <-time.After(patience):
 			cmd.Process.Signal(syscall.SIGKILL)
 			<-exited
+			t.Errorf("the example service didn't exit within %v of SIGTERM", patience)
 		}
 	})
 

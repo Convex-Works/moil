@@ -5,15 +5,16 @@
 //! or columns; everything else, including prompts, goes to stderr.
 
 use std::collections::HashSet;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command as Process, Stdio};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
-use moil_agent::review::reveal;
+use moil_agent::display::{self, reveal};
 use moil_agent::{
-    Agent, Home, Machine, MachineConfig, PairedService, Review, Snapshot, default_secrets,
+    Agent, Home, Machine, MachineConfig, PairedService, ReadOnlyMachine, Review, Snapshot,
+    default_secrets,
 };
 use moil_bundle::PackageSource;
 use moil_proto::BundleHash;
@@ -72,15 +73,20 @@ pub enum Command {
 }
 
 pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
-    let machine = open(globals)?;
+    // Commands that only read work while the agent runs, without the
+    // home's lock. The others change what the agent holds.
+    let reader =
+        || -> anyhow::Result<ReadOnlyMachine> { Ok(Machine::open_read_only(config(globals)?)?) };
+    let owner = || -> anyhow::Result<Machine> { Ok(Machine::open(config(globals)?)?) };
     match command {
         Command::Pair {
             url,
             name,
             no_browser,
-        } => pair(&machine, &url, name, no_browser).await,
-        Command::Services => services(&machine),
+        } => pair(&owner()?, &url, name, no_browser).await,
+        Command::Services => services(&reader()?),
         Command::Unpair { service } => {
+            let machine = owner()?;
             let service = machine.find_service(&service)?;
             machine.unpair(&service.id).await?;
             println!("Unpaired: {}", service.id);
@@ -89,20 +95,26 @@ pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
         Command::Review {
             service,
             hash: None,
-        } => bundles(&machine, &machine.find_service(&service)?).await,
+        } => {
+            let machine = reader()?;
+            bundles(&machine, &machine.find_service(&service)?).await
+        }
         Command::Review {
             service,
             hash: Some(hash),
         } => {
+            let machine = reader()?;
             let service = machine.find_service(&service)?;
-            show(&machine.review(&service.id, hash).await?);
-            Ok(())
+            let review = machine.review(&service.id, hash).await?;
+            Ok(show(&review, &mut io::stdout().lock())?)
         }
         Command::Approve { service, hash, yes } => {
+            let machine = owner()?;
             let service = machine.find_service(&service)?;
             approve(&machine, &machine.review(&service.id, hash).await?, yes)
         }
         Command::Revoke { service, hash } => {
+            let machine = owner()?;
             let service = machine.find_service(&service)?;
             if !service.is_approved(&hash) {
                 bail!("{hash} isn't approved for {}", service.id);
@@ -111,22 +123,23 @@ pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
             println!("Revoked: {hash}");
             Ok(())
         }
-        Command::Agent => agent(machine).await,
+        Command::Agent => agent(owner()?).await,
     }
 }
 
-fn open(globals: &Globals) -> anyhow::Result<Machine> {
+/// The machine's home, as `--home` or `$MOIL_HOME` say, and its tokens.
+fn config(globals: &Globals) -> anyhow::Result<MachineConfig> {
     let root = match &globals.home {
         Some(root) => root.clone(),
         None => Home::default_root()?,
     };
     let home = Home::new(root);
     let secrets = default_secrets(&home)?;
-    Ok(Machine::open(MachineConfig {
+    Ok(MachineConfig {
         home,
         secrets,
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
-    })?)
+    })
 }
 
 async fn pair(
@@ -141,27 +154,28 @@ async fn pair(
     let session = machine.pair(url).await?;
     eprintln!(
         "Pairing with {} at {} as {:?}.",
-        session.service_name,
+        reveal(&session.service_name),
         session.base_url(),
         machine.info().name
     );
     if session.base_url().scheme() == "http" {
         eprintln!("Warning: this service is reached over plain http.");
     }
-    println!("Code: {}", session.user_code);
-    println!("URL: {}", session.verification_uri_complete);
+    println!("Code: {}", reveal(&session.user_code));
+    println!("URL: {}", reveal(&session.verification_uri_complete));
     if !no_browser && open_browser(&session.verification_uri_complete).is_err() {
         eprintln!("Couldn't open a browser; open the URL above yourself.");
     }
     eprintln!(
         "Check that {} shows the same code, then confirm it there. Waiting…",
-        session.service_name
+        reveal(&session.service_name)
     );
     let service = session.wait().await?;
     println!("Paired: {}", service.id);
     eprintln!(
         "{} can now offer this machine jobs. See its bundles with `moil review {}`.",
-        service.name, service.id
+        reveal(&service.name),
+        service.id
     );
     Ok(())
 }
@@ -185,7 +199,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         .map(drop)
 }
 
-fn services(machine: &Machine) -> anyhow::Result<()> {
+fn services(machine: &ReadOnlyMachine) -> anyhow::Result<()> {
     let services = machine.services()?;
     if services.is_empty() {
         eprintln!("No paired services. Pair one with `moil pair URL`.");
@@ -198,7 +212,7 @@ fn services(machine: &Machine) -> anyhow::Result<()> {
                 s.id.to_string(),
                 s.base_url.to_string(),
                 s.approvals.len().to_string(),
-                s.name.clone(),
+                reveal(&s.name).into_owned(),
             ]
         })
         .collect();
@@ -208,7 +222,7 @@ fn services(machine: &Machine) -> anyhow::Result<()> {
 
 /// The service's bundles and whether each is approved, plus approved
 /// bundles it no longer offers.
-async fn bundles(machine: &Machine, service: &PairedService) -> anyhow::Result<()> {
+async fn bundles(machine: &ReadOnlyMachine, service: &PairedService) -> anyhow::Result<()> {
     let offered = machine.bundles(&service.id).await?;
     let listed: HashSet<BundleHash> = offered.iter().map(|b| b.hash).collect();
     let mut rows: Vec<[String; 3]> = offered
@@ -222,7 +236,7 @@ async fn bundles(machine: &Machine, service: &PairedService) -> anyhow::Result<(
             [
                 b.hash.to_string(),
                 status.into(),
-                format!("{} {}", b.name, b.version),
+                format!("{} {}", reveal(&b.name), reveal(&b.version)),
             ]
         })
         .collect();
@@ -235,12 +249,12 @@ async fn bundles(machine: &Machine, service: &PairedService) -> anyhow::Result<(
                 [
                     a.hash.to_string(),
                     "approved, no longer offered".into(),
-                    format!("{} {}", a.name, a.version),
+                    format!("{} {}", reveal(&a.name), reveal(&a.version)),
                 ]
             }),
     );
     if rows.is_empty() {
-        eprintln!("{} offers no bundles.", service.name);
+        eprintln!("{} offers no bundles.", reveal(&service.name));
         return Ok(());
     }
     table(&["HASH", "STATUS", "BUNDLE"], &rows);
@@ -250,102 +264,132 @@ async fn bundles(machine: &Machine, service: &PairedService) -> anyhow::Result<(
 
 /// Everything the owner needs to decide (spec §5.5): the service, the three
 /// files in full, the packages, the hash and how to check it, and what
-/// changed since the version approved before.
-fn show(review: &Review) {
+/// changed since the version approved before. Everything the service or the
+/// bundle controls goes through [`reveal`], so no character in it can
+/// rewrite what the owner reads.
+fn show(review: &Review, out: &mut impl Write) -> io::Result<()> {
     let (bundle, service) = (&review.bundle, &review.service);
     let manifest = bundle.manifest();
-    println!("Service: {} ({})", service.name, service.base_url);
+    let (name, version) = (reveal(&manifest.name), reveal(&manifest.version));
+    let service_name = reveal(&service.name);
+    writeln!(
+        out,
+        "Service: {service_name} ({})",
+        reveal(service.base_url.as_str())
+    )?;
     if service.is_insecure() {
-        println!("Warning: this service is reached over plain http.");
+        writeln!(out, "Warning: this service is reached over plain http.")?;
     }
-    println!("Bundle: {} {}", manifest.name, manifest.version);
+    writeln!(out, "Bundle: {name} {version}")?;
     if let Some(description) = &manifest.description {
-        println!("Description: {}", reveal(description));
+        writeln!(out, "Description: {}", reveal(description))?;
     }
-    println!("Hash: {}", bundle.hash());
+    writeln!(out, "Hash: {}", bundle.hash())?;
     let status = if review.approved {
         "approved"
     } else {
         "not approved"
     };
-    println!("Status: {status}");
+    writeln!(out, "Status: {status}")?;
     if let Some(memory) = manifest.resources.memory_bytes {
-        println!("Memory: {}", size(memory));
+        writeln!(out, "Memory: {}", display::memory(memory))?;
     }
     if let Some(gpu) = manifest.resources.gpu {
-        println!("GPU: {}", format!("{gpu:?}").to_lowercase());
+        writeln!(out, "GPU: {}", format!("{gpu:?}").to_lowercase())?;
     }
-    for (name, asset) in &manifest.assets {
+    for (asset_name, asset) in &manifest.assets {
         let size = asset
             .size_bytes
-            .map(size)
+            .map(display::size)
             .unwrap_or_else(|| "size unknown".into());
-        println!(
-            "Asset: {name} ({size}) from {}, sha256 {}",
-            asset.url, asset.sha256
-        );
+        writeln!(
+            out,
+            "Asset: {} ({size}) from {}, sha256 {}",
+            reveal(asset_name),
+            reveal(&asset.url),
+            reveal(&asset.sha256)
+        )?;
     }
 
-    println!();
-    println!("To check the hash yourself, save the three files below into one directory and run");
-    println!("  {}", Review::VERIFY_COMMAND);
-    println!("It must print {}.", bundle.hash());
-    for (name, text) in bundle.files() {
-        println!();
-        println!("==> {name} <==");
-        print!("{}", reveal(text));
+    writeln!(out)?;
+    writeln!(
+        out,
+        "To check the hash yourself, save the three files below into one directory and run"
+    )?;
+    writeln!(out, "  {}", Review::VERIFY_COMMAND)?;
+    writeln!(out, "It must print {}.", bundle.hash())?;
+    for (file, text) in bundle.files() {
+        writeln!(out)?;
+        writeln!(out, "==> {file} <==")?;
+        write!(out, "{}", reveal(text))?;
         if !text.ends_with('\n') {
-            println!();
-            println!("(no newline at the end of {name})");
+            writeln!(out)?;
+            writeln!(out, "(no newline at the end of {file})")?;
         }
     }
 
-    println!();
+    writeln!(out)?;
     let packages = bundle.packages();
-    println!("Packages ({}):", packages.len());
+    writeln!(out, "Packages ({}):", packages.len())?;
     for package in packages {
-        let version = package.version.as_deref().unwrap_or("(no version)");
         let source = match (&package.source, package.link()) {
             (_, Some(link)) => link,
-            (PackageSource::Path(path), None) => format!("a path on the author's machine: {path}"),
-            (PackageSource::Registry(index), None) => format!("from {index}"),
-            (source, None) => format!("{source:?}"),
+            (
+                PackageSource::Registry(index)
+                | PackageSource::Git(index)
+                | PackageSource::Url(index),
+                None,
+            ) => {
+                format!("from {index}")
+            }
         };
-        println!("  {} {version}  {}", package.name, reveal(&source));
+        let built = if package.builds_from_source {
+            "  (built from source here; its build tools aren't pinned)"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "  {} {}  {}{built}",
+            reveal(&package.name),
+            reveal(package.version.as_deref().unwrap_or("(no version)")),
+            reveal(&source)
+        )?;
     }
 
-    println!();
+    writeln!(out)?;
     match (&review.previous, review.diff()) {
         (Some(previous), Some(diffs)) => {
-            println!(
+            writeln!(
+                out,
                 "Changes since {} {} ({}):",
-                previous.manifest().name,
-                previous.manifest().version,
+                reveal(&previous.manifest().name),
+                reveal(&previous.manifest().version),
                 previous.hash()
-            );
+            )?;
             for diff in diffs {
                 if diff.is_unchanged() {
-                    println!("  {} is unchanged", diff.name);
+                    writeln!(out, "  {} is unchanged", diff.name)?;
                 } else {
-                    print!("{}", reveal(&diff.unified()));
+                    write!(out, "{}", reveal(&diff.unified()))?;
                 }
             }
         }
-        _ => println!(
-            "No earlier version of {} is approved for {}.",
-            manifest.name, service.name
-        ),
+        _ => writeln!(
+            out,
+            "No earlier version of {name} is approved for {service_name}."
+        )?,
     }
-    println!();
-    println!(
-        "Approving lets this code run on this machine with your permissions whenever {} \
-         sends it a job. moil has no sandbox yet.",
-        service.name
-    );
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Approving lets this code run on this machine with your permissions whenever \
+         {service_name} sends it a job. moil has no sandbox yet."
+    )
 }
 
 fn approve(machine: &Machine, review: &Review, yes: bool) -> anyhow::Result<()> {
-    show(review);
+    show(review, &mut io::stdout().lock())?;
     let hash = review.bundle.hash();
     if review.approved {
         println!("Approved: {hash}");
@@ -356,7 +400,9 @@ fn approve(machine: &Machine, review: &Review, yes: bool) -> anyhow::Result<()> 
         let manifest = review.bundle.manifest();
         eprint!(
             "Approve {} {} for {}? [y/N] ",
-            manifest.name, manifest.version, review.service.name
+            reveal(&manifest.name),
+            reveal(&manifest.version),
+            reveal(&review.service.name)
         );
         std::io::stderr().flush()?;
         let mut answer = String::new();
@@ -382,12 +428,12 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
         .init();
     let uv = moil_runtime::find_uv()
         .context("couldn't find uv; install it (https://docs.astral.sh/uv/) or set $MOIL_UV")?;
-    let runtime = Runtime::new(machine.runtime_config(uv));
-    let reaped = runtime
-        .reap_orphans()
-        .context("couldn't clean up after an earlier crash")?;
-    if reaped > 0 {
-        tracing::info!("cleaned up {reaped} attempts left over from a crash");
+    let runtime = Runtime::new(machine.runtime_config(uv))?;
+    // As in the app: leftovers are worth a warning, not refusing to work.
+    match runtime.reap_orphans() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("cleaned up {n} attempts left over from a crash"),
+        Err(e) => tracing::warn!("couldn't clean up attempts left over from a crash: {e}"),
     }
     let services = machine.services()?;
     if services.is_empty() {
@@ -407,21 +453,21 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
 }
 
 /// Tells the owner, once each, about bundles waiting for their review.
-/// Approving needs the machine's home, which the agent holds, so the owner
-/// stops the agent first.
+/// Reading one works while the agent runs; approving changes what the agent
+/// holds, so the owner stops it first.
 async fn announce_reviews(mut snapshots: tokio::sync::watch::Receiver<Snapshot>) {
     let mut announced = HashSet::new();
     loop {
         for (service, bundle) in snapshots.borrow_and_update().pending_reviews() {
             if announced.insert((service.id.clone(), bundle.info.hash)) {
+                let (id, hash) = (&service.id, bundle.info.hash);
                 tracing::info!(
-                    "{} offers {} {}, which you haven't approved; to read and approve it, \
-                     stop the agent and run `moil approve {} {}`",
-                    service.name,
-                    bundle.info.name,
-                    bundle.info.version,
-                    service.id,
-                    bundle.info.hash
+                    "{} offers {} {}, which you haven't approved; read it with \
+                     `moil review {id} {hash}`, and to approve it, stop the agent and run \
+                     `moil approve {id} {hash}`",
+                    reveal(&service.name),
+                    reveal(&bundle.info.name),
+                    reveal(&bundle.info.version),
                 );
             }
         }
@@ -470,30 +516,67 @@ fn table<const N: usize>(headers: &[&str; N], rows: &[[String; N]]) {
     }
 }
 
-/// A size for people: `75.5 MB`.
-fn size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["bytes", "kB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit + 1 < UNITS.len() {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} bytes")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
+    use moil_agent::display::is_hidden;
+    use moil_agent::{PairedService, ServiceId};
+    use moil_bundle::Bundle;
+
     use super::*;
 
+    /// A bundle, and the service offering it, that hide things everywhere
+    /// they can: the screen-clearing escape sequence and the invisible
+    /// characters would let a harmless-looking review be drawn over the
+    /// real one.
+    fn hostile() -> Review {
+        let clear = "\x1b[2J\x1b[H";
+        let script = format!(
+            "# /// script\n# requires-python = \">=3.12\"\n# dependencies = []\n# ///\n\
+             import os{clear}\nprint('hi')\u{202e}\r\n"
+        );
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let lockfile = format!(
+            "version = 1\nrevision = 3\n\n[[package]]\nname = \"requests\\u001b[2J\"\n\
+             version = \"2.32.3\\u001b[8m\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+             wheels = [{{ hash = \"{hash}\" }}]\n"
+        );
+        let manifest = "{\"moil\": 1, \"name\": \"echo\", \"version\": \"1.0\u{3164}\", \
+                        \"description\": \"Harmless.\u{200b}\"}";
+        let bundle = Bundle::new(script, lockfile, manifest).unwrap();
+        let base_url = "https://klisi.example.com/moil".parse().unwrap();
+        Review {
+            service: PairedService {
+                id: ServiceId::new("klisi.example.com").unwrap(),
+                base_url,
+                name: format!("klisi{clear}\u{2066}"),
+                machine_id: "m_1".into(),
+                paired_at: SystemTime::now(),
+                approvals: vec![],
+            },
+            previous: Some(bundle.clone()),
+            bundle,
+            approved: false,
+        }
+    }
+
     #[test]
-    fn sizes_read_naturally() {
-        assert_eq!(size(512), "512 bytes");
-        assert_eq!(size(75_538_270), "75.5 MB");
-        assert_eq!(size(8_589_934_592), "8.6 GB");
+    fn a_review_shows_nothing_hidden() {
+        let mut out = Vec::new();
+        show(&hostile(), &mut out).unwrap();
+        let shown = String::from_utf8(out).unwrap();
+        let hidden: Vec<char> = shown.chars().filter(|&c| is_hidden(c)).collect();
+        assert!(hidden.is_empty(), "{hidden:?} in\n{shown}");
+        for revealed in [
+            "Service: klisi␛[2J␛[H\\u{2066} (https://klisi.example.com/moil)",
+            "Bundle: echo 1.0\\u{3164}",
+            "Description: Harmless.\\u{200b}",
+            "import os␛[2J␛[H",
+            "print('hi')\\u{202e}␍",
+            "  requests␛[2J 2.32.3␛[8m  https://pypi.org/project/requests␛[2J/2.32.3␛[8m/",
+        ] {
+            assert!(shown.contains(revealed), "{revealed:?} in\n{shown}");
+        }
     }
 }

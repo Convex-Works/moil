@@ -80,6 +80,7 @@ type jobState struct {
 	phase    jobPhase
 	attempts int // attempts assigned so far
 	counted  int // attempts that count toward maxAttempts
+	refused  int // attempts machines refused before starting them
 	round    *offerRound
 	prep     *preparation
 	cur      *attemptState
@@ -88,7 +89,8 @@ type jobState struct {
 	// skip maps a machine to its gen when it declined, ignored or refused
 	// this job.
 	skip map[string]uint64
-	// failedOn holds the machines an attempt of this job failed on.
+	// failedOn holds the machines an attempt of this job failed on, or
+	// that refused one.
 	failedOn map[string]bool
 	forget   *time.Timer
 }
@@ -113,6 +115,7 @@ type preparation struct {
 type attemptState struct {
 	n       int
 	machine string
+	outputs map[string]wire.Upload // the outputs the attempt may produce
 	lastSeq int64
 	// The lease runs out at deadline; timer checks it.
 	deadline time.Time
@@ -157,6 +160,31 @@ func (sc *scheduler) addBundles(bundles []*Bundle) {
 	msg := wire.Bundles{Bundles: sc.bundleInfos()}
 	for _, lm := range sc.machines {
 		lm.sess.send(msg)
+	}
+}
+
+func (sc *scheduler) removeBundles(bundles []*Bundle) {
+	removed := false
+	for _, b := range bundles {
+		if b == nil || sc.bundleByHash[b.Hash()] == nil {
+			continue
+		}
+		delete(sc.bundleByHash, b.Hash())
+		sc.bundles = slices.DeleteFunc(sc.bundles, func(x *Bundle) bool { return x.Hash() == b.Hash() })
+		removed = true
+		sc.log.Info("moil: bundle removed", "bundle", b.String())
+	}
+	if !removed {
+		return
+	}
+	msg := wire.Bundles{Bundles: sc.bundleInfos()}
+	for _, lm := range sc.machines {
+		lm.sess.send(msg)
+	}
+	for _, j := range slices.Clone(sc.queue) {
+		if j.cur == nil && sc.bundleByHash[j.bundle.Hash()] == nil {
+			sc.finish(j, Failed, nil, fmt.Errorf("%w: %s", ErrBundleRemoved, j.bundle))
+		}
 	}
 }
 
@@ -263,12 +291,15 @@ func (sc *scheduler) disconnected(sess *session) {
 }
 
 // dropLive forgets a machine's control channel. Its open offer counts as
-// unanswered.
+// unanswered, and an attempt being prepared for it goes back to the queue.
 func (sc *scheduler) dropLive(lm *liveMachine) {
 	delete(sc.machines, lm.m.ID)
 	if j := lm.offer; j != nil {
 		lm.offer = nil
 		sc.answer(j, lm.m.ID, false)
+	}
+	if j := sc.preparing[lm.m.ID]; j != nil {
+		sc.endPreparation(j)
 	}
 	sc.dirty = true
 }
@@ -319,7 +350,9 @@ func (sc *scheduler) handle(sess *session, msg wire.Message) {
 			a.lastSeq = m.Seq
 			if ev, ok := jobEvent(m.Event); ok {
 				ev.Attempt, ev.Machine = a.n, a.machine
-				j.run.emit(ev)
+				if !j.run.emit(ev) {
+					sc.tooMuchData(j, a)
+				}
 			}
 		}
 	case wire.Renew:
@@ -354,12 +387,18 @@ func (sc *scheduler) submit(j *jobState) (*Run, error) {
 		return nil, ErrClosed
 	}
 	if existing := sc.jobs[j.id]; existing != nil {
-		return existing.run, nil
+		if existing.phase != phaseDone {
+			return existing.run, nil
+		}
+		// It runs again. Its attempt numbers carry on from the last run,
+		// so a machine still holding an old attempt can tell it apart.
+		existing.forget.Stop()
+		j.attempts = existing.attempts
 	}
 	if sc.bundleByHash[j.bundle.Hash()] == nil {
 		return nil, fmt.Errorf("moil: bundle %s wasn't added to the server; call AddBundle first", j.bundle)
 	}
-	j.run = newRun(j.id, func() { sc.s.post(func(sc *scheduler) { sc.cancel(j) }) })
+	j.run = newRun(j.id, func() { sc.s.post(func(sc *scheduler) { sc.cancel(j) }) }, sc.cfg.MaxDataBytes)
 	sc.jobs[j.id] = j
 	sc.queue = append(sc.queue, j)
 	j.run.emit(Event{Kind: EventQueued, Time: time.Now()})
@@ -550,7 +589,9 @@ func (sc *scheduler) start(j *jobState, lm *liveMachine) {
 	sc.preparing[p.machine] = j
 	a := Assignment{JobID: j.id, Attempt: p.n, Machine: lm.m}
 	a.Machine.MachineReport = a.Machine.MachineReport.clone()
+	sc.s.prepares.Add(1)
 	go func() {
+		defer sc.s.prepares.Done()
 		inputs, outputs, err := callPrepare(ctx, j.prepare, a)
 		sc.s.post(func(sc *scheduler) { sc.prepared(j, p, inputs, outputs, err) })
 	}()
@@ -569,13 +610,20 @@ func callPrepare(ctx context.Context, prepare func(context.Context, Assignment) 
 // machine can still take it.
 func (sc *scheduler) prepared(j *jobState, p *preparation, inputs map[string]Download, outputs map[string]Upload, err error) {
 	if j.prep != p {
-		return // the job ended meanwhile
+		return // the job ended, or the machine left, meanwhile
 	}
 	sc.endPreparation(j)
+	var retry *JobError
+	if errors.As(err, &retry) && retry.Retryable {
+		e := *retry
+		e.Machine, e.Attempt = p.machine, p.n
+		sc.retry(j, &e)
+		return
+	}
 	var ins map[string]wire.Download
 	var outs map[string]wire.Upload
 	if err == nil {
-		ins, outs, err = wireFiles(inputs, outputs)
+		ins, outs, err = wireFiles(sc.cfg.urlPolicy(), inputs, outputs)
 	}
 	if err == nil {
 		err = checkSize(j.assign(p.n, sc.cfg.LeaseTTL, ins, outs))
@@ -603,7 +651,7 @@ func (sc *scheduler) endPreparation(j *jobState) {
 }
 
 func (sc *scheduler) assign(j *jobState, lm *liveMachine, n int, inputs map[string]wire.Download, outputs map[string]wire.Upload) {
-	a := &attemptState{n: n, machine: lm.m.ID}
+	a := &attemptState{n: n, machine: lm.m.ID, outputs: outputs}
 	j.cur = a
 	j.phase = phaseRunning
 	sc.running[lm.m.ID] = j
@@ -624,9 +672,15 @@ func (j *jobState) assign(n int, lease time.Duration, inputs map[string]wire.Dow
 		Params:     j.params,
 		Inputs:     inputs,
 		Outputs:    outputs,
-		LeaseMS:    max(1, lease.Milliseconds()),
-		TimeoutMS:  j.timeout.Milliseconds(),
+		LeaseMS:    ceilMilliseconds(lease),
+		TimeoutMS:  ceilMilliseconds(j.timeout),
 	}
+}
+
+// ceilMilliseconds rounds d up to whole milliseconds, so that a positive
+// duration never becomes 0, which means none.
+func ceilMilliseconds(d time.Duration) int64 {
+	return int64((d + time.Millisecond - 1) / time.Millisecond)
 }
 
 func (sc *scheduler) renew(a *attemptState) {
@@ -651,11 +705,25 @@ func (sc *scheduler) checkLease(j *jobState, a *attemptState) {
 	sc.attemptFailed(j, &JobError{Code: CodeLeaseExpired, Message: "the machine stopped reporting on the attempt", Retryable: true})
 }
 
+// tooMuchData stops an attempt that sent more data than its run keeps, and
+// ends its job: another attempt would send as much.
+func (sc *scheduler) tooMuchData(j *jobState, a *attemptState) {
+	if lm := sc.machines[a.machine]; lm != nil {
+		lm.sess.send(wire.Cancel{JobID: j.id, Attempt: a.n})
+	}
+	sc.log.Warn("moil: an attempt sent more data than Config.MaxDataBytes; stopping it", "job", j.id, "attempt", a.n, "machine", a.machine)
+	sc.finish(j, Failed, nil, fmt.Errorf("%w: attempt %d on machine %s sent more than Config.MaxDataBytes (%d bytes)", ErrTooMuchData, a.n, a.machine, sc.cfg.MaxDataBytes))
+}
+
 func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
 	switch m.Outcome {
 	case wire.OutcomeSucceeded:
 		res := &Result{Meta: m.Result.Meta, Files: make(map[string]File, len(m.Result.Files)), Machine: a.machine, Attempt: a.n}
 		for name, f := range m.Result.Files {
+			if _, declared := a.outputs[name]; !declared {
+				sc.log.Warn("moil: a machine reported an output the job didn't declare; ignoring it", "job", j.id, "attempt", a.n, "machine", a.machine, "output", name)
+				continue
+			}
 			res.Files[name] = File{SizeBytes: f.SizeBytes, SHA256: f.SHA256}
 		}
 		sc.finish(j, Succeeded, res, nil)
@@ -678,7 +746,20 @@ func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
 func (sc *scheduler) attemptFailed(j *jobState, e *JobError) {
 	a := sc.endAttempt(j)
 	e.Machine, e.Attempt = a.machine, a.n
-	sc.log.Info("moil: attempt failed", "job", j.id, "attempt", a.n, "machine", a.machine, "code", e.Code, "message", e.Message)
+	j.failedOn[a.machine] = true
+	sc.retry(j, e)
+}
+
+// maxRefusals is how many attempts machines may refuse before starting
+// them (busy, not_approved) before the job fails. Refusals don't count
+// toward MaxAttempts, but a machine that keeps bidding and then refusing
+// mustn't hold a job forever.
+const maxRefusals = 10
+
+// retry puts a job whose attempt failed with e back in the queue, or ends
+// it if e isn't retryable or no attempts remain.
+func (sc *scheduler) retry(j *jobState, e *JobError) {
+	sc.log.Info("moil: attempt failed", "job", j.id, "attempt", e.Attempt, "machine", e.Machine, "code", e.Code, "message", e.Message)
 	if j.cancelled {
 		sc.finish(j, Cancelled, nil, ErrCancelled)
 		return
@@ -686,20 +767,24 @@ func (sc *scheduler) attemptFailed(j *jobState, e *JobError) {
 	if e.Code.NeverStarted() {
 		// The machine refused; don't hand it the job again until it
 		// reports a change.
-		if lm := sc.machines[a.machine]; lm != nil {
-			j.skip[a.machine] = lm.gen
+		if lm := sc.machines[e.Machine]; lm != nil {
+			j.skip[e.Machine] = lm.gen
 		}
+		j.refused++
 	} else {
 		j.counted++
-		j.failedOn[a.machine] = true
 	}
-	if !e.Retryable || (!e.Code.NeverStarted() && j.counted >= j.maxAttempts) {
+	if !e.Retryable || j.counted >= j.maxAttempts || j.refused >= maxRefusals {
 		sc.finish(j, Failed, nil, e)
+		return
+	}
+	if sc.bundleByHash[j.bundle.Hash()] == nil {
+		sc.finish(j, Failed, nil, fmt.Errorf("%w; it isn't retried: %w", e, ErrBundleRemoved))
 		return
 	}
 	j.phase = phaseQueued
 	j.run.setState(Queued)
-	j.run.emit(Event{Kind: EventRetrying, Time: time.Now(), Attempt: a.n, Machine: a.machine, Err: e})
+	j.run.emit(Event{Kind: EventRetrying, Time: time.Now(), Attempt: e.Attempt, Machine: e.Machine, Err: e})
 	sc.dirty = true
 }
 

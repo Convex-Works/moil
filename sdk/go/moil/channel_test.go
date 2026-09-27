@@ -2,7 +2,9 @@ package moil_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -120,6 +122,17 @@ func TestProtocolErrorsClose4400(t *testing.T) {
 			"machine": map[string]any{"name": "x", "os": "linux", "arch": "x86_64", "cpus": 1, "memory_bytes": 1, "gpus": []any{}},
 			"state":   "idle", "approved": []any{}, "attempts": []any{}}},
 		{"a service message", map[string]any{"type": "ack", "job_id": "j", "attempt": 1}},
+		// The limits of spec §10: a machine can't make the service hold
+		// more than they allow.
+		{"a log message over 64 KiB", event(map[string]any{"type": "log", "message": strings.Repeat("x", 64<<10+1)})},
+		{"a data payload over 256 KiB", event(map[string]any{"type": "data", "payload": strings.Repeat("x", 256<<10)})},
+		{"a data payload nested too deep", event(map[string]any{"type": "data", "payload": json.RawMessage(strings.Repeat("[", 65) + strings.Repeat("]", 65))})},
+		{"a progress fraction above 1", event(map[string]any{"type": "progress", "fraction": 1.5})},
+		{"result meta over 256 KiB", map[string]any{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "succeeded",
+			"result": map[string]any{"files": map[string]any{}, "meta": strings.Repeat("x", 256<<10)}}},
+		{"a stderr tail over 8 KiB", map[string]any{"type": "done", "job_id": "j", "attempt": 1, "seq": 1, "outcome": "failed",
+			"error": map[string]any{"code": "exit", "message": "", "retryable": false, "stderr_tail": strings.Repeat("x", 8<<10+1)}}},
+		{"more approvals than a service keeps", map[string]any{"type": "approved", "hashes": slices.Repeat([]string{strings.Repeat("a", 64)}, 1025)}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := moiltest.Pair(t, srv, "alice")
@@ -145,31 +158,76 @@ func TestProtocolErrorsClose4400(t *testing.T) {
 	})
 }
 
-// The first message must be hello; anything else is closed with 4400
-// before the machine counts as online.
+func event(e map[string]any) map[string]any {
+	return map[string]any{"type": "event", "job_id": "j", "attempt": 1, "seq": 1, "event": e}
+}
+
+// The first message must be a valid hello; anything else is closed with
+// 4400 before the machine counts as online.
 func TestHelloComesFirst(t *testing.T) {
 	srv := newServer(t)
 	m := moiltest.Pair(t, srv, "alice")
 	base := moiltest.Serve(t, srv)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	for _, first := range []string{
+		`{"type": "state", "state": "idle"}`,
+		`{"type": "hello", "protocol": 1, "app_version": "0.1.0", "state": "idle", "approved": [], "attempts": [],
+		  "machine": {"name": "` + strings.Repeat("x", 65) + `", "os": "linux", "arch": "x86_64", "cpus": 1, "memory_bytes": 1, "gpus": []}}`,
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, _, err := websocket.Dial(ctx, base+"/v1/connect", &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": {"Bearer " + m.Token()}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.CloseNow()
+		if err := conn.Write(ctx, websocket.MessageText, []byte(first)); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = conn.Read(ctx)
+		if code := websocket.CloseStatus(err); code != 4400 {
+			t.Fatalf("%.40s…: closed with %d (%v), want 4400", first, code, err)
+		}
+		if machine(t, srv, m.ID()).Online() {
+			t.Fatal("a machine that never said a valid hello is online")
+		}
+	}
+}
+
+// A machine can't make the service hold unbounded messages for it: one
+// that keeps the service sending while it never reads is disconnected
+// once a bounded queue fills, long before a write would time out.
+func TestMachinesThatDontReadAreDisconnected(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.PingInterval = 20 * time.Second })
+	m := moiltest.Pair(t, srv, "alice")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, base+"/v1/connect", &websocket.DialOptions{
+	conn, _, err := websocket.Dial(ctx, moiltest.Serve(t, srv)+"/v1/connect", &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + m.Token()}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.CloseNow()
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type": "state", "state": "idle"}`)); err != nil {
+	hello := `{"type": "hello", "protocol": 1, "app_version": "0.1.0", "state": "idle", "approved": [], "attempts": [],
+		"machine": {"name": "m", "os": "linux", "arch": "x86_64", "cpus": 1, "memory_bytes": 1, "gpus": []}}`
+	if err := conn.Write(ctx, websocket.MessageText, []byte(hello)); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = conn.Read(ctx)
-	if code := websocket.CloseStatus(err); code != 4400 {
-		t.Fatalf("closed with %d (%v), want 4400", code, err)
+	// Every done is acknowledged; this machine never reads the acks. Long
+	// job IDs make long acks, which fill the connection's buffers sooner.
+	jobID := strings.Repeat("j", 128)
+	for attempt := 1; ; attempt++ {
+		done := fmt.Sprintf(`{"type": "done", "job_id": "%s", "attempt": %d, "seq": 1, "outcome": "cancelled"}`, jobID, attempt)
+		if err := conn.Write(ctx, websocket.MessageText, []byte(done)); err != nil {
+			if ctx.Err() != nil {
+				t.Fatalf("still connected after %d unread acks", attempt)
+			}
+			break
+		}
 	}
-	if machine(t, srv, m.ID()).Online() {
-		t.Fatal("a machine that never said hello is online")
-	}
+	eventually(t, "the machine to go offline", func() bool { return !machine(t, srv, m.ID()).Online() })
 }
 
 // Machines lists what each machine last reported, live while connected and

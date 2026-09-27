@@ -29,6 +29,7 @@ use crate::page;
 use crate::pair::{PairEffect, PairWindow};
 use crate::platform;
 use crate::review::{ReviewEffect, ReviewWindow};
+use crate::snapshots::Snapshots;
 use crate::tray::Tray;
 use crate::unpair::{UnpairEffect, UnpairWindow};
 use crate::view::{Action, TrayView, ViewContext};
@@ -41,7 +42,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 /// Everything that wakes the event loop, besides the platform's own events.
 #[derive(Debug)]
 pub enum AppEvent {
-    Snapshot(Box<Snapshot>),
+    /// The agent's state changed: take the latest snapshot.
+    Snapshot,
     Menu(MenuId),
     /// A page posted a message.
     Ipc {
@@ -69,6 +71,8 @@ pub enum AppEvent {
         window: WindowId,
         result: Result<(), String>,
     },
+    /// A signal asked the app to quit.
+    Quit,
     /// The agent has shut down; the app can exit.
     ShutDown,
 }
@@ -93,6 +97,7 @@ pub fn run(
     for link in links {
         let _ = proxy.send_event(AppEvent::Link(link));
     }
+    forward_quit_signals(&runtime, proxy.clone());
 
     let mut app = App {
         backend,
@@ -101,6 +106,7 @@ pub fn run(
         login,
         log_file,
         tray: None,
+        snapshots: None,
         snapshot: Snapshot::default(),
         deferred: HashSet::new(),
         windows: HashMap::new(),
@@ -124,6 +130,7 @@ pub fn run(
                     app.open_link(url.as_str(), target);
                 }
             }
+            Event::LoopDestroyed => app.destroyed(),
             _ => {}
         }
         *control_flow = match (app.exit, app.refresh_at) {
@@ -134,6 +141,26 @@ pub fn run(
     })
 }
 
+/// Turns the signals that ask the app to quit into [`AppEvent::Quit`].
+fn forward_quit_signals(runtime: &tokio::runtime::Runtime, proxy: EventLoopProxy<AppEvent>) {
+    let signals = {
+        let _entered = runtime.enter();
+        platform::QuitSignals::listen()
+    };
+    let mut signals = match signals {
+        Ok(signals) => signals,
+        Err(e) => return tracing::warn!("couldn't listen for signals to quit: {e}"),
+    };
+    runtime.spawn(async move {
+        loop {
+            signals.recv().await;
+            if proxy.send_event(AppEvent::Quit).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 struct App {
     backend: Result<Arc<dyn Backend>, String>,
     runtime: tokio::runtime::Runtime,
@@ -141,6 +168,7 @@ struct App {
     login: Box<dyn LoginItem>,
     log_file: Option<PathBuf>,
     tray: Option<Tray>,
+    snapshots: Option<Snapshots>,
     snapshot: Snapshot,
     /// Reviews the owner closed without approving.
     deferred: HashSet<(ServiceId, BundleHash)>,
@@ -210,17 +238,11 @@ impl App {
                 return;
             }
         };
-        let mut snapshots = backend.subscribe();
-        self.snapshot = snapshots.borrow_and_update().clone();
         let proxy = self.proxy.clone();
-        self.runtime.spawn(async move {
-            while snapshots.changed().await.is_ok() {
-                let snapshot = Box::new(snapshots.borrow_and_update().clone());
-                if proxy.send_event(AppEvent::Snapshot(snapshot)).is_err() {
-                    break;
-                }
-            }
-        });
+        let wake = move || proxy.send_event(AppEvent::Snapshot).is_ok();
+        let mut snapshots = Snapshots::watch(backend.subscribe(), self.runtime.handle(), wake);
+        self.snapshot = snapshots.take();
+        self.snapshots = Some(snapshots);
         match Tray::new(self.view()) {
             Ok(tray) => self.tray = Some(tray),
             Err(e) => tracing::error!("{e}"),
@@ -253,9 +275,11 @@ impl App {
 
     fn handle(&mut self, event: AppEvent, target: &EventLoopWindowTarget<AppEvent>) {
         match event {
-            AppEvent::Snapshot(snapshot) => {
-                self.snapshot = *snapshot;
-                self.refresh_tray();
+            AppEvent::Snapshot => {
+                if let Some(snapshots) = &mut self.snapshots {
+                    self.snapshot = snapshots.take();
+                    self.refresh_tray();
+                }
             }
             AppEvent::Menu(id) => {
                 let action = self.tray.as_ref().and_then(|t| t.action(&id)).cloned();
@@ -306,6 +330,15 @@ impl App {
                 }
                 _ => {}
             },
+            AppEvent::Quit if self.quitting => {
+                // Asked again: the owner doesn't want to wait.
+                tracing::warn!("quitting without waiting for the agent");
+                self.exit = true;
+            }
+            AppEvent::Quit => {
+                tracing::info!("quitting, as a signal asks");
+                self.quit();
+            }
             AppEvent::ShutDown => self.exit = true,
         }
     }
@@ -698,6 +731,25 @@ impl App {
                     self.quit();
                 }
             }
+        }
+    }
+
+    /// The event loop is ending, and the process with it, once this
+    /// returns: the app exits, or the system terminates it, as when the
+    /// owner logs out or shuts down. Unless the agent has shut down already,
+    /// it does now, reporting the running job as interrupted, within the
+    /// same time limit as quitting.
+    fn destroyed(&mut self) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if self.exit {
+            return;
+        }
+        tracing::info!("shutting down as the system ends the app");
+        let shutdown = tokio::time::timeout(SHUTDOWN_TIMEOUT, backend.shutdown());
+        if self.runtime.block_on(shutdown).is_err() {
+            tracing::warn!("the agent took too long to shut down");
         }
     }
 

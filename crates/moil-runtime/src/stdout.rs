@@ -20,10 +20,13 @@ const MAX_PLAIN_LINE_BYTES: usize = 4 << 10;
 /// The most `data.payload` and `result.meta` may take when serialized
 /// (spec §10).
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 256 << 10;
-/// The longest `log`, `progress` or `error` message the runtime passes on.
+/// How deeply `data.payload` and `result.meta` may nest arrays and objects
+/// (spec §10).
+const MAX_PAYLOAD_DEPTH: usize = 64;
+/// The longest message the runtime passes on, in events and failures.
 /// Keeps every message to the service well under the 1 MiB limit of a
 /// control message.
-const MAX_MESSAGE_BYTES: usize = 64 << 10;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 64 << 10;
 /// How much of an offending line a warning quotes.
 const QUOTE_BYTES: usize = 200;
 
@@ -192,21 +195,20 @@ fn interpret(line: &[u8], number: u64, report: &mut Report) -> Option<JobEvent> 
             level,
             message: truncate(&message, MAX_MESSAGE_BYTES),
         }),
-        ScriptEvent::Data { payload } => match too_large(&payload) {
-            Some(size) => ignored(format!(
-                "the data payload is {size} bytes, over the 256 KiB limit"
-            )),
+        ScriptEvent::Data { payload } => match beyond_limits(&payload) {
+            Some(why) => ignored(format!("the data payload {why}")),
             None => Some(JobEvent::Data { payload }),
         },
         ScriptEvent::Result { files, meta } => {
             if report.error.is_some() {
                 return ignored("a result after an error".into());
             }
-            if report.result.is_some() {
+            // A refused result was the first one, and the first one counts.
+            if report.result.is_some() || report.refused_result.is_some() {
                 return ignored("a second result".into());
             }
-            if let Some(size) = meta.as_ref().and_then(too_large) {
-                let why = format!("the result's meta is {size} bytes, over the 256 KiB limit");
+            if let Some(why) = meta.as_ref().and_then(beyond_limits) {
+                let why = format!("the result's meta {why}");
                 report.refused_result = Some(format!("the script's result was refused: {why}"));
                 return ignored(why);
             }
@@ -230,10 +232,24 @@ fn parse(object: Map<String, Value>) -> serde_json::Result<ScriptEvent> {
     serde_json::from_value(Value::Object(object))
 }
 
-/// The serialized size of `value`, if it's over the payload limit.
-fn too_large(value: &Value) -> Option<usize> {
+/// How `value` goes beyond the limits of arbitrary JSON the service
+/// accepts (spec §10), completing "the payload …", if it does.
+fn beyond_limits(value: &Value) -> Option<String> {
+    if depth(value) > MAX_PAYLOAD_DEPTH {
+        return Some("is nested more than 64 levels deep".into());
+    }
     let size = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
-    (size > MAX_PAYLOAD_BYTES).then_some(size)
+    (size > MAX_PAYLOAD_BYTES).then(|| format!("is {size} bytes, over the 256 KiB limit"))
+}
+
+/// How deeply `value` nests arrays and objects: 0 for a scalar, 1 for
+/// `[1]`.
+fn depth(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+        Value::Object(fields) => 1 + fields.values().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn warn(message: String) -> JobEvent {
@@ -287,6 +303,15 @@ mod tests {
             [Some("0123456789".into())]
         );
         assert_eq!(lines(b"", 10).await, Vec::<Option<String>>::new());
+    }
+
+    #[test]
+    fn depth_counts_containers() {
+        use serde_json::json;
+        assert_eq!(depth(&json!(1)), 0);
+        assert_eq!(depth(&json!([])), 1);
+        assert_eq!(depth(&json!([1, [2]])), 2);
+        assert_eq!(depth(&json!({"a": {"b": []}, "c": 1})), 3);
     }
 
     #[test]

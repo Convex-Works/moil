@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use moil_proto::BundleHash;
 
-use crate::{Bundle, BundleError, LoadError};
+use crate::{Bundle, LoadError};
 
 /// Bundles on disk, one directory per hash. The directory for a hash always
 /// holds exactly that bundle: [`BundleStore::get`] re-checks the hash on
@@ -91,15 +91,10 @@ fn tempdir_in(root: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other("couldn't create a staging directory"))
 }
 
-impl From<BundleError> for io::Error {
-    fn from(e: BundleError) -> Self {
-        io::Error::new(io::ErrorKind::InvalidData, e)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BundleError;
 
     fn minimal() -> Bundle {
         Bundle::from_dir(concat!(

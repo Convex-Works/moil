@@ -18,6 +18,7 @@ pub struct Bundle {
     lockfile: String,
     manifest_text: String,
     manifest: Manifest,
+    requires_python: Option<String>,
     packages: Vec<LockedPackage>,
     hash: BundleHash,
 }
@@ -66,7 +67,7 @@ impl Bundle {
             return Err(BundleError::TooLarge(size));
         }
         let manifest = Manifest::parse(&manifest_text)?;
-        let packages = parse_lockfile(&lockfile).map_err(BundleError::Lockfile)?;
+        let locked = parse_lockfile(&lockfile).map_err(BundleError::Lockfile)?;
         let hash = hash_files([
             (SCRIPT, &*script),
             (LOCKFILE, &*lockfile),
@@ -77,7 +78,8 @@ impl Bundle {
             lockfile,
             manifest_text,
             manifest,
-            packages,
+            requires_python: locked.requires_python,
+            packages: locked.packages,
             hash,
         })
     }
@@ -182,6 +184,12 @@ impl Bundle {
     /// The contents of `manifest.json`, exactly as hashed.
     pub fn manifest_text(&self) -> &str {
         &self.manifest_text
+    }
+
+    /// The Python versions the lockfile was made for (its
+    /// `requires-python`), such as `>=3.12`.
+    pub fn requires_python(&self) -> Option<&str> {
+        self.requires_python.as_deref()
     }
 
     /// The packages the lockfile pins.

@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use moil_proto::ids::{is_asset_name, is_bundle_name, is_sha256_hex};
 use serde::{Deserialize, Serialize};
 
-/// A bundle's `manifest.json` (spec §5.3). Parsing is strict: unknown fields
-/// anywhere make the manifest invalid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A bundle's `manifest.json` (spec §5.3). Read one with
+/// [`Manifest::parse`], which is strict: unknown fields or duplicate keys
+/// anywhere make the manifest invalid. It deliberately doesn't implement
+/// `Deserialize`, which would skip those checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Manifest {
     pub moil: u32,
     pub name: String,
@@ -73,7 +74,13 @@ pub enum ManifestError {
         "asset name {0:?} must be a relative path of segments made of A-Z, a-z, 0-9, '.', '_' and '-'"
     )]
     InvalidAssetName(String),
-    #[error("asset {name:?} must be fetched over https, not {url:?}")]
+    #[error(
+        "{field} contains control or bidirectional formatting characters, which could make it read differently from what it is"
+    )]
+    HiddenCharacters { field: &'static str },
+    #[error(
+        "asset {name:?} must be fetched from a plain https URL (https://host[:port]/path[?query]), not {url:?}"
+    )]
     InvalidAssetUrl { name: String, url: String },
     #[error("asset {name:?} has an invalid sha256 (expected 64 lowercase hex characters)")]
     InvalidAssetHash { name: String },
@@ -96,8 +103,8 @@ impl Manifest {
         if !value.is_object() {
             return Err(ManifestError::NotAnObject);
         }
-        let manifest: Self =
-            serde_json::from_value(value).map_err(|e| ManifestError::Json(e.to_string()))?;
+        let manifest =
+            ManifestFields::deserialize(value).map_err(|e| ManifestError::Json(e.to_string()))?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -112,20 +119,24 @@ impl Manifest {
         if !(1..=32).contains(&self.version.chars().count()) {
             return Err(ManifestError::InvalidVersion);
         }
-        if self
-            .description
-            .as_ref()
-            .is_some_and(|d| d.chars().count() > 500)
-        {
-            return Err(ManifestError::DescriptionTooLong);
+        if !is_plain_text(&self.version, false) {
+            return Err(ManifestError::HiddenCharacters { field: "version" });
+        }
+        if let Some(description) = &self.description {
+            if description.chars().count() > 500 {
+                return Err(ManifestError::DescriptionTooLong);
+            }
+            if !is_plain_text(description, true) {
+                return Err(ManifestError::HiddenCharacters {
+                    field: "description",
+                });
+            }
         }
         for (name, asset) in &self.assets {
             if !is_asset_name(name) {
                 return Err(ManifestError::InvalidAssetName(name.clone()));
             }
-            let https = url::Url::parse(&asset.url)
-                .is_ok_and(|u| u.scheme() == "https" && u.host().is_some());
-            if !https {
+            if !is_asset_url(&asset.url) {
                 return Err(ManifestError::InvalidAssetUrl {
                     name: name.clone(),
                     url: asset.url.clone(),
@@ -143,6 +154,77 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// How serde reads a [`Manifest`], for [`Manifest::parse`] alone.
+#[derive(Deserialize)]
+#[serde(remote = "Manifest", deny_unknown_fields)]
+struct ManifestFields {
+    moil: u32,
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    assets: BTreeMap<String, Asset>,
+    #[serde(default)]
+    resources: Resources,
+}
+
+/// No control characters (except line feeds, if `line_feeds`) and no
+/// bidirectional formatting characters (spec §5.3).
+fn is_plain_text(text: &str, line_feeds: bool) -> bool {
+    text.chars().all(|c| {
+        let bidi = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+        !bidi && (!c.is_control() || (line_feeds && c == '\n'))
+    })
+}
+
+/// `https://` host [`:` port] [path] [`?` query], as spec §5.3 defines it:
+/// narrower than URL parsers accept, so every implementation agrees.
+fn is_asset_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let host_ok = !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len())
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+    });
+    host_ok && port_ok && is_path_and_query(tail)
+}
+
+/// RFC 3986 unreserved characters, percent-encodings, sub-delimiters, `:`,
+/// `@`, `/` and `?`.
+fn is_path_and_query(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                i += 3;
+                continue;
+            }
+            b if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&b) => {}
+            _ => return false,
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Two asset names that can't both be laid out on disk, because one would
@@ -259,6 +341,20 @@ mod tests {
         );
         let fine = ["w", "whisper.bin", "whisper/model.bin", "whisper/vocab.txt"];
         assert_eq!(layout_conflict(fine.into_iter()), None);
+    }
+
+    #[test]
+    fn manifests_can_only_be_read_by_parse() {
+        // `serde_json::from_str::<Manifest>` would skip the duplicate-key
+        // and validity checks, so it must not compile. The call below
+        // resolves only while exactly one of these impls applies: it stops
+        // compiling if `Manifest` implements `Deserialize`.
+        trait Ambiguous<A> {
+            fn check() {}
+        }
+        impl<T> Ambiguous<()> for T {}
+        impl<T: serde::de::DeserializeOwned> Ambiguous<u8> for T {}
+        <Manifest as Ambiguous<_>>::check();
     }
 
     #[test]

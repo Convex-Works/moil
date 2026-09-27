@@ -83,12 +83,15 @@ func normalizeUserCode(code string) string {
 }
 
 // start registers a new pairing and returns its device code and user code.
+// When limit pairings are in progress, it makes room by forgetting the
+// oldest one nobody confirmed, so that anonymous requests can't lock
+// everyone out of pairing; it fails only if every one was confirmed.
 func (p *pairings) start(req wire.PairRequest, ttl time.Duration, limit int) (deviceCode string, info Pairing, ok bool) {
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.purge(now)
-	if len(p.byDevice) >= limit {
+	if len(p.byDevice) >= limit && !p.evictOldest() {
 		return "", Pairing{}, false
 	}
 	deviceCode = randomToken(32)
@@ -113,13 +116,34 @@ func (p *pairings) start(req wire.PairRequest, ttl time.Duration, limit int) (de
 	return deviceCode, pr.info, true
 }
 
+// purge forgets expired pairings.
 func (p *pairings) purge(now time.Time) {
-	for key, pr := range p.byDevice {
-		if !now.Before(pr.info.Expires) {
-			delete(p.byDevice, key)
-			delete(p.byUser, pr.userKey)
+	for _, pr := range p.byDevice {
+		if pr.expired(now) {
+			p.remove(pr)
 		}
 	}
+}
+
+// evictOldest forgets the oldest pairing that is pending or denied. It
+// reports false if there's none.
+func (p *pairings) evictOldest() bool {
+	var oldest *pairing
+	for _, pr := range p.byDevice {
+		if (pr.status == pairingPending || pr.status == pairingDenied) && (oldest == nil || pr.info.Expires.Before(oldest.info.Expires)) {
+			oldest = pr
+		}
+	}
+	if oldest != nil {
+		p.remove(oldest)
+	}
+	return oldest != nil
+}
+
+// expired reports whether the pairing's code has expired. One being
+// confirmed doesn't expire until the Store has the machine.
+func (pr *pairing) expired(now time.Time) bool {
+	return pr.status != pairingConfirming && !now.Before(pr.info.Expires)
 }
 
 func (p *pairings) remove(pr *pairing) {
@@ -143,7 +167,7 @@ func (p *pairings) poll(deviceCode string, interval time.Duration) (machineID, t
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pr := p.byDevice[hashSecret(deviceCode)]
-	if pr == nil || !now.Before(pr.info.Expires) {
+	if pr == nil || pr.expired(now) {
 		if pr != nil {
 			p.remove(pr)
 		}
@@ -182,8 +206,9 @@ func (s *Server) PendingPairing(code string) (Pairing, bool) {
 // ConfirmPairing pairs the machine waiting with this user code, with owner
 // as its owner. Call it only for a signed-in user who confirmed the code on
 // the service's page. The machine is in the Store when ConfirmPairing
-// returns, and receives its token the next time it polls. It returns
-// ErrUnknownCode if no machine is waiting with the code.
+// returns, and receives its token the next time it polls, within
+// Config.PairingTTL. It returns ErrUnknownCode if no machine is waiting
+// with the code.
 func (s *Server) ConfirmPairing(ctx context.Context, code, owner string) (Machine, error) {
 	if owner == "" {
 		return Machine{}, errors.New("moil: ConfirmPairing needs an owner")
@@ -219,7 +244,11 @@ func (s *Server) ConfirmPairing(ctx context.Context, code, owner string) (Machin
 		pr.status = pairingPending
 		return Machine{}, err
 	}
+	// The machine gets a fresh TTL to collect its token, so that one
+	// confirmed as its code expires doesn't leave a record behind that no
+	// machine can use.
 	pr.status, pr.machineID, pr.token = pairingConfirmed, rec.ID, token
+	pr.info.Expires = time.Now().Add(s.cfg.PairingTTL)
 	s.log.Info("moil: machine paired", "machine", rec.ID, "name", rec.Report.Name, "owner", owner)
 	return rec.machine(), nil
 }
