@@ -16,7 +16,13 @@
 //!   without the meta the service expects.
 //! - Nothing the script starts outlives the attempt: when the script ends,
 //!   whatever is left in its process group is killed.
-//! - A redirect is followed only to a URL the policy of spec §3 allows.
+//! - Downloads follow a redirect only to a URL the job's policy (spec §3)
+//!   allows. Uploads follow none, since following one could turn the upload
+//!   into a `GET`.
+//! - Inputs, and assets whose manifest gives no size, are held to
+//!   [`RuntimeConfig::max_download_bytes`].
+//! - Each bundle has a uv environment of its own, which goes once the
+//!   bundle is no longer stored.
 //!
 //! Unix only: scripts run in their own process group.
 

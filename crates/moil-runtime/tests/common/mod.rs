@@ -41,9 +41,9 @@ pub fn uv() -> PathBuf {
         .expect("these tests run real uv: install it, or set MOIL_UV to it")
 }
 
-/// A uv cache under `target/`: every test home stores its bundles at a new
-/// path, and uv keeps an environment per script path, which shouldn't pile
-/// up in the developer's own cache. Python installs are shared regardless.
+/// A uv cache under `target/`, so that what the tests install doesn't land
+/// in the developer's own cache. Environments live in each test's home, and
+/// Python installs are shared regardless.
 pub fn uv_cache_env() -> Vec<(OsString, OsString)> {
     let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("uv-cache");
     vec![("UV_CACHE_DIR".into(), cache.into())]
