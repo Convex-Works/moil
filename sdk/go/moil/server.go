@@ -34,8 +34,11 @@ type Config struct {
 	// PairingInterval is how often a pairing machine may poll for its
 	// token; machines polling faster are told to slow down. Default 2s.
 	PairingInterval time.Duration
-	// MaxPendingPairings bounds the pairings waiting for confirmation, so
-	// that anonymous requests can't exhaust memory. Default 1000.
+	// MaxPendingPairings bounds the pairings in progress, so that
+	// anonymous requests can't exhaust memory. When it's reached, a new
+	// pairing replaces the oldest one nobody confirmed. Default 10000.
+	// POST /v1/pair needs no credentials: also limit how often one client
+	// may call it, in front of the Handler.
 	MaxPendingPairings int
 
 	// BidWindow is how long machines have to answer an offer. The Server
@@ -122,7 +125,7 @@ func (c *Config) setDefaults() error {
 		return errors.New("moil: Config.PingInterval must be at most 20s; machines take a channel that stays silent for 45 seconds for dead")
 	}
 	if c.MaxPendingPairings <= 0 {
-		c.MaxPendingPairings = 1000
+		c.MaxPendingPairings = 10000
 	}
 	if c.MaxAttempts <= 0 {
 		c.MaxAttempts = 3

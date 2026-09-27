@@ -76,6 +76,22 @@ func (s *Service) confirmPairing(w http.ResponseWriter, r *http.Request) {
 Codes are compared case-insensitively, with or without the hyphen. The
 app picks up its token on its next poll.
 
+The confirmation page hands a machine the user's jobs, so guard it:
+
+- **Warn against phishing** (RFC 8628 §5.4). An attacker can start
+  pairing their own machine and send a victim the link; confirming it
+  would send the victim's jobs, and their data, to the attacker. Say
+  plainly on the page: only confirm a code your own moil app shows you.
+- **Protect the confirmation from CSRF**, as any state-changing form: a
+  CSRF token tied to the session, or refusing cross-site requests by
+  their `Sec-Fetch-Site` or `Origin` header (`http.CrossOriginProtection`
+  from Go 1.25). Otherwise another site could confirm an attacker's code
+  from the user's browser.
+- **Rate-limit `POST /v1/pair`** per client in front of the Handler. It
+  needs no credentials; the Server bounds the pairings it holds
+  (`MaxPendingPairings`, replacing the oldest unconfirmed one when full),
+  but only a per-client limit keeps one client from crowding out others.
+
 `srv.Machines(ctx, user.ID)` lists a user's machines: online or not, their
 state (idle, busy, paused, offline), hardware, and the bundle hashes the
 owner approved. `srv.RemoveMachine(ctx, id)` unpairs one; check it's the
