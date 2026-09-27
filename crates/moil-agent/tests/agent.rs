@@ -1280,11 +1280,38 @@ async fn pairing_again_through_the_agent_reconnects_with_the_new_token() {
     let session = setup.agent.pair(&setup.service().base_url).await.unwrap();
     within("pairing", session.wait()).await.unwrap();
 
-    // The service forgets the old machine, closing its channel...
-    assert_eq!(conn.closed().await, Some(4401));
+    // The old channel closes: the agent closes it, or the service does as
+    // it forgets the old machine...
+    let closed = conn.closed().await;
+    assert!(matches!(closed, Some(1000 | 4401)), "{closed:?}");
     // ...and the agent connects with the new token.
     let conn = setup.service().accept().await;
     assert_eq!(conn.token, "moil_token_2");
+}
+
+#[tokio::test]
+async fn pairing_again_connects_at_once_while_the_service_forgets_the_old_token() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let service = setup.service();
+    service.hold_forgets(true);
+    service.script_pairing([TokenReply::Grant]);
+    let session = setup.agent.pair(&service.base_url).await.unwrap();
+
+    // The app stops waiting when its window closes, and nothing here
+    // waits for the service to forget the old token.
+    let paired = tokio::time::timeout(Duration::from_secs(2), session.wait()).await;
+    paired.expect("pairing waited on the service").unwrap();
+    assert_eq!(service.accept().await.token, "moil_token_2");
+
+    // The machine closed the old channel itself...
+    assert_eq!(conn.closed().await, Some(1000));
+    // ...and the service forgets the old token once it gets to it.
+    service.hold_forgets(false);
+    until("the old token to be forgotten", || {
+        service.forgotten() == ["moil_token_1"]
+    })
+    .await;
 }
 
 #[tokio::test]

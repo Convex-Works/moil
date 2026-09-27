@@ -255,6 +255,8 @@ struct Shared {
     listed: Mutex<Vec<BundleInfo>>,
     forgotten: Mutex<Vec<String>>,
     refuse_upgrades: Mutex<Option<StatusCode>>,
+    /// While true, `DELETE /v1/machine` doesn't answer.
+    hold_forgets: tokio::sync::watch::Sender<bool>,
     /// Open channels, by token, for closing them from the service's side.
     open: Mutex<Vec<(String, mpsc::UnboundedSender<Out>)>>,
     connections: mpsc::UnboundedSender<Conn>,
@@ -291,6 +293,7 @@ impl FakeService {
             listed: Mutex::default(),
             forgotten: Mutex::default(),
             refuse_upgrades: Mutex::default(),
+            hold_forgets: tokio::sync::watch::Sender::new(false),
             open: Mutex::default(),
             connections,
         });
@@ -366,6 +369,12 @@ impl FakeService {
     /// Tokens machines sent with `DELETE /v1/machine`.
     pub fn forgotten(&self) -> Vec<String> {
         self.shared.forgotten.lock().unwrap().clone()
+    }
+
+    /// Makes `DELETE /v1/machine` wait, as a slow service would, until
+    /// called again with `false`.
+    pub fn hold_forgets(&self, hold: bool) {
+        self.shared.hold_forgets.send_replace(hold);
     }
 
     /// Tokens the service currently accepts.
@@ -513,6 +522,7 @@ async fn bundle_handler(
 }
 
 async fn forget_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let _ = shared.hold_forgets.subscribe().wait_for(|held| !held).await;
     let Some(token) = shared.authorized(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "unauthorized");
     };

@@ -84,7 +84,12 @@ impl PairingSession {
 
     /// Polls the service until the owner confirms or rejects the pairing, or
     /// the code expires. On confirmation, stores the service and its token.
-    /// Dropping the future abandons the pairing.
+    ///
+    /// Dropping the future abandons the pairing until the service has sent
+    /// the token. From then on the pairing completes (the service and token
+    /// are stored, and an agent pairing through
+    /// [`AgentHandle::pair`](crate::AgentHandle::pair) connects) whether
+    /// the future is polled to the end or not.
     pub async fn wait(mut self) -> Result<PairedService, Error> {
         loop {
             tokio::time::sleep(self.interval).await;
@@ -153,29 +158,31 @@ impl PairingSession {
                 self.service_name, granted.machine_id
             )));
         }
-        let base_url = self.base_url.clone();
-        let (service, replaced) = self
-            .machine
+        let (base_url, on_paired) = (self.base_url, self.on_paired);
+        // One task that runs to the end, whoever waits for it.
+        self.machine
             .blocking(move |machine| {
-                machine.record_pairing(
+                let (service, replaced) = machine.record_pairing(
                     &base_url,
                     granted.service.name,
                     granted.machine_id,
                     &granted.token,
-                )
+                )?;
+                if let Some(hook) = on_paired {
+                    hook(&service);
+                }
+                // Pairing again made the service a new machine record; the
+                // old one would otherwise linger there, offline forever.
+                // Nothing waits for the service to answer.
+                if let Some(old_token) = replaced {
+                    let machine = machine.clone();
+                    tokio::spawn(
+                        async move { machine.forget_token_on(&base_url, &old_token).await },
+                    );
+                }
+                Ok(service)
             })
-            .await?;
-        // Pairing again made the service a new machine record; the old one
-        // would otherwise linger there, offline forever.
-        if let Some(old_token) = replaced {
-            self.machine
-                .forget_token_on(&self.base_url, &old_token)
-                .await;
-        }
-        if let Some(hook) = self.on_paired {
-            hook(&service);
-        }
-        Ok(service)
+            .await
     }
 }
 

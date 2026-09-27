@@ -311,8 +311,11 @@ async fn pairing_again_replaces_the_token_and_keeps_the_approvals() {
     assert_eq!(machine.services().unwrap(), [second]);
 
     // The service is asked to forget the machine it knew by the old token,
-    // and the new token is the only one kept.
-    assert_eq!(service.forgotten(), ["moil_token_1"]);
+    // in the background, and the new token is the only one kept.
+    until("the old token to be forgotten", || {
+        service.forgotten() == ["moil_token_1"]
+    })
+    .await;
     let secrets: BTreeMap<String, String> =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("secrets.json")).unwrap())
             .unwrap();
