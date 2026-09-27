@@ -41,6 +41,7 @@ mod locks;
 mod orphans;
 mod outcome;
 mod process;
+mod progress;
 mod stderr;
 mod stdout;
 mod sys;

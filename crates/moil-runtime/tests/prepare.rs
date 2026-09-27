@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use moil_bundle::{Bundle, BundleStore};
-use moil_proto::{ErrorCode, LogLevel, Phase};
+use moil_proto::{ErrorCode, JobEvent, LogLevel, Phase};
 use moil_runtime::{Executor, Runtime};
 use serde_json::{Value, json};
 
@@ -221,6 +221,59 @@ mod assets {
             error.message.contains("larger than the 10 bytes"),
             "{}",
             error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn fetching_an_asset_reports_how_far_it_got() {
+        let h = Harness::new().await;
+        let weights = vec![7; 4 << 20];
+        let gate = Gate::default();
+        h.server.reply(
+            "/model.bin",
+            Reply::Gated {
+                body: weights.clone(),
+                at: 1 << 20,
+                gate: gate.clone(),
+            },
+        );
+        let bundle = asset_manifest(json!({
+            "url": h.server.https_url("/model.bin"),
+            "sha256": sha256(&weights),
+            "size_bytes": weights.len(),
+        }));
+        let mut running = h.start(h.job(&bundle, steps(json!([{"emit": {"type": "result"}}]))));
+
+        // Held back after a quarter, the download says how far it got.
+        loop {
+            let (fraction, message) = running.progress().await;
+            if fraction == Some(0.25) {
+                assert_eq!(message, "asset model.bin: 1 MiB of 4 MiB");
+                break;
+            }
+            assert!(fraction.is_some_and(|f| f < 0.25), "{fraction:?}");
+        }
+        gate.open();
+        let run = running.finish().await;
+        run.result();
+        assert_eq!(
+            run.progress().last(),
+            Some(&(Some(1.0), "asset model.bin: 4 MiB of 4 MiB".to_owned()))
+        );
+        let preparing_ended = run
+            .events
+            .iter()
+            .position(|e| {
+                *e == JobEvent::Phase {
+                    phase: Phase::Downloading,
+                }
+            })
+            .unwrap();
+        assert!(
+            run.events[preparing_ended..]
+                .iter()
+                .all(|e| !matches!(e, JobEvent::Progress { .. })),
+            "it all happened while preparing"
         );
     }
 

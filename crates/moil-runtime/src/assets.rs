@@ -11,6 +11,7 @@ use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel, UrlPolicy};
 
 use crate::http::{Http, TransferError};
 use crate::locks::KeyedLocks;
+use crate::progress::{self, Meter};
 use crate::{EventSink, units};
 
 /// How the names of files still being downloaded start.
@@ -70,7 +71,8 @@ impl AssetCache {
                 format!("downloading asset {name}"),
             ));
         }
-        self.download(http, policy, name, asset, &path).await
+        self.download(http, policy, name, asset, &path, events)
+            .await
     }
 
     async fn download(
@@ -80,6 +82,7 @@ impl AssetCache {
         name: &str,
         asset: &Asset,
         path: &Path,
+        events: Option<&EventSink>,
     ) -> Result<(), JobError> {
         let failed = |why: String| {
             JobError::new(
@@ -110,8 +113,13 @@ impl AssetCache {
         let (file, partial) = partial.into_parts();
         let mut file = tokio::fs::File::from_std(file);
         let limit = asset.size_bytes.unwrap_or(self.max_unsized_bytes);
-        let got = http
-            .download(policy, &asset.url, &BTreeMap::new(), &mut file, limit)
+        let meter = Meter::default();
+        if let Some(size) = asset.size_bytes {
+            meter.set_total(size);
+        }
+        let no_headers = BTreeMap::new();
+        let download = http.download(policy, &asset.url, &no_headers, &mut file, limit, &meter);
+        let got = progress::report(events, &format!("asset {name}"), &meter, download)
             .await
             .map_err(|e| match e {
                 TransferError::TooLarge(_) if asset.size_bytes.is_some() => mismatch(format!(

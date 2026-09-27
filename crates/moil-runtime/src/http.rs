@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
+use crate::progress::Meter;
+
 /// How long to wait for a server to accept a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a transfer may go without receiving anything.
@@ -113,6 +115,7 @@ impl Http {
     /// Downloads `url` with `GET` into `file`, following redirects that
     /// `policy` allows, and returns the size and SHA-256 of what arrived.
     /// Gives up as soon as it's clear that more than `max_bytes` would.
+    /// Counts what arrives on `meter`.
     pub async fn download(
         &self,
         policy: UrlPolicy,
@@ -120,6 +123,7 @@ impl Http {
         headers: &BTreeMap<String, String>,
         file: &mut tokio::fs::File,
         max_bytes: u64,
+        meter: &Meter,
     ) -> Result<FileInfo, TransferError> {
         let failed = TransferError::Failed;
         let url = check(policy, url)?;
@@ -135,11 +139,11 @@ impl Http {
                 quote_body(response).await
             )));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_bytes)
-        {
-            return Err(TransferError::TooLarge(max_bytes));
+        if let Some(length) = response.content_length() {
+            if length > max_bytes {
+                return Err(TransferError::TooLarge(max_bytes));
+            }
+            meter.set_total(length);
         }
         let mut hasher = Sha256::new();
         let mut size = 0u64;
@@ -149,6 +153,7 @@ impl Http {
                 return Err(TransferError::TooLarge(max_bytes));
             }
             hasher.update(&chunk);
+            meter.add(chunk.len() as u64);
             file.write_all(&chunk)
                 .await
                 .map_err(|e| failed(format!("couldn't write it to disk: {e}")))?;
@@ -164,12 +169,14 @@ impl Http {
 
     /// Uploads `file` to `target`, whose URL `policy` must allow,
     /// streaming it with a `Content-Length`. Any `2xx` answer is success; a
-    /// redirect is not. Returns the size and SHA-256 of the bytes sent.
+    /// redirect is not. Returns the size and SHA-256 of the bytes sent, and
+    /// counts them on `meter` as they go.
     pub async fn upload(
         &self,
         policy: UrlPolicy,
         target: &Upload,
         file: std::fs::File,
+        meter: &Meter,
     ) -> Result<FileInfo, TransferError> {
         let failed = TransferError::Failed;
         let url = check(policy, &target.url)?;
@@ -179,12 +186,14 @@ impl Http {
             .await
             .map_err(|e| failed(format!("couldn't read it: {e}")))?
             .len();
+        meter.set_total(size);
         let sent = Arc::new(Mutex::new((Sha256::new(), 0u64)));
-        let counter = sent.clone();
+        let (counter, meter) = (sent.clone(), meter.clone());
         let body = ReaderStream::new(file).inspect_ok(move |chunk| {
             let mut sent = counter.lock().unwrap_or_else(|e| e.into_inner());
             sent.0.update(chunk);
             sent.1 += chunk.len() as u64;
+            meter.add(chunk.len() as u64);
         });
         let mut headers = header_map(&target.headers).map_err(failed)?;
         headers.insert(CONTENT_LENGTH, HeaderValue::from(size));

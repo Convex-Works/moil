@@ -19,6 +19,7 @@ use crate::limits::Limits;
 use crate::orphans::Registration;
 use crate::outcome::{self, Accepted, Cut};
 use crate::process::Group;
+use crate::progress::{self, Meter};
 use crate::stderr::{self, Tail};
 use crate::stdout::{self, Report};
 use crate::workdir::WorkDir;
@@ -201,25 +202,31 @@ impl Attempt<'_> {
                 .await
                 .map_err(|e| failed(format!("couldn't create {}: {e}", path.display())))?;
             let limit = self.runtime.config.max_download_bytes;
-            self.runtime
-                .http
-                .download(
-                    self.url_policy(),
-                    &source.url,
-                    &source.headers,
-                    &mut file,
-                    limit,
-                )
-                .await
-                .map_err(|e| match e {
-                    // Another machine would refuse it too.
-                    TransferError::TooLarge(_) => failed(format!(
-                        "it is larger than the {} this machine accepts",
-                        units::bytes(limit)
-                    ))
-                    .retryable(false),
-                    e => failed(e.to_string()).retryable(e.is_retryable()),
-                })?;
+            let meter = Meter::default();
+            let download = self.runtime.http.download(
+                self.url_policy(),
+                &source.url,
+                &source.headers,
+                &mut file,
+                limit,
+                &meter,
+            );
+            progress::report(
+                Some(self.events),
+                &format!("input {name}"),
+                &meter,
+                download,
+            )
+            .await
+            .map_err(|e| match e {
+                // Another machine would refuse it too.
+                TransferError::TooLarge(_) => failed(format!(
+                    "it is larger than the {} this machine accepts",
+                    units::bytes(limit)
+                ))
+                .retryable(false),
+                e => failed(e.to_string()).retryable(e.is_retryable()),
+            })?;
             paths.insert(name.clone(), path);
         }
         Ok(paths)
@@ -301,18 +308,21 @@ impl Attempt<'_> {
         let mut uploaded = BTreeMap::new();
         for (name, file) in files {
             let target = &self.job.outputs[&name];
-            let info = self
+            let meter = Meter::default();
+            let upload = self
                 .runtime
                 .http
-                .upload(self.url_policy(), target, file)
-                .await
-                .map_err(|e| {
-                    JobError::new(
-                        ErrorCode::OutputUpload,
-                        format!("couldn't upload {name}: {e}"),
-                    )
-                    .retryable(e.is_retryable())
-                })?;
+                .upload(self.url_policy(), target, file, &meter);
+            let info =
+                progress::report(Some(self.events), &format!("output {name}"), &meter, upload)
+                    .await
+                    .map_err(|e| {
+                        JobError::new(
+                            ErrorCode::OutputUpload,
+                            format!("couldn't upload {name}: {e}"),
+                        )
+                        .retryable(e.is_retryable())
+                    })?;
             uploaded.insert(name, info);
         }
         Ok(uploaded)

@@ -940,6 +940,75 @@ mod transfers {
     }
 
     #[tokio::test]
+    async fn inputs_and_outputs_report_how_far_they_got() {
+        let h = Harness::new().await;
+        let (down, up) = (Gate::default(), Gate::default());
+        h.server.reply(
+            "/in/big.in",
+            Reply::Gated {
+                body: vec![b'i'; 4 << 20],
+                at: 1 << 20,
+                gate: down.clone(),
+            },
+        );
+        h.server.reply(
+            "/out/big.out",
+            Reply::Receive {
+                at: 1 << 20,
+                gate: up.clone(),
+            },
+        );
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"fill": "big.out", "bytes": 32 << 20},
+                {"emit": {"type": "result", "files": ["big.out"]}},
+            ])),
+        );
+        job.inputs.insert(
+            "big.in".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/big.in"),
+                headers: Default::default(),
+            },
+        );
+        job.outputs.extend([output(&h.server, "big.out")]);
+        let mut running = h.start(job);
+
+        running.phase(Phase::Downloading).await;
+        loop {
+            let (fraction, message) = running.progress().await;
+            if fraction == Some(0.25) {
+                assert_eq!(message, "input big.in: 1 MiB of 4 MiB");
+                break;
+            }
+            assert!(fraction.is_some_and(|f| f < 0.25), "{fraction:?}");
+        }
+        down.open();
+
+        // The server stops reading the upload after a mebibyte.
+        running.phase(Phase::Uploading).await;
+        let (fraction, message) = running.progress().await;
+        assert!(fraction.is_some_and(|f| f > 0.0 && f < 1.0), "{fraction:?}");
+        assert!(
+            message.starts_with("output big.out: ") && message.ends_with(" of 32 MiB"),
+            "{message}"
+        );
+        up.open();
+
+        let run = running.finish().await;
+        assert_eq!(run.result().files["big.out"].size_bytes, 32 << 20);
+        assert_eq!(
+            run.progress().last(),
+            Some(&(Some(1.0), "output big.out: 32 MiB of 32 MiB".to_owned()))
+        );
+        assert!(
+            run.progress()
+                .contains(&(Some(1.0), "input big.in: 4 MiB of 4 MiB".to_owned()))
+        );
+    }
+
+    #[tokio::test]
     async fn inputs_come_over_https_with_their_headers() {
         let h = Harness::new().await;
         h.server.serve("/in/secret.txt", "classified");
