@@ -2,7 +2,6 @@
 //! (spec §8).
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -14,8 +13,8 @@ use moil_proto::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
+use crate::limits::Limits;
 use crate::orphans::Registration;
 use crate::outcome::{self, Accepted, Cut};
 use crate::process::Group;
@@ -42,12 +41,22 @@ pub(crate) async fn run(
         events: &events,
         ran: None,
     };
-    let outcome = match attempt.run(&mut limits).await {
+    let ended = attempt.run(&mut limits).await;
+    attempt.with_script_facts(outcome(&limits, ended))
+}
+
+/// How an attempt that ended as `ended` turns out (spec §8.5). A stop wins
+/// over any other ending, even one that came as a transfer failed or once
+/// the outputs were up.
+fn outcome(limits: &Limits, ended: Result<JobResult, Ending>) -> Outcome {
+    if let Some(reason) = limits.stopped() {
+        return Cut::Stopped(reason).outcome();
+    }
+    match ended {
         Ok(result) => Outcome::Succeeded { result },
         Err(Ending::Cut(cut)) => cut.outcome(),
         Err(Ending::Failed(error)) => Outcome::failed(error),
-    };
-    attempt.with_script_facts(outcome)
+    }
 }
 
 struct Attempt<'a> {
@@ -313,56 +322,6 @@ impl Attempt<'_> {
     }
 }
 
-/// What can cut an attempt short: the stop signal and the time limit.
-struct Limits {
-    stop: StopSignal,
-    timeout: Option<Duration>,
-    deadline: Option<Instant>,
-}
-
-impl Limits {
-    fn new(stop: StopSignal, timeout: Option<Duration>) -> Self {
-        Self {
-            stop,
-            timeout,
-            deadline: timeout.map(|limit| Instant::now() + limit),
-        }
-    }
-
-    /// Resolves once the attempt must end early. Cancel-safe.
-    async fn reached(&mut self) -> Cut {
-        let (deadline, timeout) = (self.deadline, self.timeout);
-        let expired = async move {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
-                None => std::future::pending().await,
-            }
-        };
-        let cut = tokio::select! {
-            biased;
-            reason = self.stop.stopped() => Cut::Stopped(reason),
-            () = expired => Cut::TimedOut(timeout.unwrap_or_default()),
-        };
-        self.decide(Some(cut)).unwrap_or(cut)
-    }
-
-    /// Rules 1–3 of spec §8.5: a stop, whenever it came, wins over running
-    /// out of time, which wins over everything else.
-    fn decide(&self, cut: Option<Cut>) -> Option<Cut> {
-        self.stop.reason().map(Cut::Stopped).or(cut)
-    }
-
-    /// Runs `work` unless the attempt must end first, in which case `work`
-    /// is dropped.
-    async fn guard<T>(&mut self, work: impl Future<Output = T>) -> Result<T, Cut> {
-        tokio::select! {
-            biased;
-            cut = self.reached() => Err(cut),
-            value = work => Ok(value),
-        }
-    }
-}
-
 /// Waits for a task reading the script's output to finish, but not for long.
 async fn drain(task: JoinHandle<()>) {
     let abort = task.abort_handle();
@@ -374,4 +333,36 @@ async fn drain(task: JoinHandle<()>) {
 
 fn internal(what: &'static str) -> impl FnOnce(std::io::Error) -> JobError {
     move |error| JobError::new(ErrorCode::Internal, format!("{what}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StopReason, stop_signal};
+
+    #[tokio::test]
+    async fn a_stop_wins_over_however_else_the_attempt_ended() {
+        let (stopper, stop) = stop_signal();
+        let limits = Limits::new(stop, None);
+        let failed = || {
+            Err(Ending::Failed(JobError::new(
+                ErrorCode::InputDownload,
+                "the connection was reset",
+            )))
+        };
+        let succeeded = || {
+            Ok(JobResult {
+                meta: None,
+                files: BTreeMap::new(),
+            })
+        };
+        assert!(matches!(
+            outcome(&limits, failed()),
+            Outcome::Failed { error } if error.code == ErrorCode::InputDownload
+        ));
+
+        stopper.stop(StopReason::Cancelled);
+        assert_eq!(outcome(&limits, failed()), Outcome::Cancelled);
+        assert_eq!(outcome(&limits, succeeded()), Outcome::Cancelled);
+    }
 }

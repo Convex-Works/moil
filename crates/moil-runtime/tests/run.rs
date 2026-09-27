@@ -368,25 +368,29 @@ mod outcome {
 
     #[tokio::test]
     async fn a_cancel_during_the_grace_period_wins_over_the_timeout() {
-        // A grace period long enough for the script to clean up in, however
-        // busy the machine running the tests.
-        let h = Harness::with(|c| c.kill_grace = Duration::from_secs(60)).await;
+        let h = Harness::new().await;
+        let limit = Duration::from_secs(3600);
         let mut job = h.job(
             &probe(),
             steps(json!([
-                {"on_sigterm": "terminating", "linger": 1},
-                {"emit": {"type": "result"}},
-                {"sleep": 60},
+                {"on_sigterm": "terminating", "linger": 3600},
+                {"emit": {"type": "data", "payload": {"ready": true}}},
+                {"sleep": 3600},
             ])),
         );
-        // Long enough for the script to be listening for SIGTERM by then,
-        // however busy the machine running the tests.
-        job.timeout = Some(Duration::from_secs(3));
+        job.timeout = Some(limit);
         let mut running = h.start(job);
-        // The time limit passed and the script is still cleaning up when
-        // the service cancels: rule 1 beats rule 3.
+        running.data("ready").await;
+        // The time limit passes only now, with the script listening for
+        // SIGTERM. The paused clock moves only when told to: waiting for
+        // the script keeps it from skipping ahead.
+        tokio::time::pause();
+        tokio::time::advance(limit).await;
         running.log("terminating").await;
+        // The script is still cleaning up when the service cancels: rule 1
+        // beats rule 3. Then its grace period, half a second here, runs out.
         running.stop(StopReason::Cancelled);
+        tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(running.finish().await.outcome, Outcome::Cancelled);
     }
 }
