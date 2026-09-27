@@ -34,7 +34,12 @@ mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
 
 Users add your service in the moil app by its moil base URL, here
 `https://klisi.example.com/moil`. Machines need https, except on loopback
-addresses.
+addresses. Jobs' input and output URLs need https too: machines accept
+plain http only to loopback hosts, and only from a service they reach on
+loopback, as in local development, so `Submit` refuses other http URLs.
+For development against storage without TLS, `Config.AllowInsecureHTTP`
+lifts that; machines then need their owners to allow insecure http in
+their settings too.
 
 `Store` keeps paired machines and the SHA-256 of their tokens, never the
 tokens. `FileStore` suits one process and a few hundred machines; for more,

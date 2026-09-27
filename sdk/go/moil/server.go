@@ -54,6 +54,22 @@ type Config struct {
 	// KeepFinished is how long a finished job stays known, for Run and
 	// for idempotent Submit. Default 1 hour.
 	KeepFinished time.Duration
+
+	// AllowInsecureHTTP lets jobs use plain http input and output URLs on
+	// any host, for development against storage without TLS, such as a
+	// local MinIO. Machines refuse such URLs too unless their owners also
+	// allow insecure http in the machine's settings, so leave it off in
+	// production. Without it Submit accepts https URLs, and http URLs to
+	// loopback hosts, which machines accept only from a service they
+	// reach on loopback, as in local development (spec §3).
+	AllowInsecureHTTP bool
+}
+
+// urlPolicy is what Submit accepts for input and output URLs: what a
+// machine accepts from a service on loopback, since the SDK can't know
+// the base URL machines reach it at.
+func (c *Config) urlPolicy() wire.URLPolicy {
+	return wire.URLPolicy{LoopbackHTTP: true, AnyHTTP: c.AllowInsecureHTTP}
 }
 
 func (c *Config) setDefaults() error {
@@ -382,7 +398,7 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 	if j.maxAttempts <= 0 {
 		j.maxAttempts = s.cfg.MaxAttempts
 	}
-	if j.inputs, j.outputs, err = wireFiles(job.Inputs, job.Outputs); err != nil {
+	if j.inputs, j.outputs, err = wireFiles(s.cfg.urlPolicy(), job.Inputs, job.Outputs); err != nil {
 		return nil, err
 	}
 	if err := checkSize(j.assign(1, s.cfg.LeaseTTL, j.inputs, j.outputs)); err != nil {
@@ -393,17 +409,17 @@ func (s *Server) newJob(job Job) (*jobState, error) {
 
 // wireFiles checks a job's inputs and outputs and converts them for
 // assign.
-func wireFiles(inputs map[string]Download, outputs map[string]Upload) (map[string]wire.Download, map[string]wire.Upload, error) {
+func wireFiles(policy wire.URLPolicy, inputs map[string]Download, outputs map[string]Upload) (map[string]wire.Download, map[string]wire.Upload, error) {
 	ins := make(map[string]wire.Download, len(inputs))
 	outs := make(map[string]wire.Upload, len(outputs))
 	for name, in := range inputs {
-		if err := checkFile("input", name, in.URL); err != nil {
+		if err := checkFile(policy, "input", name, in.URL); err != nil {
 			return nil, nil, err
 		}
 		ins[name] = wire.Download{URL: in.URL, Headers: in.Headers}
 	}
 	for name, out := range outputs {
-		if err := checkFile("output", name, out.URL); err != nil {
+		if err := checkFile(policy, "output", name, out.URL); err != nil {
 			return nil, nil, err
 		}
 		method := out.Method
@@ -419,13 +435,12 @@ func wireFiles(inputs map[string]Download, outputs map[string]Upload) (map[strin
 	return ins, outs, nil
 }
 
-func checkFile(kind, name, rawURL string) error {
+func checkFile(policy wire.URLPolicy, kind, name, rawURL string) error {
 	if !wire.IsFileName(name) {
 		return fmt.Errorf("moil: %s name %q must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", kind, name)
 	}
-	u, err := url.Parse(rawURL)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return fmt.Errorf("moil: %s %q needs an absolute http or https URL", kind, name)
+	if err := policy.Check(rawURL); err != nil {
+		return fmt.Errorf("moil: %s %q: machines would refuse it: the URL %w", kind, name, err)
 	}
 	return nil
 }

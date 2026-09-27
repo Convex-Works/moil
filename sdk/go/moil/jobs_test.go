@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -175,7 +176,9 @@ func TestSubmitRejectsJobsMachinesCouldNotRun(t *testing.T) {
 		{"bundle never added", func(j *moil.Job) { j.Bundle = other }, "AddBundle"},
 		{"bad job ID", func(j *moil.Job) { j.ID = "../etc" }, "job ID"},
 		{"unsafe input name", func(j *moil.Job) { j.Inputs = map[string]moil.Download{"../a": {URL: "https://e.com/a"}} }, "input name"},
-		{"relative output URL", func(j *moil.Job) { j.Outputs = map[string]moil.Upload{"a.txt": {URL: "/upload"}} }, "absolute"},
+		{"relative output URL", func(j *moil.Job) { j.Outputs = map[string]moil.Upload{"a.txt": {URL: "/upload"}} }, "has no host"},
+		{"plain http to storage", func(j *moil.Job) { j.Inputs = map[string]moil.Download{"a": {URL: "http://s3.example.com/a"}} }, "uses http to s3.example.com"},
+		{"a scheme machines don't speak", func(j *moil.Job) { j.Outputs = map[string]moil.Upload{"a": {URL: "ftp://example.com/a"}} }, "uses ftp"},
 		{"unsupported method", func(j *moil.Job) {
 			j.Outputs = map[string]moil.Upload{"a.txt": {URL: "https://e.com", Method: "PATCH"}}
 		}, "PUT or POST"},
@@ -194,6 +197,77 @@ func TestSubmitRejectsJobsMachinesCouldNotRun(t *testing.T) {
 	}
 	if _, err := srv.Submit(context.Background(), ok); err != nil {
 		t.Fatalf("the valid job was rejected: %v", err)
+	}
+}
+
+// Submit accepts the URLs machines accept: https, and http to loopback
+// hosts, which machines accept from a service on loopback. Plain http
+// elsewhere needs the service's explicit opt-in, as it needs the machine
+// owner's.
+func TestSubmitAcceptsURLsMachinesAccept(t *testing.T) {
+	strict := newServer(t)
+	insecure := newServer(t, func(c *moil.Config) { c.AllowInsecureHTTP = true })
+	for _, srv := range []*moil.Server{strict, insecure} {
+		bundle := loadBundle(t, srv, "minimal")
+		for _, u := range []string{"https://s3.example.com/a?X-Amz-Signature=x", "http://127.0.0.1:9000/a", "http://localhost/a", "http://[::1]:9000/a"} {
+			if _, err := srv.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Inputs: map[string]moil.Download{"a": {URL: u}}}); err != nil {
+				t.Errorf("%s was refused: %v", u, err)
+			}
+		}
+	}
+	bundle := loadBundle(t, insecure, "minimal")
+	if _, err := insecure.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Outputs: map[string]moil.Upload{"a": {URL: "http://minio:9000/a"}}}); err != nil {
+		t.Errorf("AllowInsecureHTTP didn't allow http: %v", err)
+	}
+	if _, err := insecure.Submit(context.Background(), moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Outputs: map[string]moil.Upload{"a": {URL: "file:///etc/passwd"}}}); err == nil {
+		t.Error("AllowInsecureHTTP allowed a file URL")
+	}
+}
+
+// moiltest's machines refuse what real machines refuse: http beyond
+// loopback, unless their owner allowed it, also after a redirect.
+func TestMoiltestHoldsTransfersToTheMachinesURLPolicy(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.AllowInsecureHTTP = true })
+	bundle := loadBundle(t, srv, "minimal")
+	storage := newFileServer(t, map[string][]byte{"/in": []byte("audio")})
+	// The same storage, at an address that isn't a loopback host by the
+	// spec's definition, though it leads to one.
+	elsewhere := strings.Replace(storage.URL, "127.0.0.1", "[::ffff:127.0.0.1]", 1) + "/in"
+	redirect := httptestServer(t, http.RedirectHandler(elsewhere, http.StatusFound))
+	job := moil.Job{Bundle: bundle, Eligible: moil.OwnedBy("alice"), Inputs: map[string]moil.Download{
+		"local.ogg":      {URL: storage.URL + "/in"},
+		"remote.ogg":     {URL: elsewhere},
+		"redirected.ogg": {URL: redirect + "/in"},
+	}}
+
+	tb := &failureRecorder{TB: t}
+	strict := moiltest.Pair(tb, srv, "alice")
+	strict.Approve(bundle)
+	strict.Connect()
+	run := submit(t, srv, job)
+	a := strict.NextAttempt()
+	if got := string(a.Input("local.ogg")); got != "audio" {
+		t.Fatalf("loopback input %q", got)
+	}
+	if msg := tb.failure(func() { a.Input("remote.ogg") }); !strings.Contains(msg, "uses http to ::ffff:127.0.0.1; only https is allowed") {
+		t.Errorf("fetching an http input beyond loopback: %q", msg)
+	}
+	if msg := tb.failure(func() { a.Input("redirected.ogg") }); !strings.Contains(msg, "redirects to "+elsewhere+", which uses http") {
+		t.Errorf("following a redirect to http beyond loopback: %q", msg)
+	}
+	a.Succeed(nil)
+	succeeded(t, run)
+	strict.Disconnect()
+
+	lenient := moiltest.Pair(t, srv, "alice", moiltest.WithInsecureHTTP())
+	lenient.Approve(bundle)
+	lenient.Connect()
+	submit(t, srv, job)
+	b := lenient.NextAttempt()
+	for _, name := range []string{"remote.ogg", "redirected.ogg"} {
+		if got := string(b.Input(name)); got != "audio" {
+			t.Errorf("%s: %q", name, got)
+		}
 	}
 }
 

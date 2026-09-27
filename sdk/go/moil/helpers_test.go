@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -143,6 +146,65 @@ func httptestServer(t *testing.T, h http.Handler) string {
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
 	return ts.URL
+}
+
+// A failureRecorder is a testing.TB for checking that moiltest fails a
+// test: failures inside failure's function are recorded instead of
+// failing the test; the rest reach the test.
+type failureRecorder struct {
+	testing.TB
+	mu        sync.Mutex
+	recording bool
+	failures  []string
+}
+
+// failure runs f, as a test would, and returns how it failed the test, or
+// "" if it didn't.
+func (r *failureRecorder) failure(f func()) string {
+	r.mu.Lock()
+	r.recording, r.failures = true, nil
+	r.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	<-done
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recording = false
+	return strings.Join(r.failures, "\n")
+}
+
+func (r *failureRecorder) record(msg string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.recording {
+		r.failures = append(r.failures, msg)
+	}
+	return r.recording
+}
+
+func (r *failureRecorder) Helper() {}
+
+func (r *failureRecorder) Errorf(format string, args ...any) {
+	if !r.record(fmt.Sprintf(format, args...)) {
+		r.TB.Errorf(format, args...)
+	}
+}
+
+func (r *failureRecorder) Fatalf(format string, args ...any) {
+	if !r.record(fmt.Sprintf(format, args...)) {
+		r.TB.Fatalf(format, args...)
+	}
+	runtime.Goexit()
+}
+
+func (r *failureRecorder) Fatal(args ...any) {
+	if !r.record(fmt.Sprint(args...)) {
+		r.TB.Fatal(args...)
+	}
+	runtime.Goexit()
 }
 
 func machine(t *testing.T, srv *moil.Server, id string) moil.Machine {

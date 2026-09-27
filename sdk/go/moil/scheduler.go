@@ -575,7 +575,7 @@ func (sc *scheduler) prepared(j *jobState, p *preparation, inputs map[string]Dow
 	var ins map[string]wire.Download
 	var outs map[string]wire.Upload
 	if err == nil {
-		ins, outs, err = wireFiles(inputs, outputs)
+		ins, outs, err = wireFiles(sc.cfg.urlPolicy(), inputs, outputs)
 	}
 	if err == nil {
 		err = checkSize(j.assign(p.n, sc.cfg.LeaseTTL, ins, outs))

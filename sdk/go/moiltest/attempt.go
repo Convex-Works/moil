@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -159,7 +161,9 @@ func (a *Attempt) sendLocked(msg wire.Message) {
 }
 
 // Input downloads an input the way the runtime does, and returns its
-// bytes. It fails the test unless the download answers 2xx.
+// bytes. It fails the test unless the download answers 2xx, and if the
+// URL, or one it redirects to, is one machines refuse (see
+// WithInsecureHTTP).
 func (a *Attempt) Input(name string) []byte {
 	a.m.t.Helper()
 	in, ok := a.Inputs[name]
@@ -173,7 +177,7 @@ func (a *Attempt) Input(name string) []byte {
 	for k, v := range in.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := a.m.client.Do(req)
+	resp, err := a.transfer("input", name, req)
 	if err != nil {
 		a.m.t.Fatalf("moiltest: downloading input %q: %v", name, err)
 	}
@@ -187,7 +191,8 @@ func (a *Attempt) Input(name string) []byte {
 
 // Output uploads a declared output the way the runtime does: the bytes as
 // the body, with the declared method and headers. It fails the test unless
-// the upload answers 2xx. Succeed reports every uploaded output.
+// the upload answers 2xx, and if the URL is one machines refuse (see
+// WithInsecureHTTP). Succeed reports every uploaded output.
 func (a *Attempt) Output(name string, data []byte) {
 	a.m.t.Helper()
 	out, ok := a.Outputs[name]
@@ -205,7 +210,7 @@ func (a *Attempt) Output(name string, data []byte) {
 	for k, v := range out.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := a.m.client.Do(req)
+	resp, err := a.transfer("output", name, req)
 	if err != nil {
 		a.m.t.Fatalf("moiltest: uploading output %q: %v", name, err)
 	}
@@ -217,6 +222,34 @@ func (a *Attempt) Output(name string, data []byte) {
 	a.m.mu.Lock()
 	defer a.m.mu.Unlock()
 	a.uploaded[name] = wire.FileInfo{SizeBytes: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
+}
+
+// transfer sends an input or output request as the runtime does, holding
+// its URL and every redirect to the machine's URL policy (spec §3). It
+// fails the test if the policy refuses a URL.
+func (a *Attempt) transfer(kind, name string, req *http.Request) (*http.Response, error) {
+	a.m.t.Helper()
+	policy := wire.ServicePolicy(a.m.baseURL, a.m.insecureHTTP)
+	if err := policy.Check(req.URL.String()); err != nil {
+		a.m.t.Fatalf("moiltest: a machine would refuse %s %q: the URL %v", kind, name, err)
+	}
+	var refused error
+	client := *a.m.client
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if err := policy.Check(req.URL.String()); err != nil {
+			refused = fmt.Errorf("it redirects to %s, which %w", req.URL.Redacted(), err)
+			return refused
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
+	if refused != nil {
+		a.m.t.Fatalf("moiltest: a machine would refuse %s %q: %v", kind, name, refused)
+	}
+	return resp, err
 }
 
 // Succeed ends the attempt successfully, with meta (nil for none) and

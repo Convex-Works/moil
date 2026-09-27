@@ -73,6 +73,13 @@ func WithGPU(name string, memoryBytes int64) Option {
 // failing the test.
 func WithTimeout(d time.Duration) Option { return func(m *Machine) { m.timeout = d } }
 
+// WithInsecureHTTP makes the machine accept plain http input and output
+// URLs on any host, as a machine whose owner allowed insecure http in its
+// settings does. Use it with moil.Config.AllowInsecureHTTP. Without it
+// the machine accepts https, and http to loopback hosts only while the
+// service is on loopback, as it is in tests (spec §3).
+func WithInsecureHTTP() Option { return func(m *Machine) { m.insecureHTTP = true } }
+
 // At makes Pair reach the service at baseURL, such as the moil prefix of
 // the service's own router, instead of serving the Server's handler on a
 // new test server.
@@ -82,11 +89,12 @@ func At(baseURL string) Option {
 
 // A Machine is a fake moil machine paired with one service.
 type Machine struct {
-	t       testing.TB
-	baseURL string
-	client  *http.Client
-	timeout time.Duration
-	info    wire.MachineInfo
+	t            testing.TB
+	baseURL      string
+	client       *http.Client
+	timeout      time.Duration
+	info         wire.MachineInfo
+	insecureHTTP bool
 
 	mu         sync.Mutex
 	id, token  string
