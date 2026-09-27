@@ -8,12 +8,14 @@
 //! and gets a `renew` when its running attempt has been quiet for a third
 //! of its lease. Deriving what to send from state, rather than sending as
 //! things happen, is what makes reconnecting and resuming (spec §7.5) fall
-//! out naturally.
+//! out naturally. Inputs that arrive together make one round, after which
+//! the owner gets one new [`Snapshot`], however many there were.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
@@ -29,7 +31,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::connection::{self, LinkEvent};
+use super::connection::{self, LinkEvent, Outbox};
 use super::{
     AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
 };
@@ -97,8 +99,12 @@ impl fmt::Display for AttemptKey {
 const MIN_RENEW_INTERVAL: Duration = Duration::from_millis(50);
 /// ...and at least this often, however long.
 const MAX_RENEW_INTERVAL: Duration = Duration::from_secs(3600);
-/// How long shutting down waits for connections to close.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most inputs handled in one round, between two snapshots.
+const MAX_ROUND: usize = 256;
+/// How long the coordinator waits for a connection to close. The
+/// connection gives up on its own after [`connection::CLOSE_TIMEOUT`]; this
+/// only guards against a bug there.
+const CLOSE_WAIT: Duration = connection::CLOSE_TIMEOUT.saturating_mul(2);
 
 pub(super) struct Coordinator {
     machine: Machine,
@@ -108,10 +114,21 @@ pub(super) struct Coordinator {
     inputs: mpsc::UnboundedSender<Input>,
     snapshot: watch::Sender<Snapshot>,
     paused: bool,
+    /// What the settings should say about pausing, for the writes that
+    /// save it.
+    paused_choice: Arc<AtomicBool>,
     services: BTreeMap<ServiceId, Service>,
+    /// Verified copies of the bundles some service's approval names, by
+    /// hash: offers and assignments are answered from these, without
+    /// reading the store.
+    bundles: HashMap<BundleHash, Bundle>,
     /// Attempts whose messages the machine keeps until the service
-    /// acknowledges their `done`.
+    /// acknowledges their `done`. Only attempts that started: a refused
+    /// one's `done` is sent once and forgotten (spec §7.5).
     attempts: BTreeMap<AttemptKey, Attempt>,
+    /// Attempts with messages their service may not have yet, for
+    /// [`reconcile`](Self::reconcile) to send.
+    unsent: BTreeSet<AttemptKey>,
     /// The one attempt running on this machine, if any.
     running: Option<Running>,
     /// The attempt that ran before, once it ended.
@@ -135,7 +152,10 @@ struct Service {
 
 /// An open channel to a service.
 struct Link {
-    outbox: mpsc::UnboundedSender<String>,
+    outbox: Outbox,
+    /// The outbox was full: nothing more is sent until the connection has
+    /// written what it holds.
+    held: bool,
     /// Whether the service answered `hello`. Until it has, the machine
     /// sends nothing else.
     welcomed: bool,
@@ -147,9 +167,23 @@ struct Link {
 }
 
 impl Link {
-    fn send(&self, message: &MachineMessage) {
-        let text = serde_json::to_string(message).expect("machine messages serialize");
-        let _ = self.outbox.send(text);
+    /// Queues `message` for the service. Returns whether it was: not while
+    /// the outbox is full.
+    fn send(&mut self, message: &MachineMessage) -> bool {
+        self.queue(|| serde_json::to_string(message).expect("machine messages serialize"))
+    }
+
+    fn queue(&mut self, frame: impl FnOnce() -> String) -> bool {
+        if !self.held {
+            self.held = !self.outbox.queue(frame());
+        }
+        !self.held
+    }
+
+    /// Whether the service takes messages now: it answered `hello` and
+    /// its outbox has room.
+    fn ready(&self) -> bool {
+        self.welcomed && !self.held
     }
 }
 
@@ -214,6 +248,23 @@ impl Attempt {
         self.next_seq += 1;
     }
 
+    /// Sends `link` the kept messages it hasn't had, oldest first. Returns
+    /// whether all of them went: not if the outbox filled up.
+    fn deliver(&mut self, link: &mut Link, now: Instant) -> bool {
+        // Kept messages are in `seq` order, so the unsent ones are the
+        // newest: an attempt's every event isn't looked at again each
+        // round, however many it sends.
+        let unsent = self.kept.partition_point(|(seq, _)| *seq <= self.delivered);
+        for (seq, text) in self.kept.range(unsent..) {
+            if !link.queue(|| text.clone()) {
+                return false;
+            }
+            self.delivered = *seq;
+            self.last_sent = now;
+        }
+        true
+    }
+
     fn renew_at(&self) -> Instant {
         self.last_sent + (self.lease / 3).clamp(MIN_RENEW_INTERVAL, MAX_RENEW_INTERVAL)
     }
@@ -251,6 +302,19 @@ enum Unavailable {
     NotApproved(String),
 }
 
+impl From<Unavailable> for JobError {
+    /// The error of a `done` refusing an assignment (spec §7.2).
+    fn from(unavailable: Unavailable) -> Self {
+        match unavailable {
+            Unavailable::Busy => {
+                JobError::new(ErrorCode::Busy, "the machine is running another job")
+            }
+            Unavailable::Paused => JobError::new(ErrorCode::Busy, "the machine is paused"),
+            Unavailable::NotApproved(why) => JobError::new(ErrorCode::NotApproved, why),
+        }
+    }
+}
+
 impl Coordinator {
     pub(super) fn new(
         machine: Machine,
@@ -259,15 +323,19 @@ impl Coordinator {
         inputs: mpsc::UnboundedSender<Input>,
         snapshot: watch::Sender<Snapshot>,
     ) -> Self {
+        let paused = machine.settings().paused;
         let mut coordinator = Self {
-            paused: machine.settings().paused,
+            paused,
+            paused_choice: Arc::new(AtomicBool::new(paused)),
             machine,
             executor,
             options,
             inputs,
             snapshot,
             services: BTreeMap::new(),
+            bundles: HashMap::new(),
             attempts: BTreeMap::new(),
+            unsent: BTreeSet::new(),
             running: None,
             last_job: None,
             next_task: 0,
@@ -283,6 +351,7 @@ impl Coordinator {
     }
 
     pub(super) async fn run(mut self, mut inputs: mpsc::UnboundedReceiver<Input>) {
+        self.bundles = self.warm_up().await;
         while !self.shut_down() {
             let renew_at = self.renew_at();
             let deliver_by = self.shutdown.as_ref().and_then(|s| s.deliver_by);
@@ -295,6 +364,15 @@ impl Coordinator {
                 () = sleep_until(deliver_by) => {}
             }
             self.reconcile();
+            // What else has arrived meanwhile, such as a burst of progress
+            // from a chatty script, makes one round, and one snapshot.
+            for _ in 1..MAX_ROUND {
+                let Ok(input) = inputs.try_recv() else {
+                    break;
+                };
+                self.handle(input);
+                self.reconcile();
+            }
             self.publish();
             for reply in self.replies.drain(..) {
                 let _ = reply.send(());
@@ -304,6 +382,38 @@ impl Coordinator {
         for waiter in self.shutdown.take().into_iter().flat_map(|s| s.waiters) {
             let _ = waiter.send(());
         }
+    }
+
+    /// Gets ready, off the coordinator, what answering services takes: the
+    /// hardware `hello` describes, and verified copies of the approved
+    /// bundles. A copy that fails verification is left out, so the machine
+    /// declines its jobs.
+    async fn warm_up(&self) -> HashMap<BundleHash, Bundle> {
+        let approved: BTreeSet<BundleHash> = self
+            .services
+            .values()
+            .flat_map(|s| s.paired.approved_hashes())
+            .collect();
+        let loaded = self.machine.blocking(move |machine| {
+            machine.info();
+            let store = machine.home().bundles();
+            let verified = approved.into_iter().filter_map(|hash| match store.get(&hash) {
+                Ok(Some(bundle)) => Some((hash, bundle)),
+                Ok(None) => {
+                    tracing::error!("the approved bundle {hash} isn't stored; approve it again to take its jobs");
+                    None
+                }
+                Err(e) => {
+                    tracing::error!("the stored copy of approved bundle {hash} failed verification ({e}); approve it again to take its jobs");
+                    None
+                }
+            });
+            Ok(verified.collect())
+        });
+        loaded.await.unwrap_or_else(|e| {
+            tracing::error!("couldn't read the approved bundles: {e}");
+            HashMap::new()
+        })
     }
 
     fn handle(&mut self, input: Input) {
@@ -336,12 +446,14 @@ impl Coordinator {
             }
             Command::Disconnect(id, reply) => {
                 self.drop_attempts(&id);
-                match self.services.remove(&id) {
+                let removed = self.services.remove(&id);
+                self.drop_unapproved_bundles();
+                match removed {
                     Some(service) => {
                         service.stop.cancel();
                         let inputs = self.inputs.clone();
                         tokio::spawn(async move {
-                            let _ = service.join.await;
+                            let _ = tokio::time::timeout(CLOSE_WAIT, service.join).await;
                             let _ = inputs.send(Input::Reply(reply));
                         });
                     }
@@ -364,17 +476,17 @@ impl Coordinator {
                     service.paired = *paired;
                 }
                 if let Some(bundle) = approved {
+                    self.bundles.insert(bundle.hash(), (*bundle).clone());
                     self.prepare(*bundle);
                 }
+                self.drop_unapproved_bundles();
                 self.replies.push(reply);
             }
             Command::SetPaused(paused) => {
                 if paused != self.paused {
                     self.paused = paused;
                     tracing::info!("{}", if paused { "paused" } else { "resumed" });
-                    if let Err(e) = self.machine.update_settings(|s| s.paused = paused) {
-                        tracing::warn!("couldn't remember that the machine is paused: {e}");
-                    }
+                    self.remember_paused();
                 }
             }
             Command::StopJob => {
@@ -408,6 +520,16 @@ impl Coordinator {
             }
             LinkEvent::Open(outbox) => self.hello(id, outbox),
             LinkEvent::Message(message) => self.message(id, message),
+            LinkEvent::Unreadable { attempt, reason } => {
+                if service.link.as_ref().is_some_and(|l| l.welcomed) {
+                    self.unreadable(id, attempt, reason);
+                }
+            }
+            LinkEvent::Drained => {
+                if let Some(link) = &mut service.link {
+                    link.held = false;
+                }
+            }
             LinkEvent::Lost { error, retry_at } => {
                 tracing::info!("lost {}: {error}", service.paired.name);
                 service.link = None;
@@ -435,7 +557,7 @@ impl Coordinator {
     }
 
     /// Opens the conversation (spec §6.2).
-    fn hello(&mut self, id: &ServiceId, outbox: mpsc::UnboundedSender<String>) {
+    fn hello(&mut self, id: &ServiceId, outbox: Outbox) {
         let state = self.state();
         let announced: Vec<AttemptRef> = self
             .attempts
@@ -447,8 +569,10 @@ impl Coordinator {
             return;
         };
         let approved = service.paired.approved_hashes();
-        let link = Link {
+        warn_unannounced(&service.paired);
+        let mut link = Link {
             outbox,
+            held: false,
             welcomed: false,
             announced: announced.clone(),
             state,
@@ -517,7 +641,10 @@ impl Coordinator {
                 .iter()
                 .find(|r| r.job_id == key.attempt.job_id && r.attempt == key.attempt.attempt);
             match (resumed, self.attempts.get_mut(&key)) {
-                (Some(resume), Some(attempt)) => attempt.delivered = resume.seq,
+                (Some(resume), Some(attempt)) => {
+                    attempt.delivered = resume.seq;
+                    self.unsent.insert(key);
+                }
                 (Some(_), None) => {}
                 (None, _) => {
                     tracing::info!("{id} no longer expects {key}; abandoning it");
@@ -541,7 +668,10 @@ impl Coordinator {
                 },
             },
         };
-        self.send(id, &answer);
+        if !self.send(id, &answer) {
+            // The offer expires unanswered, as if it had been lost.
+            tracing::debug!("couldn't answer an offer from {id}: its channel is backed up");
+        }
     }
 
     /// Starts an attempt, or reports at once why it can't start (spec
@@ -555,22 +685,9 @@ impl Coordinator {
             tracing::warn!("ignoring a second assign for {key}");
             return;
         }
-        let mut attempt = Attempt::new(Duration::from_millis(assign.lease_ms));
         let bundle = match self.availability(id, &assign.bundle_hash) {
-            Ok(bundle) => bundle,
-            Err(unavailable) => {
-                let error = match unavailable {
-                    Unavailable::Busy => {
-                        JobError::new(ErrorCode::Busy, "the machine is running another job")
-                    }
-                    Unavailable::Paused => JobError::new(ErrorCode::Busy, "the machine is paused"),
-                    Unavailable::NotApproved(why) => JobError::new(ErrorCode::NotApproved, why),
-                };
-                tracing::info!("refused {key}: {}", error.message);
-                attempt.push_done(&key, Outcome::failed(error));
-                self.attempts.insert(key, attempt);
-                return;
-            }
+            Ok(bundle) => bundle.clone(),
+            Err(unavailable) => return self.refuse(key, unavailable.into()),
         };
         tracing::info!("starting {key}: {}", bundle.manifest().name);
         let (stopper, stop) = moil_runtime::stop_signal();
@@ -586,7 +703,10 @@ impl Coordinator {
             started_at: Instant::now(),
             stopping: false,
         };
-        self.attempts.insert(key.clone(), attempt);
+        self.attempts.insert(
+            key.clone(),
+            Attempt::new(Duration::from_millis(assign.lease_ms)),
+        );
         self.running = Some(Running {
             key: key.clone(),
             bundle: bundle.hash(),
@@ -596,6 +716,38 @@ impl Coordinator {
         let mut job = Job::from_assign(assign, bundle);
         job.url_policy = self.url_policy(&key.service);
         self.spawn_attempt(key, job, stop);
+    }
+
+    /// Refuses an assignment the machine can't read (spec §7.2), unless it
+    /// names an attempt the machine already holds.
+    fn unreadable(&mut self, id: &ServiceId, attempt: AttemptRef, reason: String) {
+        let key = AttemptKey {
+            service: id.clone(),
+            attempt,
+        };
+        if self.attempts.contains_key(&key) {
+            tracing::warn!(
+                "ignoring a second assign for {key}, which moil can't read either: {reason}"
+            );
+            return;
+        }
+        self.refuse(key, JobError::new(ErrorCode::Rejected, reason));
+    }
+
+    /// Answers an assignment the machine won't run with a failed `done`.
+    /// The machine doesn't keep it (spec §7.5): if it doesn't reach the
+    /// service, the service fails the attempt as `lost`.
+    fn refuse(&mut self, key: AttemptKey, error: JobError) {
+        tracing::info!("refused {key}: {}", error.message);
+        let done = MachineMessage::Done(Done {
+            job_id: key.attempt.job_id.clone(),
+            attempt: key.attempt.attempt,
+            seq: 1,
+            outcome: Outcome::failed(error),
+        });
+        if !self.send(&key.service, &done) {
+            tracing::debug!("couldn't tell {} that {key} was refused", key.service);
+        }
     }
 
     /// Which URLs the jobs of service `id` may use for their files (spec
@@ -613,7 +765,7 @@ impl Coordinator {
 
     /// Whether the machine takes a job for `hash` from `id` now (spec
     /// §7.1): idle, approved, and holding a verified copy.
-    fn availability(&self, id: &ServiceId, hash: &BundleHash) -> Result<Bundle, Unavailable> {
+    fn availability(&self, id: &ServiceId, hash: &BundleHash) -> Result<&Bundle, Unavailable> {
         if self.running.is_some() {
             return Err(Unavailable::Busy);
         }
@@ -629,18 +781,31 @@ impl Coordinator {
                 "the machine's owner hasn't approved bundle {hash}"
             )));
         }
-        match self.machine.approved_bundle(id, *hash) {
-            Ok(Some(bundle)) => Ok(bundle),
-            Ok(None) => Err(Unavailable::NotApproved(format!(
-                "the machine has no approved copy of bundle {hash}"
-            ))),
-            Err(e) => {
-                tracing::error!("the approved copy of bundle {hash} failed verification: {e}");
-                Err(Unavailable::NotApproved(format!(
-                    "the machine's copy of bundle {hash} failed verification"
-                )))
+        self.bundles.get(hash).ok_or_else(|| {
+            Unavailable::NotApproved(format!("the machine has no verified copy of bundle {hash}"))
+        })
+    }
+
+    /// Forgets the verified bundles no service's approval names anymore.
+    fn drop_unapproved_bundles(&mut self) {
+        let services = &self.services;
+        self.bundles
+            .retain(|hash, _| services.values().any(|s| s.paired.is_approved(hash)));
+    }
+
+    /// Saves in the settings whether the machine is paused, off the
+    /// coordinator. Each write saves the latest choice, so the last one to
+    /// run leaves it on disk, whichever order they run in.
+    fn remember_paused(&self) {
+        self.paused_choice.store(self.paused, Ordering::SeqCst);
+        let choice = self.paused_choice.clone();
+        let machine = self.machine.clone();
+        tokio::task::spawn_blocking(move || {
+            let saved = machine.update_settings(|s| s.paused = choice.load(Ordering::SeqCst));
+            if let Err(e) = saved {
+                tracing::warn!("couldn't remember whether the machine is paused: {e}");
             }
-        }
+        });
     }
 
     fn spawn_attempt(&self, key: AttemptKey, job: Job, stop: StopSignal) {
@@ -692,7 +857,7 @@ impl Coordinator {
                         status.message.clone_from(message);
                     }
                     if let Some(message) = message {
-                        tracing::info!("{key}: {message}");
+                        tracing::debug!("{key}: {message}");
                     }
                 }
                 JobEvent::Log { .. } | JobEvent::Data { .. } => {}
@@ -701,6 +866,7 @@ impl Coordinator {
         // Abandoned attempts are gone, and so are their late events.
         if let Some(attempt) = self.attempts.get_mut(key) {
             attempt.push_event(key, event, self.options.max_kept_bytes);
+            self.unsent.insert(key.clone());
         }
     }
 
@@ -718,6 +884,7 @@ impl Coordinator {
                 Outcome::Cancelled => tracing::info!("{key} was cancelled"),
             }
             attempt.push_done(&key, outcome);
+            self.unsent.insert(key);
         }
     }
 
@@ -766,62 +933,65 @@ impl Coordinator {
     /// `idle` it leads to.
     fn reconcile(&mut self) {
         let now = Instant::now();
-        let running = self.running.as_ref().map(|r| &r.key);
-        for (key, attempt) in &mut self.attempts {
+        for key in std::mem::take(&mut self.unsent) {
+            let Some(attempt) = self.attempts.get_mut(&key) else {
+                continue;
+            };
+            // Until the service answers hello there's nothing to send;
+            // `welcome` marks what it's missing.
             let Some(link) = self
                 .services
-                .get(&key.service)
-                .and_then(|s| s.link.as_ref())
+                .get_mut(&key.service)
+                .and_then(|s| s.link.as_mut())
                 .filter(|l| l.welcomed)
             else {
                 continue;
             };
-            // Kept messages are in `seq` order, so the unsent ones are the
-            // newest: an attempt's every event isn't looked at again each
-            // round, however many it sends.
-            let unsent = attempt
-                .kept
-                .partition_point(|(seq, _)| *seq <= attempt.delivered);
-            let mut sent = false;
-            for (_, text) in attempt.kept.range(unsent..) {
-                let _ = link.outbox.send(text.clone());
-                sent = true;
+            if !attempt.deliver(link, now) {
+                // The rest goes once the outbox has room.
+                self.unsent.insert(key);
             }
-            if sent {
-                attempt.delivered = attempt.kept.back().map_or(0, |(seq, _)| *seq);
-                attempt.last_sent = now;
-            }
-            if running == Some(key) && now >= attempt.renew_at() {
-                link.send(&MachineMessage::Renew(key.attempt.clone()));
-                attempt.last_sent = now;
-            }
+        }
+        if let Some(running) = &self.running
+            && let Some(attempt) = self.attempts.get_mut(&running.key)
+            && let Some(link) = self
+                .services
+                .get_mut(&running.key.service)
+                .and_then(|s| s.link.as_mut())
+                .filter(|l| l.ready())
+            && now >= attempt.renew_at()
+            && link.send(&MachineMessage::Renew(running.key.attempt.clone()))
+        {
+            attempt.last_sent = now;
         }
 
         let state = self.state();
         for service in self.services.values_mut() {
-            let Some(link) = service.link.as_mut().filter(|l| l.welcomed) else {
+            let Some(link) = service.link.as_mut().filter(|l| l.ready()) else {
                 continue;
             };
-            if link.state != state {
-                link.send(&MachineMessage::State { state });
+            if link.state != state && link.send(&MachineMessage::State { state }) {
                 link.state = state;
             }
             let approved = service.paired.approved_hashes();
             if link.approved != approved {
-                link.send(&MachineMessage::Approved {
+                let message = MachineMessage::Approved {
                     hashes: approved.clone(),
-                });
-                link.approved = approved;
+                };
+                if link.send(&message) {
+                    link.approved = approved;
+                    warn_unannounced(&service.paired);
+                }
             }
         }
     }
 
-    /// When the running attempt next needs a `renew`, if its service is
-    /// connected.
+    /// When the running attempt next needs a `renew`, if its service takes
+    /// messages now.
     fn renew_at(&self) -> Option<Instant> {
         let key = &self.running.as_ref()?.key;
         let link = self.services.get(&key.service)?.link.as_ref()?;
-        link.welcomed
+        link.ready()
             .then(|| self.attempts.get(key).map(Attempt::renew_at))
             .flatten()
     }
@@ -867,7 +1037,7 @@ impl Coordinator {
                 service.join
             })
             .collect();
-        let _ = tokio::time::timeout(CLOSE_TIMEOUT, futures::future::join_all(closing)).await;
+        let _ = tokio::time::timeout(CLOSE_WAIT, futures::future::join_all(closing)).await;
     }
 
     fn connect(&mut self, paired: PairedService) {
@@ -876,7 +1046,7 @@ impl Coordinator {
         let stop = CancellationToken::new();
         let join = connection::spawn(
             self.machine.clone(),
-            paired.id.clone(),
+            &paired,
             task,
             self.options.clone(),
             self.inputs.clone(),
@@ -909,10 +1079,15 @@ impl Coordinator {
         });
     }
 
-    fn send(&self, id: &ServiceId, message: &MachineMessage) {
-        if let Some(link) = self.services.get(id).and_then(|s| s.link.as_ref()) {
-            link.send(message);
-        }
+    /// Answers service `id` right away, such as with a bid; what follows
+    /// from the machine's state goes out in [`reconcile`](Self::reconcile).
+    /// Returns whether the message went: not while the service's outbox is
+    /// full.
+    fn send(&mut self, id: &ServiceId, message: &MachineMessage) -> bool {
+        self.services
+            .get_mut(id)
+            .and_then(|s| s.link.as_mut())
+            .is_some_and(|link| link.send(message))
     }
 
     fn publish(&self) {
@@ -950,9 +1125,152 @@ impl Coordinator {
     }
 }
 
+/// Says so when `service` isn't told about every bundle approved for it.
+fn warn_unannounced(service: &PairedService) {
+    let older = service.unannounced_approvals();
+    if older > 0 {
+        tracing::warn!(
+            "{} is told only of the {} bundles approved for it most recently; {older} older \
+             approvals aren't announced, so it won't offer their jobs",
+            service.name,
+            PairedService::MAX_ANNOUNCED
+        );
+    }
+}
+
 async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at.into()).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::future::BoxFuture;
+    use moil_proto::control::{ServiceInfo, Welcome};
+    use moil_runtime::EventSink;
+    use url::Url;
+
+    use super::*;
+    use crate::{Home, MachineConfig, MemorySecrets, Review};
+
+    /// Hands every job it's given to the test.
+    #[derive(Debug)]
+    struct Jobs(mpsc::UnboundedSender<Job>);
+
+    impl Executor for Jobs {
+        fn prepare<'a>(&'a self, _: &'a Bundle) -> BoxFuture<'a, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run(&self, job: Job, _: EventSink, mut stop: StopSignal) -> BoxFuture<'_, Outcome> {
+            let _ = self.0.send(job);
+            Box::pin(async move {
+                stop.stopped().await;
+                Outcome::Cancelled
+            })
+        }
+    }
+
+    /// The job an assignment from the service at `base_url` becomes. The
+    /// test plays the connection, so the service needn't exist: no remote
+    /// service does in tests.
+    async fn job_from(base_url: &str) -> Job {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Machine::open(MachineConfig {
+            home: Home::new(dir.path()),
+            secrets: Arc::new(MemorySecrets::default()),
+            app_version: "0.1.0-test".into(),
+        })
+        .unwrap();
+        let base_url = Url::parse(base_url).unwrap();
+        let (paired, _) = machine
+            .record_pairing(&base_url, "klisi".into(), "m_1".into(), "moil_token")
+            .unwrap();
+        let bundle = Bundle::new(
+            "# /// script\n# requires-python = \">=3.12\"\n# dependencies = []\n# ///\n",
+            "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n",
+            r#"{"moil": 1, "name": "echo", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        let hash = bundle.hash();
+        let review = Review {
+            service: paired,
+            bundle,
+            previous: None,
+            approved: false,
+        };
+        let id = machine.approve(&review).unwrap().id;
+
+        let (jobs, mut ran) = mpsc::unbounded_channel();
+        let (inputs, _) = mpsc::unbounded_channel();
+        let (snapshot, _) = watch::channel(Snapshot::default());
+        let options = AgentOptions::default();
+        let mut coordinator =
+            Coordinator::new(machine, Arc::new(Jobs(jobs)), options, inputs, snapshot);
+        coordinator.services[&id].stop.cancel();
+        coordinator.bundles = coordinator.warm_up().await;
+        let (outbox, _frames) = connection::outbox();
+        let welcome = Welcome {
+            protocol: PROTOCOL_VERSION,
+            machine_id: "m_1".into(),
+            service: ServiceInfo {
+                name: "klisi".into(),
+            },
+            bundles: vec![],
+            resume: vec![],
+        };
+        let assign = Assign {
+            job_id: "j1".parse().unwrap(),
+            attempt: 1,
+            bundle_hash: hash,
+            title: None,
+            params: serde_json::Value::Null,
+            inputs: Default::default(),
+            outputs: Default::default(),
+            lease_ms: 120_000,
+            timeout_ms: None,
+        };
+        for event in [
+            LinkEvent::Open(outbox),
+            LinkEvent::Message(ServiceMessage::Welcome(welcome)),
+            LinkEvent::Message(ServiceMessage::Assign(assign)),
+        ] {
+            let service = id.clone();
+            coordinator.handle(Input::Link {
+                service,
+                task: 0,
+                event,
+            });
+        }
+        ran.recv().await.expect("the attempt runs")
+    }
+
+    fn allows(job: &Job, url: &str) -> bool {
+        job.url_policy.check(&Url::parse(url).unwrap()).is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_remote_services_jobs_cant_use_http_to_this_machine() {
+        let job = job_from("https://klisi.example.com/moil").await;
+        assert!(allows(&job, "https://s3.example.com/meeting.ogg"));
+        for refused in [
+            "http://127.0.0.1:6379/",
+            "http://localhost:8080/admin",
+            "http://[::1]/",
+            "http://s3.example.com/meeting.ogg",
+        ] {
+            assert!(!allows(&job, refused), "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_on_this_machine_may_use_http_to_it() {
+        let job = job_from("http://127.0.0.1:8787/moil").await;
+        assert!(allows(&job, "http://127.0.0.1:8787/files/meeting.ogg"));
+        assert!(allows(&job, "http://localhost:9000/bucket/out.json"));
+        assert!(allows(&job, "https://s3.example.com/meeting.ogg"));
+        assert!(!allows(&job, "http://s3.example.com/meeting.ogg"));
     }
 }

@@ -5,6 +5,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 mod app;
 mod backend;
@@ -21,12 +22,13 @@ mod page;
 mod pair;
 mod platform;
 mod review;
+mod snapshots;
 mod tray;
 mod unpair;
 mod view;
 
 use backend::Backend;
-use login::{DemoLoginItem, LoginItem, SystemLoginItem};
+use login::{Cached, DemoLoginItem, LoginItem, SystemLoginItem};
 
 const USAGE: &str = "\
 usage: moil-app [--demo] [moil://…]
@@ -99,7 +101,8 @@ fn main() -> ExitCode {
             let demo: Arc<dyn Backend> = Arc::new(demo::Demo::start());
             (Ok(demo), Box::new(DemoLoginItem::default()))
         } else {
-            (backend::start_agent(), Box::new(SystemLoginItem::new()))
+            let login = Cached::new(SystemLoginItem::new(), Duration::from_secs(30));
+            (backend::start_agent(), Box::new(login))
         }
     };
     app::run(runtime, backend, login, options.links, log_file)

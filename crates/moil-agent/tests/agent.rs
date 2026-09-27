@@ -4,11 +4,12 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use moil_agent::{
-    Agent, AgentHandle, AgentOptions, Connection, JobOutcome, JobReport, Machine, PairedService,
-    Settings,
+    Agent, AgentHandle, AgentOptions, Approval, Connection, Home, JobOutcome, JobReport, Machine,
+    MachineConfig, PairedService, Settings,
 };
 use moil_bundle::Bundle;
 use moil_proto::control::{EventMessage, Hello, Welcome};
@@ -219,6 +220,39 @@ async fn hello_describes_the_machine_and_what_it_approved_for_that_service() {
 }
 
 #[tokio::test]
+async fn a_service_is_told_of_its_1024_most_recent_approvals_at_most() {
+    let mut approved = Vec::new();
+    let setup = Setup::build(&["klisi"], fast(), |machine, services| {
+        // Approved one after another, after the setup's own.
+        let mut paired = services[0].1.clone();
+        for i in 0..1029 {
+            let hash = bundle("transcribe", &format!("1.0.{i}"), "print('hi')").hash();
+            paired.approvals.push(Approval {
+                hash,
+                name: "transcribe".into(),
+                version: format!("1.0.{i}"),
+                approved_at: std::time::SystemTime::now(),
+            });
+        }
+        let all: Vec<_> = paired.approvals.iter().map(|a| a.hash).collect();
+        approved = all[all.len() - 1024..].to_vec();
+        let file = machine
+            .home()
+            .services_dir()
+            .join(format!("{}.json", paired.id));
+        std::fs::write(file, serde_json::to_vec(&paired).unwrap()).unwrap();
+    })
+    .await;
+    let hello = setup.service().accept().await.hello().await;
+    assert_eq!(hello.approved.len(), 1024);
+    assert_eq!(hello.approved, approved, "the newest, oldest first");
+    assert!(
+        !hello.approved.contains(&setup.hash()),
+        "the oldest approvals aren't announced"
+    );
+}
+
+#[tokio::test]
 async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     let mut setup = Setup::new().await;
     let mut conn = setup.connect().await;
@@ -230,15 +264,6 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     let unapproved = bundle("summarize", "1.0.0", "print('?')");
     conn.send(offer("j2", unapproved.hash()));
     assert_eq!(conn.recv().await, decline("j2", DeclineReason::NotApproved));
-
-    // The stored copy no longer matches the approved hash.
-    let store = setup.agent.machine().home().bundles();
-    std::fs::write(store.dir(&hash).join("job.py"), "print('edited')\n").unwrap();
-    conn.send(offer("j3", hash));
-    assert_eq!(conn.recv().await, decline("j3", DeclineReason::NotApproved));
-    store.put(&setup.bundle).unwrap();
-    conn.send(offer("j4", hash));
-    assert_eq!(conn.recv().await, bid("j4"));
 
     setup.agent.set_paused(true);
     assert_eq!(conn.recv().await, state(MachineState::Paused));
@@ -252,6 +277,87 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     let _run = setup.runs.next().await;
     conn.send(offer("j7", hash));
     assert_eq!(conn.recv().await, decline("j7", DeclineReason::Busy));
+}
+
+#[tokio::test]
+async fn jobs_run_the_copy_verified_at_approval_whatever_happens_to_the_store() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let hash = setup.hash();
+
+    // Offers are answered from memory: the store isn't read, let alone
+    // hashed, for each one...
+    let store = setup.agent.machine().home().bundles();
+    std::fs::write(store.dir(&hash).join("job.py"), "import os\n").unwrap();
+    conn.send(offer("j1", hash));
+    assert_eq!(conn.recv().await, bid("j1"));
+
+    // ...and the job gets the approved bundle, which the runtime checks
+    // the stored copy against before it runs.
+    conn.send(assign("j1", 1, hash, 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    assert_eq!(setup.runs.next().await.job.bundle, setup.bundle);
+}
+
+#[tokio::test]
+async fn a_stored_copy_that_fails_verification_takes_no_jobs_until_approved_again() {
+    let mut setup = Setup::build(&["klisi"], fast(), |machine, services| {
+        let hash = services[0].1.approvals[0].hash;
+        let dir = machine.home().bundles().dir(&hash);
+        std::fs::write(dir.join("job.py"), "import os\n").unwrap();
+    })
+    .await;
+    let mut conn = setup.connect().await;
+    let hash = setup.hash();
+    conn.send(offer("j1", hash));
+    assert_eq!(conn.recv().await, decline("j1", DeclineReason::NotApproved));
+    conn.send(assign("j1", 1, hash, 30_000));
+    let (_, error) = failure(conn.recv().await);
+    assert_eq!(error.code, ErrorCode::NotApproved);
+
+    let review = setup.agent.review(&setup.paired().id, hash).await.unwrap();
+    setup.agent.approve(&review).await.unwrap();
+    conn.send(offer("j2", hash));
+    assert_eq!(conn.recv().await, bid("j2"));
+    conn.send(assign("j2", 1, hash, 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    assert_eq!(setup.runs.next().await.job.bundle, setup.bundle);
+}
+
+#[tokio::test]
+async fn a_keychain_that_keeps_moil_waiting_doesnt_hold_up_the_agent() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = Arc::new(SlowSecrets::new(dir.path().join("secrets.json")));
+    let machine = Machine::open(MachineConfig {
+        home: Home::new(dir.path()),
+        secrets: keychain.clone(),
+        app_version: "0.1.0-test".into(),
+    })
+    .unwrap();
+    pair(&machine, &service).await;
+    let (executor, _runs) = fake_executor();
+
+    // Like a keychain asking the owner for permission, every read takes
+    // its time: connecting, then unpairing, read the token.
+    keychain.slow_down(Duration::from_secs(1));
+    let agent = Agent::start_with(machine, executor, fast());
+    let started = Instant::now();
+    agent.set_paused(true);
+    snapshot_where(&agent, "the pause to show", |s| s.paused).await;
+    let id = agent.snapshot().services[0].id.clone();
+    let unpairing = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.unpair(&id).await }
+    });
+    agent.set_paused(false);
+    snapshot_where(&agent, "the resumption to show", |s| !s.paused).await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(500),
+        "the agent was held up for {took:?}"
+    );
+    within("unpairing", unpairing).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -278,6 +384,105 @@ async fn an_assignment_the_machine_cant_take_fails_at_once() {
         (1, ErrorCode::Busy, true)
     );
     assert!(!setup.runs.has_pending_run(), "only one attempt ever ran");
+}
+
+#[tokio::test]
+async fn a_refused_assignment_is_answered_once_and_not_kept() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let unapproved = bundle("summarize", "1.0.0", "print('?')");
+    conn.send(assign("j1", 1, unapproved.hash(), 30_000));
+    failure(conn.recv().await);
+
+    // Never acknowledged, it isn't offered again: the service fails the
+    // attempt as lost (spec §7.5).
+    conn.drop_connection();
+    let hello = setup.service().accept().await.hello().await;
+    assert_eq!(hello.attempts, []);
+}
+
+#[tokio::test]
+async fn a_flood_of_refused_assignments_costs_the_machine_nothing() {
+    let setup = Setup::new().await;
+    let conn = setup.connect().await;
+    let unapproved = bundle("summarize", "1.0.0", "print('?')").hash();
+
+    // Kept until acknowledged, and all looked at again after each
+    // message, 40,000 of these took seconds and memory without end.
+    const ASSIGNS: u32 = 20_000;
+    let started = Instant::now();
+    for attempt in 1..=ASSIGNS {
+        conn.send(assign("j1", attempt, unapproved, 30_000));
+    }
+    // The machine reads them all before it sees the connection drop.
+    conn.drop_connection();
+    let mut conn = setup.service().accept().await;
+    assert_eq!(conn.hello().await.attempts, [], "none of them was kept");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "{ASSIGNS} refusals took {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_assignment_the_machine_cant_read_is_rejected() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let hash = setup.hash();
+    let assign = |attempt: u32, params: &str, more: &str| {
+        format!(
+            r#"{{"type": "assign", "job_id": "j1", "attempt": {attempt}, "bundle_hash": "{hash}",
+                "params": {params}, "lease_ms": 30000{more}}}"#
+        )
+    };
+    let nested = |levels| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+    let unreadable = [
+        // Deeper than any JSON parser need follow...
+        assign(1, &nested(10_000), ""),
+        // ...or than the spec allows (§10).
+        assign(2, &nested(65), ""),
+        // No double holds it.
+        assign(3, r#"{"x": 1e400}"#, ""),
+        // An upload method from a later protocol.
+        assign(
+            4,
+            "null",
+            r#", "outputs": {"out.json": {"url": "https://s3.example/o", "method": "PATCH"}}"#,
+        ),
+        // A time limit of nothing (§6.3).
+        assign(5, "null", r#", "timeout_ms": 0"#),
+    ];
+    for (attempt, text) in (1..).zip(&unreadable) {
+        conn.send_text(text);
+        match conn.recv().await {
+            MachineMessage::Done(Done {
+                job_id,
+                attempt: done_attempt,
+                seq: 1,
+                outcome: Outcome::Failed { error },
+            }) => {
+                assert_eq!((job_id.as_str(), done_attempt), ("j1", attempt));
+                assert_eq!(
+                    (error.code, error.retryable),
+                    (ErrorCode::Rejected, false),
+                    "{error}"
+                );
+            }
+            other => panic!("expected a rejected done for attempt {attempt}, got {other:?}"),
+        }
+    }
+    assert!(!setup.runs.has_pending_run(), "none of them ran");
+
+    // At the spec's limits, an attempt runs...
+    conn.send_text(&assign(6, &nested(64), r#", "timeout_ms": 1"#));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+    assert_eq!(run.job.attempt, 6);
+    // ...and an unreadable assign for it changes nothing.
+    conn.send_text(&assign(6, "1e400", ""));
+    conn.send(offer("j2", hash));
+    assert_eq!(conn.recv().await, decline("j2", DeclineReason::Busy));
 }
 
 #[tokio::test]
@@ -694,7 +899,7 @@ async fn a_chatty_attempt_is_relayed_as_briskly_as_a_quiet_one() {
     // The fake service doesn't ping; a slow relay should fail the
     // assertion below, not look like a dead channel.
     let options = AgentOptions {
-        receive_timeout: Duration::from_secs(60),
+        channel_timeout: Duration::from_secs(60),
         ..fast()
     };
     let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
@@ -803,7 +1008,7 @@ async fn other_failures_are_retried() {
 #[tokio::test]
 async fn a_silent_service_is_given_up_on_but_pings_keep_it_alive() {
     let options = AgentOptions {
-        receive_timeout: Duration::from_millis(300),
+        channel_timeout: Duration::from_millis(300),
         ..fast()
     };
     let setup = Setup::build(&["klisi"], options, |_, _| {}).await;
@@ -823,6 +1028,104 @@ async fn a_silent_service_is_given_up_on_but_pings_keep_it_alive() {
     let _conn = setup.connect().await;
 }
 
+/// A `data` event of `kib` KiB.
+fn bulky(i: usize, kib: usize) -> JobEvent {
+    JobEvent::Data {
+        payload: serde_json::json!({"i": i, "text": "x".repeat(kib << 10)}),
+    }
+}
+
+/// Sends `events` bulky events, then waits until the agent has handled
+/// them: sent them on, or held them back for a service that isn't reading.
+async fn flood(agent: &AgentHandle, run: &FakeRun, events: usize, kib: usize) {
+    for i in 0..events {
+        run.emit(bulky(i, kib));
+    }
+    run.emit(progress(0.5, "flooded"));
+    snapshot_where(agent, "the agent to handle the flood", |s| {
+        s.job.as_ref().is_some_and(|j| j.fraction == Some(0.5))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_service_that_stops_reading_is_given_up_on_even_while_it_pings() {
+    let options = AgentOptions {
+        channel_timeout: Duration::from_millis(500),
+        ..fast()
+    };
+    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+
+    // The service stops reading, but it keeps pinging: the machine hears
+    // from it all along, and only its writes stall.
+    conn.stop_reading();
+    flood(&setup.agent, &run, 100, 200).await;
+    let pinging = async {
+        loop {
+            conn.ping();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let mut conn = tokio::select! {
+        conn = setup.service().accept() => conn,
+        () = pinging => unreachable!(),
+    };
+    assert_eq!(conn.hello().await.attempts, [attempt("j1", 1)]);
+}
+
+#[tokio::test]
+async fn unpairing_doesnt_wait_on_a_service_that_stopped_reading() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let mut run = setup.runs.next().await;
+    conn.stop_reading();
+    flood(&setup.agent, &run, 100, 200).await;
+
+    within("unpairing", setup.agent.unpair(&setup.paired().id))
+        .await
+        .unwrap();
+    assert_eq!(run.stopped().await, StopReason::Interrupted);
+    assert_eq!(setup.agent.snapshot().services, []);
+}
+
+#[tokio::test]
+async fn a_slow_service_gets_every_message_in_order_once_it_reads_again() {
+    // Neither silence nor stalled writes run out while the service rests.
+    let options = AgentOptions {
+        channel_timeout: Duration::from_secs(60),
+        max_kept_bytes: 64 << 20,
+        ..fast()
+    };
+    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+
+    // More than the outbox and the network hold together: the machine
+    // holds the rest back until there's room.
+    conn.stop_reading();
+    const EVENTS: u64 = 800;
+    flood(&setup.agent, &run, EVENTS as usize, 32).await;
+    run.finish(succeeded());
+    snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+
+    conn.resume_reading();
+    for (i, seq) in (1..=EVENTS).enumerate() {
+        assert_eq!(conn.recv().await, event("j1", 1, seq, bulky(i, 32)));
+    }
+    let marker = progress(0.5, "flooded");
+    assert_eq!(conn.recv().await, event("j1", 1, EVENTS + 1, marker));
+    assert_eq!(conn.recv().await, done("j1", 1, EVENTS + 2, succeeded()));
+    assert_eq!(conn.recv().await, state(MachineState::Idle));
+}
+
 #[tokio::test]
 async fn pausing_is_told_to_every_service_and_remembered() {
     let setup = Setup::build(&["klisi", "notes"], fast(), |_, _| {}).await;
@@ -833,17 +1136,24 @@ async fn pausing_is_told_to_every_service_and_remembered() {
     assert_eq!(klisi.recv().await, state(MachineState::Paused));
     assert_eq!(notes.recv().await, state(MachineState::Paused));
     assert!(setup.agent.snapshot().paused);
-    let saved: Settings = serde_json::from_str(
-        &std::fs::read_to_string(setup.dir.path().join("settings.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(saved.paused, "the pause survives a restart");
+    let saved = || -> Option<Settings> {
+        let text = std::fs::read_to_string(setup.dir.path().join("settings.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    };
+    until("the pause to be saved", || {
+        saved().is_some_and(|s| s.paused)
+    })
+    .await;
     klisi.send(offer("j1", setup.hash()));
     assert_eq!(klisi.recv().await, decline("j1", DeclineReason::Paused));
 
     setup.agent.set_paused(false);
     assert_eq!(klisi.recv().await, state(MachineState::Idle));
     assert_eq!(notes.recv().await, state(MachineState::Idle));
+    until("the resumption to be saved", || {
+        saved().is_some_and(|s| !s.paused)
+    })
+    .await;
     assert!(!setup.agent.machine().settings().paused);
 }
 
@@ -1003,11 +1313,38 @@ async fn pairing_again_through_the_agent_reconnects_with_the_new_token() {
     let session = setup.agent.pair(&setup.service().base_url).await.unwrap();
     within("pairing", session.wait()).await.unwrap();
 
-    // The service forgets the old machine, closing its channel...
-    assert_eq!(conn.closed().await, Some(4401));
+    // The old channel closes: the agent closes it, or the service does as
+    // it forgets the old machine...
+    let closed = conn.closed().await;
+    assert!(matches!(closed, Some(1000 | 4401)), "{closed:?}");
     // ...and the agent connects with the new token.
     let conn = setup.service().accept().await;
     assert_eq!(conn.token, "moil_token_2");
+}
+
+#[tokio::test]
+async fn pairing_again_connects_at_once_while_the_service_forgets_the_old_token() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let service = setup.service();
+    service.hold_forgets(true);
+    service.script_pairing([TokenReply::Grant]);
+    let session = setup.agent.pair(&service.base_url).await.unwrap();
+
+    // The app stops waiting when its window closes, and nothing here
+    // waits for the service to forget the old token.
+    let paired = tokio::time::timeout(Duration::from_secs(2), session.wait()).await;
+    paired.expect("pairing waited on the service").unwrap();
+    assert_eq!(service.accept().await.token, "moil_token_2");
+
+    // The machine closed the old channel itself...
+    assert_eq!(conn.closed().await, Some(1000));
+    // ...and the service forgets the old token once it gets to it.
+    service.hold_forgets(false);
+    until("the old token to be forgotten", || {
+        service.forgotten() == ["moil_token_1"]
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1124,6 +1461,9 @@ async fn messages_the_machine_cant_use_are_ignored() {
     conn.send_text(r#"{"type": "poll", "question": "lunch?"}"#);
     conn.send_text("not json");
     conn.send_text(r#"{"type": "offer", "job_id": "../../etc", "bundle_hash": "x"}"#);
+    // An assign whose attempt can't be named can't be answered either.
+    conn.send_text(r#"{"type": "assign", "job_id": "../../etc", "attempt": 1}"#);
+    conn.send_text(r#"{"type": "assign", "job_id": "j1", "attempt": -1}"#);
     conn.send(offer("j1", setup.hash()));
     assert_eq!(conn.recv().await, bid("j1"));
 }

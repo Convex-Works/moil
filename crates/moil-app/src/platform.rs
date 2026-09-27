@@ -103,10 +103,76 @@ pub fn reveal(path: &Path) {
     });
 }
 
+/// The signals that ask the app to quit: SIGTERM, as `kill`, launchd and
+/// shutdown scripts send it, and SIGINT, Ctrl-C where it was started from
+/// a terminal. Listening starts when it's made, so a signal that comes
+/// while the app starts isn't missed.
+pub struct QuitSignals {
+    #[cfg(unix)]
+    signals: [tokio::signal::unix::Signal; 2],
+}
+
+impl QuitSignals {
+    /// Must be called within a Tokio runtime.
+    pub fn listen() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                signals: [
+                    signal(SignalKind::terminate())?,
+                    signal(SignalKind::interrupt())?,
+                ],
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    /// The next signal to quit.
+    pub async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            let [terminate, interrupt] = &mut self.signals;
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
 /// Opens a web page in the owner's browser. Only `http` and `https` URLs
 /// get here (see [`crate::links::browser_url`]).
 pub fn open_in_browser(url: &Url) {
     if let Err(e) = open::that_detached(url.as_str()) {
         tracing::warn!("couldn't open {url} in the browser: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Sends the signals to this very process: listening, it lives on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quit_signals_are_heard() {
+        let mut signals = QuitSignals::listen().unwrap();
+        for signal in ["-TERM", "-INT"] {
+            let sent = Command::new("kill")
+                .args([signal, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success());
+            let heard = tokio::time::timeout(Duration::from_secs(5), signals.recv()).await;
+            assert!(heard.is_ok(), "kill {signal} went unheard");
+        }
     }
 }

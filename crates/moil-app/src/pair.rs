@@ -8,12 +8,13 @@
 use std::time::Instant;
 
 use maud::{Markup, html};
+use moil_agent::services::parse_base_url;
 use url::Url;
 
 use crate::backend::PairingCode;
 use crate::format;
 use crate::ipc::PairMessage;
-use crate::links::{browser_url, service_address};
+use crate::links::browser_url;
 use crate::page::{self, icon, link, visible};
 
 /// One pair window and where the owner is in pairing.
@@ -122,7 +123,7 @@ impl PairWindow {
         match (message, &self.step) {
             (PairMessage::Close {}, _) => Some(PairEffect::Close),
             (PairMessage::Start { url }, Step::Enter { from_link, .. }) => {
-                match service_address(&url) {
+                match parse_base_url(&url).map_err(|e| e.to_string()) {
                     Ok(parsed) => {
                         self.attempt += 1;
                         self.show(Step::Starting {

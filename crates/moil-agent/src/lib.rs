@@ -11,6 +11,7 @@
 //! gets [`Error::AlreadyRunning`].
 
 mod agent;
+pub mod display;
 mod error;
 mod fs;
 mod hardware;
@@ -28,7 +29,7 @@ pub use agent::{
 };
 pub use error::Error;
 pub use home::{Home, Settings};
-pub use machine::{Machine, MachineConfig};
+pub use machine::{Machine, MachineConfig, ReadOnlyMachine};
 pub use pairing::PairingSession;
 pub use review::Review;
 #[cfg(target_os = "macos")]

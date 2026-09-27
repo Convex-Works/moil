@@ -56,7 +56,9 @@ pub trait Backend: Send + Sync + 'static {
 pub struct Pairing {
     pub code: PairingCode,
     /// Resolves once the owner confirms or rejects the pairing on the
-    /// service, or the code expires. Dropping it abandons the pairing.
+    /// service, or the code expires. Dropping it abandons the pairing,
+    /// unless the service has already sent the machine's token: then the
+    /// pairing completes anyway, and the agent connects.
     pub confirmed: BoxFuture<'static, Result<PairedService>>,
 }
 

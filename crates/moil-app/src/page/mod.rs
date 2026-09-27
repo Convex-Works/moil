@@ -9,14 +9,14 @@
 //!   anywhere and runs only the page's own script and style, which carry a
 //!   fresh nonce per render;
 //! - characters that are invisible or reorder text are shown as visible
-//!   markers, so what the owner reads is what runs. The markers read as
-//!   `moil review` writes them ([`moil_agent::review::reveal`]).
+//!   markers, so what the owner reads is what runs. They are the ones
+//!   `moil review` reveals, marked as it writes them
+//!   ([`moil_agent::display::reveal`]).
 
-use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use maud::{DOCTYPE, Escaper, Markup, PreEscaped, Render, html};
-use moil_agent::review::reveal;
+use moil_agent::display::{hidden_name, is_hidden, reveal};
 
 use crate::links::browser_url;
 
@@ -74,13 +74,9 @@ pub fn visible(text: &str) -> Markup {
     let mut out = String::with_capacity(text.len());
     let mut run = 0;
     for (i, c) in text.char_indices() {
-        if let Some(name) = hidden_char(c) {
+        if let Some(name) = hidden_name(c) {
             let _ = Escaper::new(&mut out).write_str(&text[run..i]);
-            let shown = match reveal(&text[i..i + c.len_utf8()]) {
-                Cow::Owned(shown) => shown,
-                // One the agent doesn't reveal, in the same notation.
-                Cow::Borrowed(_) => format!("\\u{{{:04x}}}", c as u32),
-            };
+            let shown = reveal(&text[i..i + c.len_utf8()]);
             let title = format!("U+{:04X} {name}", c as u32);
             html! { span.hc title=(title) { (shown) } }.render_to(&mut out);
             run = i + c.len_utf8();
@@ -94,58 +90,8 @@ pub fn visible(text: &str) -> Markup {
 /// carriage returns of CRLF line endings.
 pub fn hidden_chars(text: &str) -> usize {
     lines(text)
-        .map(|line| line.chars().filter(|&c| hidden_char(c).is_some()).count())
+        .map(|line| line.chars().filter(|&c| is_hidden(c)).count())
         .sum()
-}
-
-/// Whether [`visible`] would mark `c`.
-pub fn is_hidden(c: char) -> bool {
-    hidden_char(c).is_some()
-}
-
-/// The name of a character that shouldn't pass unseen in code: controls,
-/// bidirectional formatting (the "Trojan Source" attack), zero-width and
-/// filler characters, and tag and variation selectors that can smuggle
-/// text. Tabs and line feeds are ordinary. It covers every character
-/// [`reveal`] does, and more.
-fn hidden_char(c: char) -> Option<&'static str> {
-    Some(match c {
-        '\t' | '\n' => return None,
-        '\r' => "CARRIAGE RETURN",
-        '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => "CONTROL CHARACTER",
-        '\u{ad}' => "SOFT HYPHEN",
-        '\u{34f}' => "COMBINING GRAPHEME JOINER",
-        '\u{61c}' => "ARABIC LETTER MARK",
-        '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}' => "HANGUL FILLER",
-        '\u{17b4}' | '\u{17b5}' => "KHMER INHERENT VOWEL",
-        '\u{180e}' => "MONGOLIAN VOWEL SEPARATOR",
-        '\u{200b}' => "ZERO WIDTH SPACE",
-        '\u{200c}' => "ZERO WIDTH NON-JOINER",
-        '\u{200d}' => "ZERO WIDTH JOINER",
-        '\u{200e}' => "LEFT-TO-RIGHT MARK",
-        '\u{200f}' => "RIGHT-TO-LEFT MARK",
-        '\u{2028}' => "LINE SEPARATOR",
-        '\u{2029}' => "PARAGRAPH SEPARATOR",
-        '\u{202a}' => "LEFT-TO-RIGHT EMBEDDING",
-        '\u{202b}' => "RIGHT-TO-LEFT EMBEDDING",
-        '\u{202c}' => "POP DIRECTIONAL FORMATTING",
-        '\u{202d}' => "LEFT-TO-RIGHT OVERRIDE",
-        '\u{202e}' => "RIGHT-TO-LEFT OVERRIDE",
-        '\u{2060}' => "WORD JOINER",
-        '\u{2061}'..='\u{2064}' => "INVISIBLE OPERATOR",
-        '\u{2065}' => "UNASSIGNED FORMATTING CHARACTER",
-        '\u{2066}' => "LEFT-TO-RIGHT ISOLATE",
-        '\u{2067}' => "RIGHT-TO-LEFT ISOLATE",
-        '\u{2068}' => "FIRST STRONG ISOLATE",
-        '\u{2069}' => "POP DIRECTIONAL ISOLATE",
-        '\u{206a}'..='\u{206f}' => "DEPRECATED FORMATTING CHARACTER",
-        '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}' => "VARIATION SELECTOR",
-        '\u{feff}' => "ZERO WIDTH NO-BREAK SPACE",
-        '\u{fff9}'..='\u{fffb}' => "INTERLINEAR ANNOTATION",
-        '\u{1d173}'..='\u{1d17a}' => "MUSICAL SYMBOL FORMATTING",
-        '\u{e0000}'..='\u{e007f}' => "TAG CHARACTER",
-        _ => return None,
-    })
 }
 
 /// A file's lines, without their `\n` or `\r\n` endings.
@@ -313,19 +259,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_character_the_agent_reveals_is_marked_as_it_reveals_it() {
+    fn every_hidden_character_is_marked_as_the_command_line_reveals_it() {
         let mut buf = [0; 4];
-        let mut revealed = 0;
         for c in char::MIN..=char::MAX {
             let text = c.encode_utf8(&mut buf);
-            if let Cow::Owned(shown) = reveal(text) {
-                revealed += 1;
-                assert!(is_hidden(c), "U+{:04X} isn't marked", c as u32);
-                let marked = visible(text).into_string();
-                assert!(marked.contains(&format!(">{shown}</span>")), "{marked}");
+            let marked = visible(text).into_string();
+            if is_hidden(c) {
+                assert!(
+                    marked.contains(&format!(">{}</span>", reveal(text))),
+                    "{marked}"
+                );
+            } else {
+                assert!(!marked.contains("<span"), "{marked}");
             }
         }
-        assert!(revealed > 60);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use url::Url;
 use crate::fs::{PUBLIC, read_json, with_path, write_json};
 use crate::hardware::Hardware;
 use crate::net::{self, Net};
+use crate::services;
 use crate::{
     Approval, Error, Home, PairedService, PairingSession, Review, SecretStore, ServiceId, Settings,
 };
@@ -52,7 +53,8 @@ struct Inner {
     /// every home on the computer.
     token_scope: String,
     hardware: OnceLock<Hardware>,
-    _lock: File,
+    /// The home's lock, unless this is a [`ReadOnlyMachine`].
+    _lock: Option<File>,
 }
 
 impl fmt::Debug for Inner {
@@ -64,6 +66,54 @@ impl fmt::Debug for Inner {
     }
 }
 
+/// This computer's moil state, opened without taking the home's lock, for
+/// looking at while an agent runs: the paired services, and the bundles
+/// they offer. It changes nothing, and reads each file afresh, so it sees
+/// what the agent has written. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct ReadOnlyMachine(Machine);
+
+impl ReadOnlyMachine {
+    pub fn home(&self) -> &Home {
+        self.0.home()
+    }
+
+    /// Like [`Machine::services`].
+    pub fn services(&self) -> Result<Vec<PairedService>, Error> {
+        self.0.services()
+    }
+
+    /// Like [`Machine::find_service`].
+    pub fn find_service(&self, query: &str) -> Result<PairedService, Error> {
+        self.0.find_service(query)
+    }
+
+    /// Like [`Machine::bundles`].
+    pub async fn bundles(&self, id: &ServiceId) -> Result<Vec<BundleInfo>, Error> {
+        self.0.bundles(id).await
+    }
+
+    /// Like [`Machine::review`].
+    pub async fn review(&self, id: &ServiceId, hash: BundleHash) -> Result<Review, Error> {
+        self.0.review(id, hash).await
+    }
+}
+
+/// A paired service and the token that proves this machine to it.
+struct Credentials {
+    service: PairedService,
+    token: String,
+}
+
+/// The most GPUs `hello` lists (spec §10).
+const MAX_GPUS: usize = 64;
+
+/// `text`, cut to the 64 characters services accept for the machine's
+/// name, OS, architecture and app version (spec §10).
+fn bounded(text: &str) -> String {
+    text.chars().take(64).collect()
+}
+
 /// How long unpairing waits for the service before forgetting it anyway.
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -71,19 +121,32 @@ impl Machine {
     /// Opens the machine's home, creating it if needed. Fails with
     /// [`Error::AlreadyRunning`] if another process has it open.
     pub fn open(config: MachineConfig) -> Result<Self, Error> {
+        let lock = config.home.lock()?;
+        Self::with_lock(config, Some(lock))
+    }
+
+    /// Opens the machine's home to read it, even while another process has
+    /// it open. Nothing is created or changed.
+    pub fn open_read_only(config: MachineConfig) -> Result<ReadOnlyMachine, Error> {
+        Self::with_lock(config, None).map(ReadOnlyMachine)
+    }
+
+    fn with_lock(config: MachineConfig, lock: Option<File>) -> Result<Self, Error> {
         let MachineConfig {
             home,
             secrets,
             app_version,
         } = config;
-        let lock = home.lock()?;
+        let app_version = bounded(&app_version);
         let settings = home.load_settings()?;
-        let token_scope = home
-            .root()
-            .canonicalize()
-            .map_err(|e| with_path(e, home.root()))?
-            .display()
-            .to_string();
+        let token_scope = match home.root().canonicalize() {
+            Ok(root) => root.display().to_string(),
+            // A home that doesn't exist yet has no tokens to find.
+            Err(e) if lock.is_none() && e.kind() == std::io::ErrorKind::NotFound => {
+                home.root().display().to_string()
+            }
+            Err(e) => return Err(with_path(e, home.root()).into()),
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 net: Net::new(&app_version)?,
@@ -142,16 +205,17 @@ impl Machine {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The machine as `hello` describes it: its name and hardware.
+    /// The machine as `hello` describes it: its name and hardware, within
+    /// what services accept (spec §10).
     pub fn info(&self) -> MachineInfo {
         let hardware = self.inner.hardware.get_or_init(Hardware::detect);
         MachineInfo {
             name: self.name(),
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
+            os: bounded(std::env::consts::OS),
+            arch: bounded(std::env::consts::ARCH),
             cpus: hardware.cpus,
             memory_bytes: hardware.memory_bytes,
-            gpus: hardware.gpus.clone(),
+            gpus: hardware.gpus.iter().take(MAX_GPUS).cloned().collect(),
         }
     }
 
@@ -166,7 +230,7 @@ impl Machine {
                 let hardware = self.inner.hardware.get_or_init(Hardware::detect);
                 hardware.computer_name.clone()
             });
-        name.trim().chars().take(64).collect()
+        bounded(name.trim())
     }
 
     /// Every paired service, by ID.
@@ -214,7 +278,7 @@ impl Machine {
         }
         let url = query
             .contains("://")
-            .then(|| net::parse_base_url(query).ok())
+            .then(|| services::parse_base_url(query).ok())
             .flatten();
         let matches: Vec<&PairedService> = services
             .iter()
@@ -247,7 +311,7 @@ impl Machine {
     /// Starts pairing with the service at `base_url`, after checking that it
     /// is a moil service (`GET /v1/info`).
     pub async fn pair(&self, base_url: &str) -> Result<PairingSession, Error> {
-        let base_url = net::parse_base_url(base_url)?;
+        let base_url = services::parse_base_url(base_url)?;
         self.check_url(&base_url)?;
         let not_a_service = |reason: String| Error::NotAService {
             url: base_url.to_string(),
@@ -278,9 +342,12 @@ impl Machine {
                 moil_proto::PROTOCOL_VERSION
             )));
         }
+        services::check_name(&info.name).map_err(not_a_service)?;
 
+        // The computer's name may take detecting.
+        let name = self.blocking(|machine| Ok(machine.name())).await?;
         let request = PairRequest {
-            name: self.name(),
+            name,
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             app_version: self.inner.app_version.clone(),
@@ -295,6 +362,7 @@ impl Machine {
             .map_err(|e| net::unreachable(base_url.as_str(), &e))?;
         let started = Instant::now();
         let pairing: PairResponse = net::read_json(&info.name, response).await?;
+        services::check_name(&pairing.service.name).map_err(not_a_service)?;
         for uri in [
             &pairing.verification_uri,
             &pairing.verification_uri_complete,
@@ -354,10 +422,20 @@ impl Machine {
     /// (`DELETE /v1/machine`, best effort), then deletes its token and
     /// approvals here.
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
-        let service = self.service(id)?;
-        if let Some(token) = self.token(id)? {
+        let found = id.clone();
+        let (service, token) = self
+            .blocking(move |machine| Ok((machine.service(&found)?, machine.token(&found)?)))
+            .await?;
+        if let Some(token) = token {
             self.forget_token_on(&service.base_url, &token).await;
         }
+        let id = id.clone();
+        self.blocking(move |machine| machine.forget(&id, &service))
+            .await
+    }
+
+    /// Deletes a service's token and approvals here.
+    fn forget(&self, id: &ServiceId, service: &PairedService) -> Result<(), Error> {
         let _services = self.lock_services();
         self.inner.secrets.delete(&self.token_key(id))?;
         let path = self.inner.home.service_file(id);
@@ -396,29 +474,35 @@ impl Machine {
     /// The bundles a service may send jobs for (`GET /v1/bundles`), as the
     /// service describes them.
     pub async fn bundles(&self, id: &ServiceId) -> Result<Vec<BundleInfo>, Error> {
-        let service = self.service(id)?;
-        let response = self.get(&service, "v1/bundles").await?;
-        let listing: BundlesResponse = net::read_json(&service.name, response).await?;
+        let credentials = self.credentials(id).await?;
+        let response = self.get(&credentials, "v1/bundles").await?;
+        let listing: BundlesResponse = net::read_json(&credentials.service.name, response).await?;
         Ok(listing.bundles)
     }
 
     /// Fetches a bundle for the owner to review and verifies it against
     /// `hash`.
     pub async fn review(&self, id: &ServiceId, hash: BundleHash) -> Result<Review, Error> {
-        let service = self.service(id)?;
-        let response = self.get(&service, &format!("v1/bundles/{hash}")).await?;
+        let credentials = self.credentials(id).await?;
+        let response = self
+            .get(&credentials, &format!("v1/bundles/{hash}"))
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(Error::UnknownBundle(hash));
         }
+        let service = credentials.service;
         let response: BundleResponse = net::read_json(&service.name, response).await?;
-        let bundle = Bundle::from_response(response, &hash)?;
-        let previous = self.previous_version(&service, &bundle);
-        Ok(Review {
-            approved: service.is_approved(&hash),
-            service,
-            bundle,
-            previous,
+        self.blocking(move |machine| {
+            let bundle = Bundle::from_response(response, &hash)?;
+            let previous = machine.previous_version(&service, &bundle);
+            Ok(Review {
+                approved: service.is_approved(&hash),
+                service,
+                bundle,
+                previous,
+            })
         })
+        .await
     }
 
     /// The most recently approved bundle from `service` with `bundle`'s
@@ -514,15 +598,43 @@ impl Machine {
         net::check_url(url, self.settings().allow_insecure_http)
     }
 
-    /// `GET`s a machine-authenticated endpoint.
-    async fn get(&self, service: &PairedService, path: &str) -> Result<reqwest::Response, Error> {
+    /// Runs `work` where blocking is fine. State files take a moment to
+    /// read and write, and the keychain may even ask the owner first; on an
+    /// async worker thread either would hold up everything scheduled there.
+    pub(crate) async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Machine) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let machine = self.clone();
+        match tokio::task::spawn_blocking(move || work(&machine)).await {
+            Ok(result) => result,
+            Err(e) => match e.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_) => Err(Error::Io(std::io::Error::other("moil is shutting down"))),
+            },
+        }
+    }
+
+    /// Service `id` and this machine's token for it.
+    async fn credentials(&self, id: &ServiceId) -> Result<Credentials, Error> {
+        let id = id.clone();
+        self.blocking(move |machine| {
+            let service = machine.service(&id)?;
+            let token = machine.token(&id)?.ok_or(Error::Unauthorized)?;
+            Ok(Credentials { service, token })
+        })
+        .await
+    }
+
+    /// `GET`s a machine-authenticated endpoint of a service.
+    async fn get(&self, to: &Credentials, path: &str) -> Result<reqwest::Response, Error> {
+        let service = &to.service;
         self.check_url(&service.base_url)?;
-        let token = self.token(&service.id)?.ok_or(Error::Unauthorized)?;
         let url = net::endpoint(&service.base_url, path);
         self.net()
             .http
             .get(&url)
-            .bearer_auth(token)
+            .bearer_auth(&to.token)
             .send()
             .await
             .map_err(|e| net::unreachable(service.base_url.as_str(), &e))
@@ -548,5 +660,38 @@ impl Machine {
                 .map_err(|e| with_path(e, &store.dir(hash)))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemorySecrets;
+
+    #[test]
+    fn hello_stays_within_what_services_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Machine::open(MachineConfig {
+            home: Home::new(dir.path()),
+            secrets: Arc::new(MemorySecrets::default()),
+            app_version: format!("0.1.0+{}", "build".repeat(20)),
+        })
+        .unwrap();
+        let gpu = |i| moil_proto::Gpu {
+            name: format!("GPU {i}"),
+            memory_bytes: None,
+        };
+        let hardware = Hardware {
+            computer_name: format!("  Ada's {}  ", "very ".repeat(20)),
+            cpus: 256,
+            memory_bytes: 1 << 40,
+            gpus: (0..100).map(gpu).collect(),
+        };
+        machine.inner.hardware.set(hardware).unwrap();
+
+        let info = machine.info();
+        assert_eq!(info.name, format!("Ada's {}", "very ".repeat(20))[..64]);
+        assert_eq!(info.gpus, (0..64).map(gpu).collect::<Vec<_>>());
+        assert_eq!(machine.app_version().chars().count(), 64);
     }
 }

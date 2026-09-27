@@ -1,11 +1,13 @@
-//! URLs that reach the app from outside: `moil://` links, the service
-//! addresses the owner types, and the links in the app's own pages.
+//! URLs that reach the app from outside: `moil://` links and the links in
+//! the app's own pages. The service addresses the owner types are the
+//! agent's to read ([`moil_agent::services::parse_base_url`]).
 //!
 //! All of them can carry text the owner didn't write, so each is parsed
 //! strictly into what it is allowed to mean.
 
 use std::fmt;
 
+use moil_agent::services::parse_base_url;
 use url::Url;
 
 /// What a `moil://` link asks the app to do. Every link only ever leads to
@@ -53,7 +55,7 @@ impl DeepLink {
                 let (Some((_, service)), None) = (urls.next(), urls.next()) else {
                     return Err(refuse("it must name exactly one service URL"));
                 };
-                let url = service_address(&service).map_err(|e| refuse(&e))?;
+                let url = parse_base_url(&service).map_err(|e| refuse(&e.to_string()))?;
                 Ok(DeepLink::Pair { url })
             }
             other => Err(refuse(&format!(
@@ -61,41 +63,6 @@ impl DeepLink {
             ))),
         }
     }
-}
-
-/// The service base URL the owner means by `input`, which they typed or a
-/// link supplied: surrounding whitespace is ignored and `https://` is
-/// assumed when no scheme is given. Whether plain `http` is acceptable is
-/// the agent's decision (spec §3), so it isn't refused here.
-pub fn service_address(input: &str) -> Result<Url, String> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err("Enter the service's address, such as https://klisi.example.com/moil.".into());
-    }
-    let with_scheme;
-    let input = if input.contains("://") {
-        input
-    } else {
-        with_scheme = format!("https://{input}");
-        &with_scheme
-    };
-    let url = Url::parse(input).map_err(|e| format!("{input} isn't a valid address: {e}."))?;
-    if !matches!(url.scheme(), "https" | "http") {
-        return Err(format!(
-            "moil services have https addresses, not {}:// ones.",
-            url.scheme()
-        ));
-    }
-    if url.host().is_none() {
-        return Err(format!("{input} doesn't name a host."));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("The address mustn't contain a user name or password.".into());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("The address can't contain a query (?…) or a fragment (#…).".into());
-    }
-    Ok(url)
 }
 
 /// A link that may be opened in the owner's browser: `http` or `https`,
@@ -186,27 +153,6 @@ mod tests {
             err.to_string(),
             "moil can't open this link: it asks for \"approve\", which moil doesn't do"
         );
-    }
-
-    #[test]
-    fn typed_addresses_default_to_https() {
-        let address = |s| service_address(s).map(|u| u.to_string());
-        assert_eq!(
-            address("  klisi.example.com/moil \n").unwrap(),
-            "https://klisi.example.com/moil"
-        );
-        assert_eq!(
-            address("http://127.0.0.1:8787/moil").unwrap(),
-            "http://127.0.0.1:8787/moil"
-        );
-        assert!(
-            address("")
-                .unwrap_err()
-                .starts_with("Enter the service's address")
-        );
-        assert!(address("ftp://klisi.example.com").is_err());
-        assert!(address("https://klisi.example.com/moil?x=1").is_err());
-        assert!(address("https://a@klisi.example.com").is_err());
     }
 
     #[test]
