@@ -368,7 +368,7 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     config.extra_env.extend(uv_cache_env());
     config.keep_work_dirs = args.keep;
     config.echo_stderr = true;
-    let runtime = Runtime::try_new(config)?;
+    let runtime = Runtime::new(config)?;
     if globals.home.is_some() {
         runtime.reap_orphans()?;
     }

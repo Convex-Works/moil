@@ -100,7 +100,7 @@ impl Harness {
         config.extra_root_certificates = vec![server.ca_pem.clone()];
         config.extra_env = uv_cache_env();
         configure(&mut config);
-        let runtime = Arc::new(Runtime::try_new(config).unwrap());
+        let runtime = Arc::new(Runtime::new(config).unwrap());
         Self {
             home,
             runtime,

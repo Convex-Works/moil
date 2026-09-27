@@ -141,7 +141,7 @@ mod assets {
         let mut config = h.runtime.config().clone();
         config.bundles = BundleStore::new(other_home.path().join("bundles"));
         config.jobs_dir = other_home.path().join("jobs");
-        let other = Runtime::try_new(config).unwrap();
+        let other = Runtime::new(config).unwrap();
 
         let (a, b) = tokio::join!(h.runtime.prepare(&bundle), other.prepare(&bundle));
         a.unwrap();
@@ -229,7 +229,7 @@ mod assets {
         let home = tempfile::tempdir().unwrap();
         let mut config = moil_runtime::RuntimeConfig::new(uv(), home.path());
         config.extra_root_certificates = vec!["-----BEGIN CERTIFICATE-----\nnope\n".into()];
-        let error = Runtime::try_new(config.clone()).unwrap_err();
+        let error = Runtime::new(config.clone()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -238,22 +238,10 @@ mod assets {
         );
 
         config.extra_root_certificates = vec!["just some text".into()];
-        let error = Runtime::try_new(config.clone()).unwrap_err();
+        let error = Runtime::new(config).unwrap_err();
         assert!(
             error.to_string().contains("holds no PEM certificate"),
             "{error}"
-        );
-
-        // Runtime::new accepts the config, and fails the attempts that need
-        // HTTPS instead.
-        let h = Harness::new().await;
-        let bundle = with_assets(&h, &[("model.bin", "/model.bin", "weights")]);
-        let error = Runtime::new(config).prepare(&bundle).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::Internal);
-        assert!(
-            error.message.contains("holds no PEM certificate"),
-            "{}",
-            error.message
         );
     }
 
@@ -406,6 +394,19 @@ mod environment {
         assert!(error.message.contains("3.99"), "{}", error.message);
         assert!(error.stderr_tail.as_deref().unwrap().contains("3.99"));
         assert!(error.exit_code.is_some_and(|code| code != 0));
+    }
+
+    #[test]
+    fn a_uv_that_isnt_a_program_is_refused_up_front() {
+        let home = tempfile::tempdir().unwrap();
+        for uv in [home.path().join("missing"), home.path().to_owned()] {
+            let config = moil_runtime::RuntimeConfig::new(uv.clone(), home.path());
+            let error = Runtime::new(config).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{} can't be uv: it isn't an executable file", uv.display())
+            );
+        }
     }
 
     #[tokio::test]

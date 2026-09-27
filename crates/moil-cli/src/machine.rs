@@ -392,7 +392,7 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
         .init();
     let uv = moil_runtime::find_uv()
         .context("couldn't find uv; install it (https://docs.astral.sh/uv/) or set $MOIL_UV")?;
-    let runtime = Runtime::new(machine.runtime_config(uv));
+    let runtime = Runtime::new(machine.runtime_config(uv))?;
     let reaped = runtime
         .reap_orphans()
         .context("couldn't clean up after an earlier crash")?;

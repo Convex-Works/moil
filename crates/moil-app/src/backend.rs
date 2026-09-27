@@ -140,6 +140,8 @@ pub enum StartError {
         "moil can't find uv, which it needs to run jobs. Reinstall Moil.app, or set MOIL_UV to the path of a uv binary."
     )]
     NoUv,
+    #[error(transparent)]
+    Runtime(#[from] moil_runtime::ConfigError),
 }
 
 /// Opens this computer's moil home and starts the agent on it, the way the
@@ -170,7 +172,7 @@ fn start() -> Result<Arc<dyn Backend>, StartError> {
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
     })?;
     let uv = find_uv().ok_or(StartError::NoUv)?;
-    let runtime = Runtime::new(machine.runtime_config(uv));
+    let runtime = Runtime::new(machine.runtime_config(uv))?;
     match runtime.reap_orphans() {
         Ok(0) => {}
         Ok(n) => tracing::info!("cleaned up {n} attempts left over from an earlier run"),

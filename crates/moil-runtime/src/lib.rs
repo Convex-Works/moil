@@ -216,18 +216,20 @@ impl RuntimeConfig {
     }
 }
 
-/// A [`RuntimeConfig`] that can't work.
+/// Why a [`RuntimeConfig`] can't work.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("couldn't set up HTTPS: {0}")]
-pub struct ConfigError(String);
+pub enum ConfigError {
+    #[error("{} can't be uv: it isn't an executable file", .0.display())]
+    Uv(PathBuf),
+    #[error("couldn't set up HTTPS: {0}")]
+    Https(String),
+}
 
 /// Runs attempts for real, with uv.
 #[derive(Debug)]
 pub struct Runtime {
     config: RuntimeConfig,
-    /// The client, or why it couldn't be built, reported by every attempt
-    /// that needs it.
-    http: Result<http::Http, ConfigError>,
+    http: http::Http,
     assets: assets::AssetCache,
     /// Held while a bundle is stored and its environment synced, by hash:
     /// preparing it after approval and for an attempt may overlap.
@@ -235,27 +237,21 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// A runtime for `config`. If the config can't work (see
-    /// [`Runtime::try_new`]), attempts that move files fail as `internal`.
-    pub fn new(config: RuntimeConfig) -> Self {
+    /// A runtime for `config`, or why the config can't work, such as an
+    /// extra root certificate that isn't valid PEM. Checked up front, so
+    /// that a machine that can't run jobs doesn't bid for them.
+    pub fn new(config: RuntimeConfig) -> Result<Self, ConfigError> {
+        if !uv::is_executable(&config.uv) {
+            return Err(ConfigError::Uv(config.uv));
+        }
         let http = http::Http::new(&config.extra_root_certificates, config.allow_insecure_http)
-            .map_err(ConfigError);
-        Self {
+            .map_err(ConfigError::Https)?;
+        Ok(Self {
             assets: assets::AssetCache::new(config.assets_dir.clone()),
             http,
             preparing: locks::KeyedLocks::default(),
             config,
-        }
-    }
-
-    /// A runtime for `config`, or why it can't work, such as an extra root
-    /// certificate that isn't valid PEM.
-    pub fn try_new(config: RuntimeConfig) -> Result<Self, ConfigError> {
-        let runtime = Self::new(config);
-        match &runtime.http {
-            Ok(_) => Ok(runtime),
-            Err(error) => Err(error.clone()),
-        }
+        })
     }
 
     pub fn config(&self) -> &RuntimeConfig {
@@ -288,12 +284,6 @@ impl Runtime {
         Uv::new(&self.config.uv).with_env(self.config.extra_env.iter().cloned())
     }
 
-    fn http(&self) -> Result<&http::Http, JobError> {
-        self.http
-            .as_ref()
-            .map_err(|error| JobError::new(ErrorCode::Internal, error.to_string()))
-    }
-
     /// Stores `bundle`, creates its environment and fetches its assets.
     /// Returns the stored bundle's directory.
     async fn prepare_bundle(
@@ -310,12 +300,8 @@ impl Runtime {
         })?;
         let manifest = bundle.manifest();
         let fetch_assets = async {
-            if manifest.assets.is_empty() {
-                return Ok(());
-            }
-            let http = self.http()?;
             for (name, asset) in &manifest.assets {
-                self.assets.fetch(http, name, asset, events).await?;
+                self.assets.fetch(&self.http, name, asset, events).await?;
             }
             Ok(())
         };

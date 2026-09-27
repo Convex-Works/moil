@@ -165,11 +165,8 @@ impl Attempt<'_> {
         &self,
         work: &WorkDir,
     ) -> Result<BTreeMap<FileName, PathBuf>, JobError> {
+        let http = &self.runtime.http;
         let mut paths = BTreeMap::new();
-        if self.job.inputs.is_empty() {
-            return Ok(paths);
-        }
-        let http = self.runtime.http()?;
         for (name, source) in &self.job.inputs {
             let failed = |why: String| {
                 JobError::new(
@@ -265,11 +262,8 @@ impl Attempt<'_> {
         work: &WorkDir,
         files: &[FileName],
     ) -> Result<BTreeMap<FileName, FileInfo>, JobError> {
+        let http = &self.runtime.http;
         let mut uploaded = BTreeMap::new();
-        if files.is_empty() {
-            return Ok(uploaded);
-        }
-        let http = self.runtime.http()?;
         for name in files {
             let target = &self.job.outputs[name];
             let info = http
