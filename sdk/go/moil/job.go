@@ -58,9 +58,9 @@ type Job struct {
 	Eligible func(Machine) bool
 	// Prefer optionally ranks the machines that bid for the job: the
 	// highest score wins, ties go to the earliest bid. Without it the
-	// earliest bid wins. When retrying, machines that already failed the
-	// job rank below all others. Like Eligible, it must be fast and must
-	// not call the Server.
+	// earliest bid wins. When retrying, machines that already failed or
+	// refused the job rank below all others. Like Eligible, it must be
+	// fast and must not call the Server.
 	Prefer func(Machine) int
 	// Timeout limits each attempt's running time on the machine,
 	// preparation and transfers included, rounded up to whole

@@ -404,3 +404,39 @@ func TestErrorCodesAreRetryableAsTheSpecSays(t *testing.T) {
 		}
 	}
 }
+
+// A machine that keeps bidding and then refusing can't hold a job
+// forever: refusals don't count toward MaxAttempts, but the job fails
+// after ten of them.
+func TestMachinesCantRefuseAJobForever(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.MaxAttempts = 1 })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.RefuseNext(1000, moil.CodeBusy)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	ended := func() bool {
+		select {
+		case <-run.Done():
+			return true
+		default:
+			return false
+		}
+	}
+	for refusals := 1; !ended(); refusals++ {
+		if refusals > 20 {
+			t.Fatal("the job is still going after 20 refusals")
+		}
+		eventually(t, "a refusal", func() bool { return ended() || len(retries(eventsSoFar(run))) >= refusals })
+		m.SetState(moil.Idle) // a change, so the job is offered again
+	}
+	_, err := wait(t, run)
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != moil.CodeBusy || jerr.Attempt != 10 {
+		t.Fatalf("err = %v, want the tenth refusal", err)
+	}
+	if n := len(retries(events(t, run))); n != 9 {
+		t.Fatalf("%d refusals were retried, want 9", n)
+	}
+}

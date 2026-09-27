@@ -183,7 +183,8 @@ res, err := run.Wait(ctx)
 - **Leases and retries.** An attempt whose machine goes quiet for
   `LeaseTTL` fails with `lease_expired`; a machine that restarts without its
   attempt loses it (`lost`). Retryable failures are retried up to
-  `MaxAttempts`, not counting attempts that never started.
+  `MaxAttempts`, not counting attempts machines refused before starting
+  them, of which a job tolerates ten.
 - `run.Cancel()` stops a job: at once if it's waiting or its machine is
   offline, otherwise when the machine confirms.
 

@@ -80,6 +80,7 @@ type jobState struct {
 	phase    jobPhase
 	attempts int // attempts assigned so far
 	counted  int // attempts that count toward maxAttempts
+	refused  int // attempts machines refused before starting them
 	round    *offerRound
 	prep     *preparation
 	cur      *attemptState
@@ -88,7 +89,8 @@ type jobState struct {
 	// skip maps a machine to its gen when it declined, ignored or refused
 	// this job.
 	skip map[string]uint64
-	// failedOn holds the machines an attempt of this job failed on.
+	// failedOn holds the machines an attempt of this job failed on, or
+	// that refused one.
 	failedOn map[string]bool
 	forget   *time.Timer
 }
@@ -708,11 +710,15 @@ func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
 func (sc *scheduler) attemptFailed(j *jobState, e *JobError) {
 	a := sc.endAttempt(j)
 	e.Machine, e.Attempt = a.machine, a.n
-	if !e.Code.NeverStarted() {
-		j.failedOn[a.machine] = true
-	}
+	j.failedOn[a.machine] = true
 	sc.retry(j, e)
 }
+
+// maxRefusals is how many attempts machines may refuse before starting
+// them (busy, not_approved) before the job fails. Refusals don't count
+// toward MaxAttempts, but a machine that keeps bidding and then refusing
+// mustn't hold a job forever.
+const maxRefusals = 10
 
 // retry puts a job whose attempt failed with e back in the queue, or ends
 // it if e isn't retryable or no attempts remain.
@@ -728,10 +734,11 @@ func (sc *scheduler) retry(j *jobState, e *JobError) {
 		if lm := sc.machines[e.Machine]; lm != nil {
 			j.skip[e.Machine] = lm.gen
 		}
+		j.refused++
 	} else {
 		j.counted++
 	}
-	if !e.Retryable || (!e.Code.NeverStarted() && j.counted >= j.maxAttempts) {
+	if !e.Retryable || j.counted >= j.maxAttempts || j.refused >= maxRefusals {
 		sc.finish(j, Failed, nil, e)
 		return
 	}

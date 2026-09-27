@@ -50,8 +50,11 @@ type Config struct {
 	// seconds to notice a silently dead channel, and must reconnect
 	// before its lease runs out.
 	LeaseTTL time.Duration
-	// MaxAttempts is how many attempts a job may use, not counting ones
-	// that never started. Default 3.
+	// MaxAttempts is how many attempts a job may use. Default 3.
+	// Attempts a machine refused before starting them (it was busy or
+	// lacked the bundle, spec §7.2) don't count, but a job fails after 10
+	// of those, so that a machine that keeps bidding and then refusing
+	// can't hold it forever.
 	MaxAttempts int
 	// PingInterval is how often the Server pings each machine; a machine
 	// that doesn't answer before the next ping is disconnected. It also
