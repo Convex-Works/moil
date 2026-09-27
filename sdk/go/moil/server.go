@@ -62,8 +62,8 @@ type Config struct {
 	// maximum 20s: machines take a channel that stays silent for 45
 	// seconds for dead (spec §6.1).
 	PingInterval time.Duration
-	// KeepFinished is how long a finished job stays known, for Run and
-	// for idempotent Submit. Default 1 hour.
+	// KeepFinished is how long Server.Run finds a finished job. Default
+	// 1 hour.
 	KeepFinished time.Duration
 	// MaxDataBytes bounds the data events a Run keeps, so that a machine
 	// can't make the service hold unbounded memory: each counts its
@@ -345,8 +345,11 @@ func (s *Server) RemoveMachine(ctx context.Context, id string) error {
 // limit, until a connected, idle, eligible machine that approved its bundle
 // bids for it.
 //
-// If a job with the same ID is already known, Submit returns its Run and
-// ignores job: the first submission's definition wins.
+// If a job with the same ID hasn't finished, Submit returns its Run and
+// ignores job: the first submission's definition wins, so a service can
+// resubmit what must run without doubling the work. Once a job has
+// finished, its ID runs again, as a new Run: that's how to retry a job
+// that failed or was cancelled.
 func (s *Server) Submit(ctx context.Context, job Job) (*Run, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -469,7 +472,8 @@ func checkSize(msg wire.Assign) error {
 }
 
 // Run returns the job with the given ID, if the Server knows it: it's
-// unfinished, or finished less than Config.KeepFinished ago.
+// unfinished, or finished less than Config.KeepFinished ago. After a
+// resubmission, that's the latest Run.
 func (s *Server) Run(id string) (*Run, bool) {
 	var run *Run
 	_ = s.call(func(sc *scheduler) {

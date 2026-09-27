@@ -163,9 +163,10 @@ func TestNewerPhasesAndLogLevelsPassThrough(t *testing.T) {
 	}
 }
 
-// Submitting a job the Server knows returns the same Run, while it runs and
-// after it ended, so a service can resubmit by ID without doubling work.
-func TestSubmitIsIdempotentByID(t *testing.T) {
+// Submitting a job while one with its ID is unfinished returns the same
+// Run, so a service can resubmit by ID without doubling work. Once the job
+// has finished, the ID runs again, as a retry button would want.
+func TestResubmittingByID(t *testing.T) {
 	srv := newServer(t)
 	bundle := loadBundle(t, srv, "minimal")
 	job := moil.Job{ID: "meeting-7-summary", Bundle: bundle, Eligible: moil.AnyMachine}
@@ -185,18 +186,31 @@ func TestSubmitIsIdempotentByID(t *testing.T) {
 	if a.Title != "" {
 		t.Errorf("the second submission changed the job: title %q", a.Title)
 	}
-	a.Succeed(nil)
-	succeeded(t, first)
 	if again := submit(t, srv, job); again != first {
-		t.Fatal("resubmitting a finished job made a second run")
+		t.Fatal("resubmitting a running job made a second run")
 	}
-	other := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
-	if other == first || other.ID() == "" {
-		t.Fatal("a job without an ID must get a new one")
+	a.ScriptError("the recording is empty", false)
+	if _, err := wait(t, first); err == nil {
+		t.Fatal("the job succeeded")
 	}
-	m.Sync()
-	if n := len(m.Offers()); n != 2 {
-		t.Errorf("the machine got %d offers; resubmissions must not be offered again", n)
+
+	retry := submit(t, srv, job)
+	if retry == first || retry.ID() != first.ID() {
+		t.Fatal("resubmitting a finished job didn't run it again")
+	}
+	if got, _ := srv.Run(job.ID); got != retry {
+		t.Fatal("Run doesn't find the latest run")
+	}
+	b := m.NextAttempt()
+	if b.Title != "a different definition" || b.Number != 2 {
+		t.Errorf("the rerun is attempt %d titled %q; attempt numbers carry on, and the new definition counts", b.Number, b.Title)
+	}
+	b.Succeed(nil)
+	if res := succeeded(t, retry); res.Attempt != 2 {
+		t.Errorf("result from attempt %d", res.Attempt)
+	}
+	if _, err := wait(t, first); err == nil {
+		t.Error("the rerun changed how the first run ended")
 	}
 }
 

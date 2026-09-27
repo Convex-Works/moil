@@ -361,7 +361,13 @@ func (sc *scheduler) submit(j *jobState) (*Run, error) {
 		return nil, ErrClosed
 	}
 	if existing := sc.jobs[j.id]; existing != nil {
-		return existing.run, nil
+		if existing.phase != phaseDone {
+			return existing.run, nil
+		}
+		// It runs again. Its attempt numbers carry on from the last run,
+		// so a machine still holding an old attempt can tell it apart.
+		existing.forget.Stop()
+		j.attempts = existing.attempts
 	}
 	if sc.bundleByHash[j.bundle.Hash()] == nil {
 		return nil, fmt.Errorf("moil: bundle %s wasn't added to the server; call AddBundle first", j.bundle)

@@ -126,7 +126,7 @@ keep publishing the old version until owners have approved the new one.
 
 ```go
 run, err := srv.Submit(ctx, moil.Job{
-	ID:       "meeting-42-transcript", // optional; same ID, same Run
+	ID:       "meeting-42-transcript", // optional; same ID while unfinished, same Run
 	Bundle:   transcribe,
 	Title:    "Weekly sync",
 	Params:   map[string]any{"language": "en"},
@@ -190,7 +190,9 @@ res, err := run.Wait(ctx)
 
 Jobs live in memory. If the service restarts, unfinished jobs are gone and
 machines drop their attempts; resubmit what must finish, by the same ID,
-on startup. `srv.Run(id)` finds a job while it runs and for
+on startup. Submitting an ID whose job hasn't finished returns its `Run`;
+once it has finished, the same ID runs again, so a retry button can
+simply resubmit. `srv.Run(id)` finds a job while it runs and for
 `KeepFinished` (an hour) after.
 
 ## Test with moiltest

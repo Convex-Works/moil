@@ -12,10 +12,10 @@ import (
 // these input files and these output destinations.
 type Job struct {
 	// ID identifies the job, ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$. It is
-	// optional; one is generated if empty. Submitting a job whose ID the
-	// Server already knows returns the existing Run, so a service can
+	// optional; one is generated if empty. Submitting a job while one
+	// with its ID is unfinished returns that one's Run, so a service can
 	// derive IDs from its own records (e.g. "meeting-42-transcript") and
-	// resubmit safely.
+	// resubmit safely; once it has finished, the ID runs again.
 	ID string
 	// Bundle is the code to run. It must have been added with AddBundle.
 	Bundle *Bundle
