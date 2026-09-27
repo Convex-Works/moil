@@ -726,6 +726,95 @@ mod stdout {
         assert_eq!(run.logs(LogLevel::Warn).len(), 2);
     }
 
+    /// `[[…[1]…]]`, `depth` arrays deep.
+    fn nested(depth: usize) -> serde_json::Value {
+        (0..depth).fold(json!(1), |inner, _| json!([inner]))
+    }
+
+    #[tokio::test]
+    async fn payloads_nested_more_than_64_levels_deep_are_refused() {
+        let h = Harness::new().await;
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "data", "payload": nested(64)}},
+                    {"emit": {"type": "data", "payload": nested(65)}},
+                    {"emit": {"type": "result", "meta": nested(65)}},
+                ])),
+            ))
+            .await;
+        let data: Vec<_> = run
+            .script_events()
+            .into_iter()
+            .filter(|e| matches!(e, JobEvent::Data { .. }))
+            .collect();
+        assert_eq!(
+            data,
+            [JobEvent::Data {
+                payload: nested(64)
+            }]
+        );
+        assert_eq!(
+            run.logs(LogLevel::Warn),
+            [
+                "ignored stdout line 2: the data payload is nested more than 64 levels deep",
+                "ignored stdout line 3: the result's meta is nested more than 64 levels deep",
+            ]
+        );
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::NoResult);
+        assert!(
+            error.message.contains("nested more than 64"),
+            "{}",
+            error.message
+        );
+
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([{"emit": {"type": "result", "meta": nested(64)}}])),
+            ))
+            .await;
+        assert_eq!(run.result().meta, Some(nested(64)));
+    }
+
+    #[tokio::test]
+    async fn a_refused_result_is_still_the_first() {
+        let h = Harness::new().await;
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([
+                    {"emit": {"type": "result", "meta": "z".repeat(300 << 10)}},
+                    {"emit": {"type": "result", "meta": "small"}},
+                ])),
+            ))
+            .await;
+        assert_eq!(run.error().code, ErrorCode::NoResult);
+        assert!(
+            run.logs(LogLevel::Warn)
+                .contains(&"ignored stdout line 2: a second result".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_quotes_a_long_name_briefly() {
+        // A `done` over the 1 MiB limit of a control message would be
+        // refused every time it's sent.
+        let h = Harness::new().await;
+        let name = "n".repeat(900_000);
+        let run = h
+            .run(h.job(
+                &probe(),
+                steps(json!([{"emit": {"type": "result", "files": [name]}}])),
+            ))
+            .await;
+        let error = run.error();
+        assert_eq!(error.code, ErrorCode::OutputMissing);
+        assert!(error.message.len() < 1000, "{} bytes", error.message.len());
+    }
+
     #[tokio::test]
     async fn a_result_after_an_error_is_ignored() {
         let h = Harness::new().await;
@@ -1024,6 +1113,26 @@ mod transfers {
         assert_eq!(h.server.received("/in/a.txt").len(), 1);
         assert!(h.server.received("/local/secret").is_empty());
         assert!(h.server.received("/local/admin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_quoting_the_service_stays_under_the_message_limit() {
+        let h = Harness::new().await;
+        let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+        job.inputs.insert(
+            "a.txt".parse().unwrap(),
+            moil_proto::Download {
+                url: h.server.url("/in/a.txt"),
+                headers: [("not a header ".repeat(70_000), "x".into())].into(),
+            },
+        );
+        let error = h.run(job).await.error().clone();
+        assert_eq!(error.code, ErrorCode::InputDownload);
+        assert!(
+            error.message.len() <= 64 << 10,
+            "{} bytes",
+            error.message.len()
+        );
     }
 
     #[tokio::test]

@@ -13,8 +13,12 @@ use moil_proto::{ErrorCode, FileName, JobError, Outcome, Upload};
 use serde_json::Value;
 
 use crate::StopReason;
-use crate::stdout::Report;
+use crate::stdout::{Report, truncate};
 use crate::workdir::open_output;
+
+/// How much of a name the result gives a failure quotes: more than any
+/// output's name takes.
+const MAX_QUOTED_NAME_BYTES: usize = 200;
 
 /// Why an attempt ended before running its course.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +87,9 @@ pub(crate) fn judge(
             .ok()
             .filter(|output| declared.contains_key(output))
         else {
+            // The name is the script's, of any length; outputs' names are
+            // short.
+            let name = truncate(&name, MAX_QUOTED_NAME_BYTES);
             return Err(missing(format!(
                 "the result names {name:?}, which isn't one of the job's outputs"
             )));

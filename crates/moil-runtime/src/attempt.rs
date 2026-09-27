@@ -55,7 +55,13 @@ fn outcome(limits: &Limits, ended: Result<JobResult, Ending>) -> Outcome {
     match ended {
         Ok(result) => Outcome::Succeeded { result },
         Err(Ending::Cut(cut)) => cut.outcome(),
-        Err(Ending::Failed(error)) => Outcome::failed(error),
+        // Some messages quote what the service or the script sent: a
+        // `done` too large for a control message would be refused on every
+        // replay.
+        Err(Ending::Failed(mut error)) => {
+            error.message = stdout::truncate(&error.message, stdout::MAX_MESSAGE_BYTES);
+            Outcome::failed(error)
+        }
     }
 }
 
