@@ -719,9 +719,10 @@ stray `print` or a chatty library can't break a job:
   describing the problem.
 - A second `result` or `error`, or a `result` after an `error`, is ignored
   with a warning: the first one counts.
-- A `data` event whose payload is over the limit (§10) is dropped with a
-  warning. A `result` whose `meta` is over the limit is refused, so the
-  attempt fails with `no_result` rather than succeeding without its meta.
+- A `data` event whose payload is over the size or depth limits (§10) is
+  dropped with a warning. A `result` whose `meta` is over them is refused,
+  so the attempt fails with `no_result` rather than succeeding without its
+  meta.
 - `message` fields are truncated to 64 KiB.
 
 stderr is not forwarded. The runtime keeps its tail for error reports
@@ -807,8 +808,10 @@ A failed `done` carries `error`:
 | Script stdout line | 1 MiB; longer lines are dropped with a warning |
 | `data.payload`, `result.meta` | 256 KiB each when serialized |
 | Event `message` fields | 64 KiB |
-| Arbitrary JSON (`params`, `payload`, `meta`) | nested at most 64 levels deep; numbers within an IEEE 754 double (§2) |
-| `service.name` | 64 characters |
+| Arbitrary JSON (`params`, `payload`, `meta`) | nested at most 64 levels deep, counting containers (a scalar is 0, `[[1]]` is 2); numbers within an IEEE 754 double (§2) |
+| `service.name`; `hello`'s machine `name`, `os`, `arch`, `app_version` | 64 characters each |
+| `hello.machine.gpus` | 64 entries |
+| `hello.approved`, `approved.hashes` | 1024 hashes; a machine with more approvals for one service announces the most recent |
 | Bundle, all three files | 8 MiB |
 | `stderr_tail` | 8 KiB |
 | Pending pairings per service | an SDK-chosen bound, to resist abuse |
