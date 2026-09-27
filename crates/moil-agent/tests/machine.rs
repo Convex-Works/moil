@@ -43,6 +43,23 @@ fn opening_creates_the_home() {
     assert_eq!(machine.settings(), Settings::default());
 }
 
+#[cfg(unix)]
+#[test]
+fn only_the_owner_can_read_the_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("share").join("moil");
+    drop(open_machine(&root));
+    assert_eq!(mode(&root), 0o700, "a new home");
+
+    // An older moil left it readable by everyone.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(open_machine(&root));
+    assert_eq!(mode(&root), 0o700, "a home made private");
+}
+
 #[test]
 fn settings_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
