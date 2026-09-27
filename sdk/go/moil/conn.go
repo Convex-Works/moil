@@ -19,7 +19,9 @@ type session struct {
 	conn      *websocket.Conn
 	out       *queue[outbound]
 	log       *slog.Logger
-	overflow  sync.Once
+	// abort stops the writer, which then closes the connection.
+	abort    context.CancelFunc
+	overflow sync.Once
 }
 
 // maxOutbound bounds the messages waiting to be sent to a machine. A
@@ -43,11 +45,13 @@ func (se *session) close(code websocket.StatusCode, reason string) {
 	se.push(outbound{closeCode: code, reason: reason})
 }
 
+// push queues ob, or, if the machine lets too much pile up, disconnects
+// it. It never waits, so the scheduler can call it.
 func (se *session) push(ob outbound) {
 	if !se.out.push(ob) {
 		se.overflow.Do(func() {
 			se.log.Warn("moil: a machine isn't reading what the service sends; disconnecting it", "machine", se.machineID)
-			se.conn.CloseNow()
+			se.abort()
 		})
 	}
 }
@@ -91,7 +95,9 @@ func (s *Server) serveChannel(conn *websocket.Conn, rec MachineRecord) {
 		return
 	}
 
-	sess := &session{machineID: rec.ID, conn: conn, out: newQueue[outbound](maxOutbound), log: s.log}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	sess := &session{machineID: rec.ID, conn: conn, out: newQueue[outbound](maxOutbound), log: s.log, abort: stop}
 	var regErr error
 	if err := s.call(func(sc *scheduler) { regErr = sc.register(sess, rec, hello) }); err != nil {
 		regErr = err
@@ -105,7 +111,6 @@ func (s *Server) serveChannel(conn *websocket.Conn, rec MachineRecord) {
 		return
 	}
 
-	ctx, stop := context.WithCancel(context.Background())
 	writerDone, pingerDone := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(writerDone)
@@ -195,8 +200,9 @@ func (s *Server) read(sess *session) error {
 }
 
 // write sends queued messages until it's asked to close the channel, a
-// write fails or ctx is done.
+// write fails or ctx is done, and closes the connection.
 func (se *session) write(ctx context.Context, timeout time.Duration) {
+	defer se.conn.CloseNow()
 	for {
 		ob, ok := se.out.pop(ctx.Done())
 		if !ok {
@@ -215,7 +221,6 @@ func (se *session) write(ctx context.Context, timeout time.Duration) {
 		err = se.conn.Write(wctx, websocket.MessageText, data)
 		cancel()
 		if err != nil {
-			se.conn.CloseNow()
 			return
 		}
 	}
