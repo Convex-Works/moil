@@ -593,8 +593,9 @@ attempt the same way.
 
 A machine MAY bound what it keeps. If it had to drop events, it replays
 what it has and `seq` has a gap. It MUST keep the `done` of an attempt that
-started. It MAY drop the `done` of an attempt it refused (§7.2); the
-service then fails that attempt as `lost`.
+started. It MAY drop the `done` of an attempt it refused (§7.2); if that
+`done` is lost, the service fails the attempt as `lost` when the machine
+reconnects, or as `lease_expired` when its lease runs out.
 
 ### 7.6 Cancellation and interruption
 
