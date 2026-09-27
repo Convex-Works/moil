@@ -225,6 +225,36 @@ mod assets {
     }
 
     #[tokio::test]
+    async fn an_asset_without_a_size_is_held_to_the_machines_limit() {
+        let h = Harness::with(|c| c.max_download_bytes = 1000).await;
+        let big = vec![b'w'; 2000];
+        h.server.reply("/model.bin", Reply::Chunked(big.clone()));
+        let unsized_asset = asset_manifest(json!({
+            "url": h.server.https_url("/model.bin"),
+            "sha256": sha256(&big),
+        }));
+        let error = h.runtime.prepare(&unsized_asset).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::AssetDownload);
+        assert!(!error.retryable, "another machine would refuse it too");
+        assert!(
+            error
+                .message
+                .contains("larger than the 1000 bytes this machine accepts"),
+            "{}",
+            error.message
+        );
+        assert!(is_empty_dir(&h.runtime.config().assets_dir));
+
+        // A size the owner approved in the manifest is what counts.
+        let sized = asset_manifest(json!({
+            "url": h.server.https_url("/model.bin"),
+            "sha256": sha256(&big),
+            "size_bytes": big.len(),
+        }));
+        h.runtime.prepare(&sized).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unusable_extra_roots_are_reported_up_front() {
         let home = tempfile::tempdir().unwrap();
         let mut config = moil_runtime::RuntimeConfig::new(uv(), home.path());

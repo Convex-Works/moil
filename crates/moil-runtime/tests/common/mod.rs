@@ -325,6 +325,8 @@ pub fn is_empty_dir(dir: &Path) -> bool {
 pub enum Reply {
     /// `200` with this body.
     Body(Vec<u8>),
+    /// `200` with this body, without saying how long it is.
+    Chunked(Vec<u8>),
     /// This status, with a short body.
     Status(u16),
     /// `302` to this URL.
@@ -457,6 +459,12 @@ async fn handle(
     let reply = state.replies.lock().unwrap().get(&path).cloned();
     match reply {
         Some(Reply::Body(body)) => Body::from(body).into_response(),
+        Some(Reply::Chunked(body)) => {
+            Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(
+                Bytes::from(body),
+            )]))
+            .into_response()
+        }
         Some(Reply::Status(code)) => {
             (StatusCode::from_u16(code).unwrap(), "no luck").into_response()
         }

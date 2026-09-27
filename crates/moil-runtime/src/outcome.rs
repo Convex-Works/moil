@@ -12,9 +12,9 @@ use std::time::Duration;
 use moil_proto::{ErrorCode, FileName, JobError, Outcome, Upload};
 use serde_json::Value;
 
-use crate::StopReason;
 use crate::stdout::{Report, truncate};
 use crate::workdir::open_output;
+use crate::{StopReason, units};
 
 /// How much of a name the result gives a failure quotes: more than any
 /// output's name takes.
@@ -39,7 +39,10 @@ impl Cut {
             )),
             Cut::TimedOut(limit) => Outcome::failed(JobError::new(
                 ErrorCode::Timeout,
-                format!("the attempt ran past its time limit of {}", human(limit)),
+                format!(
+                    "the attempt ran past its time limit of {}",
+                    units::duration(limit)
+                ),
             )),
         }
     }
@@ -119,17 +122,5 @@ fn describe(status: ExitStatus) -> String {
         (Some(code), _) => format!("exited with status {code}"),
         (None, Some(signal)) => format!("was killed by signal {signal}"),
         (None, None) => "ended in an unknown way".into(),
-    }
-}
-
-/// A duration as people write it: `1 h`, `90 s`, `1500 ms`.
-fn human(duration: Duration) -> String {
-    let ms = duration.as_millis();
-    match ms {
-        0 => "0 s".into(),
-        ms if ms % 3_600_000 == 0 => format!("{} h", ms / 3_600_000),
-        ms if ms % 60_000 == 0 => format!("{} min", ms / 60_000),
-        ms if ms % 1_000 == 0 => format!("{} s", ms / 1_000),
-        ms => format!("{ms} ms"),
     }
 }

@@ -914,6 +914,32 @@ mod transfers {
     }
 
     #[tokio::test]
+    async fn an_input_larger_than_the_machine_accepts_is_refused() {
+        let h = Harness::with(|c| c.max_download_bytes = 1000).await;
+        let big = vec![b'x'; 2000];
+        h.server.serve("/in/said.bin", big.clone());
+        h.server.reply("/in/unsaid.bin", Reply::Chunked(big));
+        for path in ["/in/said.bin", "/in/unsaid.bin"] {
+            let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));
+            job.inputs.insert(
+                "big.bin".parse().unwrap(),
+                moil_proto::Download {
+                    url: h.server.url(path),
+                    headers: Default::default(),
+                },
+            );
+            let run = h.run(job).await;
+            let error = run.error();
+            assert_eq!(error.code, ErrorCode::InputDownload, "{path}");
+            assert!(!error.retryable, "another machine would refuse it too");
+            assert_eq!(
+                error.message,
+                "couldn't download input big.bin: it is larger than the 1000 bytes this machine accepts"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn inputs_come_over_https_with_their_headers() {
         let h = Harness::new().await;
         h.server.serve("/in/secret.txt", "classified");

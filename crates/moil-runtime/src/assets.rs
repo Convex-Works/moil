@@ -9,9 +9,9 @@ use std::time::Duration;
 use moil_bundle::Asset;
 use moil_proto::{ErrorCode, JobError, JobEvent, LogLevel, UrlPolicy};
 
-use crate::EventSink;
 use crate::http::{Http, TransferError};
 use crate::locks::KeyedLocks;
+use crate::{EventSink, units};
 
 /// How the names of files still being downloaded start.
 const PARTIAL: &str = ".partial-";
@@ -24,15 +24,18 @@ const PARTIAL: &str = ".partial-";
 #[derive(Debug)]
 pub(crate) struct AssetCache {
     dir: PathBuf,
+    /// The most an asset whose size the manifest doesn't give may take.
+    max_unsized_bytes: u64,
     /// Held while an asset is fetched, by hash, so concurrent attempts in
     /// this process download each asset once.
     fetching: KeyedLocks<String>,
 }
 
 impl AssetCache {
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, max_unsized_bytes: u64) -> Self {
         Self {
             dir,
+            max_unsized_bytes,
             fetching: KeyedLocks::default(),
         }
     }
@@ -106,19 +109,21 @@ impl AssetCache {
             })?;
         let (file, partial) = partial.into_parts();
         let mut file = tokio::fs::File::from_std(file);
+        let limit = asset.size_bytes.unwrap_or(self.max_unsized_bytes);
         let got = http
-            .download(
-                policy,
-                &asset.url,
-                &BTreeMap::new(),
-                &mut file,
-                asset.size_bytes,
-            )
+            .download(policy, &asset.url, &BTreeMap::new(), &mut file, limit)
             .await
             .map_err(|e| match e {
-                TransferError::TooLarge(expected) => mismatch(format!(
-                    "it is larger than the {expected} bytes the manifest says"
+                TransferError::TooLarge(_) if asset.size_bytes.is_some() => mismatch(format!(
+                    "it is larger than the {limit} bytes the manifest says"
                 )),
+                // Another machine would refuse it too.
+                TransferError::TooLarge(_) => failed(format!(
+                    "the manifest doesn't give its size, and it is larger than the {} \
+                     this machine accepts",
+                    units::bytes(limit)
+                ))
+                .retryable(false),
                 other => failed(other.to_string()),
             })?;
         if let Some(expected) = asset.size_bytes
@@ -211,7 +216,7 @@ mod tests {
     #[test]
     fn only_abandoned_downloads_are_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = AssetCache::new(dir.path().to_owned());
+        let cache = AssetCache::new(dir.path().to_owned(), u64::MAX);
         let write = |name: &str, age: Duration| {
             let file = std::fs::File::create(dir.path().join(name)).unwrap();
             file.set_modified(std::time::SystemTime::now() - age)

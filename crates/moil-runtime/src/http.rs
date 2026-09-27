@@ -42,8 +42,8 @@ pub(crate) enum TransferError {
     /// help.
     #[error("{}", refused_message(.redirected, .why))]
     Refused { why: UrlRefused, redirected: bool },
-    /// More arrived than the transfer allows.
-    #[error("it is larger than the expected {0} bytes")]
+    /// More arrived than the transfer allows, this many bytes.
+    #[error("it is larger than the {} it may take", crate::units::bytes(*.0))]
     TooLarge(u64),
     /// Anything else, such as a server that is down.
     #[error("{0}")]
@@ -112,14 +112,14 @@ impl Http {
 
     /// Downloads `url` with `GET` into `file`, following redirects that
     /// `policy` allows, and returns the size and SHA-256 of what arrived.
-    /// Gives up as soon as more than `max_bytes` arrive.
+    /// Gives up as soon as it's clear that more than `max_bytes` would.
     pub async fn download(
         &self,
         policy: UrlPolicy,
         url: &str,
         headers: &BTreeMap<String, String>,
         file: &mut tokio::fs::File,
-        max_bytes: Option<u64>,
+        max_bytes: u64,
     ) -> Result<FileInfo, TransferError> {
         let failed = TransferError::Failed;
         let url = check(policy, url)?;
@@ -135,19 +135,18 @@ impl Http {
                 quote_body(response).await
             )));
         }
-        if let (Some(max), Some(length)) = (max_bytes, response.content_length())
-            && length > max
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
         {
-            return Err(TransferError::TooLarge(max));
+            return Err(TransferError::TooLarge(max_bytes));
         }
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(|e| failed(chain(&e)))? {
             size += chunk.len() as u64;
-            if let Some(max) = max_bytes
-                && size > max
-            {
-                return Err(TransferError::TooLarge(max));
+            if size > max_bytes {
+                return Err(TransferError::TooLarge(max_bytes));
             }
             hasher.update(&chunk);
             file.write_all(&chunk)

@@ -14,6 +14,7 @@ use moil_proto::{
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 
+use crate::http::TransferError;
 use crate::limits::Limits;
 use crate::orphans::Registration;
 use crate::outcome::{self, Accepted, Cut};
@@ -21,7 +22,7 @@ use crate::process::Group;
 use crate::stderr::{self, Tail};
 use crate::stdout::{self, Report};
 use crate::workdir::WorkDir;
-use crate::{EventSink, Job, Runtime, StopSignal, uv};
+use crate::{EventSink, Job, Runtime, StopSignal, units, uv};
 
 /// How long to keep reading the script's output after its process group is
 /// gone. Only a process that left the group can hold it open longer.
@@ -199,6 +200,7 @@ impl Attempt<'_> {
             let mut file = tokio::fs::File::create(&path)
                 .await
                 .map_err(|e| failed(format!("couldn't create {}: {e}", path.display())))?;
+            let limit = self.runtime.config.max_download_bytes;
             self.runtime
                 .http
                 .download(
@@ -206,10 +208,18 @@ impl Attempt<'_> {
                     &source.url,
                     &source.headers,
                     &mut file,
-                    None,
+                    limit,
                 )
                 .await
-                .map_err(|e| failed(e.to_string()).retryable(e.is_retryable()))?;
+                .map_err(|e| match e {
+                    // Another machine would refuse it too.
+                    TransferError::TooLarge(_) => failed(format!(
+                        "it is larger than the {} this machine accepts",
+                        units::bytes(limit)
+                    ))
+                    .retryable(false),
+                    e => failed(e.to_string()).retryable(e.is_retryable()),
+                })?;
             paths.insert(name.clone(), path);
         }
         Ok(paths)

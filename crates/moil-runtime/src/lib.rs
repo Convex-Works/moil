@@ -44,6 +44,7 @@ mod process;
 mod stderr;
 mod stdout;
 mod sys;
+mod units;
 pub mod uv;
 mod workdir;
 
@@ -179,6 +180,10 @@ pub struct RuntimeConfig {
     pub jobs_dir: PathBuf,
     /// Where assets are cached, by hash.
     pub assets_dir: PathBuf,
+    /// The most an input, or an asset whose size the manifest doesn't give,
+    /// may take, so that a service can't fill the machine's disk. Assets of
+    /// a given size are held to exactly that size instead.
+    pub max_download_bytes: u64,
     /// Where bundles' uv environments are kept, by hash.
     /// [`Runtime::reap_orphans`] removes those of bundles not in
     /// [`RuntimeConfig::bundles`], so runtimes that share this directory
@@ -215,6 +220,7 @@ impl RuntimeConfig {
             bundles: BundleStore::new(home.join("bundles")),
             jobs_dir: home.join("jobs"),
             assets_dir: home.join("cache").join("assets"),
+            max_download_bytes: 64 << 30,
             environments_dir: home.join("cache").join("environments"),
             allow_insecure_http: false,
             keep_work_dirs: false,
@@ -257,7 +263,7 @@ impl Runtime {
         }
         let http = http::Http::new(&config.extra_root_certificates).map_err(ConfigError::Https)?;
         Ok(Self {
-            assets: assets::AssetCache::new(config.assets_dir.clone()),
+            assets: assets::AssetCache::new(config.assets_dir.clone(), config.max_download_bytes),
             environments: environments::Environments::new(config.environments_dir.clone()),
             http,
             preparing: locks::KeyedLocks::default(),
