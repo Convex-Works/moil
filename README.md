@@ -158,9 +158,10 @@ for ev := range run.Events(ctx) { /* progress, live data */ }
 result, err := run.Wait(ctx)
 ```
 
-[sdk/go/README.md](sdk/go/README.md) covers the pairing page, publishing
-bundles, submitting jobs and testing a service with `moiltest`, a fake
-machine.
+[sdk/go/README.md](sdk/go/README.md) covers onboarding your users (where
+to get the app, `moil.AppURL`, and the three steps to show them), the
+pairing page, publishing bundles, submitting jobs and testing a service
+with `moiltest`, a fake machine.
 
 ## Trust model
 

@@ -39,6 +39,13 @@ func TestDemo(t *testing.T) {
 	srv.AddBundle(bundle)
 	handler = newDemo(srv, ts.URL).routes()
 
+	// The home page tells a newcomer where to get the app, and what to
+	// add it by.
+	if home := get(t, ts.URL+"/"); !strings.Contains(home, `<a href="`+moil.AppURL+`">Get the moil app</a>`) ||
+		!strings.Contains(home, ts.URL+"/moil") {
+		t.Fatalf("the home page doesn't say where to get moil and what to pair with:\n%s", home)
+	}
+
 	m := moiltest.New(t, ts.URL+"/moil", moiltest.WithName("Ada's MacBook"))
 	code := m.StartPairing()
 	page := get(t, ts.URL+"/pair?code="+url.QueryEscape(code))
