@@ -438,6 +438,52 @@ func TestCancel(t *testing.T) {
 	})
 }
 
+// A machine may report an attempt cancelled only after the service
+// cancelled it (spec §7.6). One that does so unasked has failed the
+// attempt, as interrupted: the job is retried up to MaxAttempts, then
+// fails. Wait never reports a cancellation the service didn't ask for,
+// which the service would take for its own, and might resubmit the job
+// over and over. (TestCancel covers cancellations the service asked for.)
+func TestUnaskedCancellationsAreFailures(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.MaxAttempts = 3 })
+	bundle := loadBundle(t, srv, "minimal")
+	rogue := moiltest.Pair(t, srv, "alice")
+	rogue.Approve(bundle)
+	rogue.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	for n := 1; n <= 3; n++ {
+		a := rogue.NextAttempt()
+		if a.Number != n {
+			t.Fatalf("attempt %d, want %d", a.Number, n)
+		}
+		a.CancelUnasked()
+		a.WaitAcked()
+		rogue.Sync() // the service has acted on the cancelled done
+		select {
+		case <-run.Done():
+			if n < 3 {
+				_, err := run.Wait(t.Context())
+				t.Fatalf("an unasked cancellation of attempt %d ended the job: %v", n, err)
+			}
+		default:
+			if n == 3 {
+				t.Fatal("the job is still going after MaxAttempts attempts")
+			}
+		}
+	}
+	_, err := wait(t, run)
+	if errors.Is(err, moil.ErrCancelled) || run.State() != moil.Failed {
+		t.Fatalf("err %v, state %s; nobody cancelled the job", err, run.State())
+	}
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != moil.CodeInterrupted || !jerr.Retryable || jerr.Attempt != 3 || jerr.Machine != rogue.ID() {
+		t.Fatalf("err = %#v, want attempt 3 interrupted", err)
+	}
+	if got := retries(events(t, run)); !slices.Equal(got, []moil.ErrorCode{moil.CodeInterrupted, moil.CodeInterrupted}) {
+		t.Fatalf("retries %v", got)
+	}
+}
+
 // Removing a machine fails its attempt at once, so the job moves on
 // without waiting for the lease.
 func TestRemovingAMachineMovesItsJob(t *testing.T) {
