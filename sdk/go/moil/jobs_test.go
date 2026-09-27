@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -532,10 +533,9 @@ func TestPrepareErrorsEndTheJob(t *testing.T) {
 	}
 }
 
-// While Prepare runs, the machine is held for the job; if the job is
-// cancelled, Prepare's context ends, and if the machine leaves, the job is
-// offered again.
-func TestPrepareIsInterruptible(t *testing.T) {
+// While Prepare runs, the machine is held for the job. If the job is
+// cancelled, Prepare's context ends.
+func TestPrepareHoldsTheMachine(t *testing.T) {
 	srv := newServer(t)
 	bundle := loadBundle(t, srv, "minimal")
 	m := moiltest.Pair(t, srv, "alice")
@@ -562,35 +562,126 @@ func TestPrepareIsInterruptible(t *testing.T) {
 	<-stopped
 	m.NextAttempt().Succeed(nil) // the machine is free again
 	succeeded(t, other)
+}
 
-	release := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
-	moved := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
-		if a.Machine.ID == m.ID() {
-			<-release
+// A machine that leaves, or is removed, while Prepare makes its attempt's
+// files lets go of the job at once: Prepare's context ends, and the job
+// goes to another machine.
+func TestPrepareEndsWhenItsMachineLeaves(t *testing.T) {
+	for _, leave := range []struct {
+		name string
+		do   func(*moil.Server, *moiltest.Machine) error
+	}{
+		{"disconnected", func(_ *moil.Server, m *moiltest.Machine) error { m.Disconnect(); return nil }},
+		{"removed", func(srv *moil.Server, m *moiltest.Machine) error {
+			return srv.RemoveMachine(context.Background(), m.ID())
+		}},
+	} {
+		t.Run(leave.name, func(t *testing.T) {
+			srv := newServer(t)
+			bundle := loadBundle(t, srv, "minimal")
+			first := moiltest.Pair(t, srv, "alice")
+			first.Approve(bundle)
+			first.Connect()
+			preparing, stopped := make(chan struct{}), make(chan error, 1)
+			run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+				if a.Machine.ID == first.ID() {
+					close(preparing)
+					<-ctx.Done() // held until the machine leaves
+					stopped <- ctx.Err()
+					return nil, nil, ctx.Err()
+				}
+				return nil, nil, nil
+			}})
+			<-preparing
+			if err := leave.do(srv, first); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-stopped:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Prepare's context ended with %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Prepare's context didn't end when its machine left")
+			}
+			second := moiltest.Pair(t, srv, "alice")
+			second.Approve(bundle)
+			second.Connect()
+			second.NextAttempt().Succeed(nil)
+			if res := succeeded(t, run); res.Machine != second.ID() || res.Attempt != 2 {
+				t.Fatalf("result from %s attempt %d", res.Machine, res.Attempt)
+			}
+		})
+	}
+}
+
+// Prepare can ask for another try, as when storage is briefly down; the
+// job goes back to the queue, and the tries count toward MaxAttempts.
+func TestPrepareCanRetry(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.MaxAttempts = 3 })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	unavailable := &moil.JobError{Code: "storage_unavailable", Message: "S3 is down", Retryable: true}
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		if a.Attempt == 1 {
+			return nil, nil, unavailable
 		}
 		return nil, nil, nil
 	}})
-	m.NextOffer()
-	m.NextOffer()
-	if o := m.NextOffer(); o.JobID != moved.ID() || o.Answer != moiltest.Bid {
-		t.Fatalf("offer %+v", o)
+	a := m.NextAttempt()
+	if a.Number != 2 {
+		t.Fatalf("attempt %d", a.Number)
 	}
-	m.Disconnect()
-	eventually(t, "the machine to go offline", func() bool { return !machine(t, srv, m.ID()).Online() })
-	close(release)
-	replacement := moiltest.Pair(t, srv, "alice")
-	replacement.Approve(bundle)
-	replacement.Connect()
-	a := replacement.NextAttempt()
 	a.Succeed(nil)
-	if res := succeeded(t, moved); res.Machine != replacement.ID() || res.Attempt != 2 {
-		t.Fatalf("result from %s attempt %d", res.Machine, res.Attempt)
+	succeeded(t, run)
+	var retried []moil.JobError
+	for _, ev := range events(t, run) {
+		if ev.Kind == moil.EventRetrying {
+			retried = append(retried, *ev.Err)
+		}
+	}
+	if len(retried) != 1 || retried[0].Code != "storage_unavailable" || retried[0].Attempt != 1 || retried[0].Machine != m.ID() {
+		t.Fatalf("retries %+v", retried)
+	}
+	if unavailable.Attempt != 0 {
+		t.Error("the Server changed Prepare's error")
+	}
+
+	always := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		return nil, nil, unavailable
+	}})
+	_, err := wait(t, always)
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != "storage_unavailable" || jerr.Attempt != 3 {
+		t.Fatalf("a Prepare that always asks to retry ended the job with %v, want its error on attempt 3", err)
+	}
+}
+
+// Close ends Prepare's context and waits for it to return.
+func TestCloseWaitsForPrepare(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	started := make(chan struct{})
+	var returned atomic.Bool
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		close(started)
+		<-ctx.Done()
+		time.Sleep(20 * time.Millisecond) // cleaning up, slowly
+		returned.Store(true)
+		return nil, nil, ctx.Err()
+	}})
+	<-started
+	srv.Close()
+	if !returned.Load() {
+		t.Fatal("Close returned before Prepare did")
+	}
+	if _, err := wait(t, run); !errors.Is(err, moil.ErrClosed) {
+		t.Fatalf("Wait = %v, want ErrClosed", err)
 	}
 }

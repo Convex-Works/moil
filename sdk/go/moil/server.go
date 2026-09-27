@@ -160,6 +160,8 @@ type Server struct {
 	closing bool
 	conns   sync.WaitGroup
 
+	prepares sync.WaitGroup // Job.Prepare calls in flight
+
 	reports *reporter
 
 	closeOnce sync.Once
@@ -193,8 +195,9 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // Close disconnects every machine and ends every unfinished Run with
-// ErrClosed. It saves what machines last reported, giving the Store up to
-// closeGrace, and waits for the Server's goroutines to finish.
+// ErrClosed. It waits for the Server's goroutines to finish, Job.Prepare
+// calls included, and saves what machines last reported, giving the Store
+// up to five seconds.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.connMu.Lock()
@@ -205,6 +208,7 @@ func (s *Server) Close() error {
 		close(s.stop)
 		<-s.loopDone
 		s.conns.Wait()
+		s.prepares.Wait()
 		s.reports.close(closeGrace)
 	})
 	return nil

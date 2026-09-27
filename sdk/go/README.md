@@ -143,15 +143,19 @@ res, err := run.Wait(ctx)
   already failed the job last.
 - **Pre-signed URLs expire.** If a job may wait a while or be retried, set
   `Prepare` instead of `Inputs` and `Outputs`: it makes each attempt's URLs
-  as the attempt is assigned.
+  as the attempt is assigned. A `*moil.JobError` with `Retryable` set
+  tries again later, counting toward `MaxAttempts`; any other error ends
+  the job.
 - **JSON values, not bytes.** `Params`, `ev.Data` and `Result.Meta` reach
   the other side as the same JSON value, but machines re-encode them, so
   key order, whitespace and the spelling of numbers may change. Keep them
   within I-JSON: send integers beyond 2^53, such as 64-bit IDs, as
   strings.
 - **Results.** `Wait` returns a `*moil.Result` (the script's `Meta`, and the
-  size and SHA-256 of each uploaded output), or a `*moil.JobError` with the
-  spec's error code, `moil.ErrCancelled`, or `moil.ErrClosed`.
+  size and SHA-256 of each uploaded output), or an error: a
+  `*moil.JobError` with the spec's error code, the error `Prepare`
+  returned, `moil.ErrTooMuchData`, `moil.ErrCancelled` or
+  `moil.ErrClosed`.
 - **Events** replay from the first for every reader and end with the run;
   the Server never waits for slow readers. Besides the script's `phase`,
   `progress`, `log` and `data`, you get `queued`, `assigned` (with the

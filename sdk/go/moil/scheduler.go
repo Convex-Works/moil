@@ -263,12 +263,15 @@ func (sc *scheduler) disconnected(sess *session) {
 }
 
 // dropLive forgets a machine's control channel. Its open offer counts as
-// unanswered.
+// unanswered, and an attempt being prepared for it goes back to the queue.
 func (sc *scheduler) dropLive(lm *liveMachine) {
 	delete(sc.machines, lm.m.ID)
 	if j := lm.offer; j != nil {
 		lm.offer = nil
 		sc.answer(j, lm.m.ID, false)
+	}
+	if j := sc.preparing[lm.m.ID]; j != nil {
+		sc.endPreparation(j)
 	}
 	sc.dirty = true
 }
@@ -552,7 +555,9 @@ func (sc *scheduler) start(j *jobState, lm *liveMachine) {
 	sc.preparing[p.machine] = j
 	a := Assignment{JobID: j.id, Attempt: p.n, Machine: lm.m}
 	a.Machine.MachineReport = a.Machine.MachineReport.clone()
+	sc.s.prepares.Add(1)
 	go func() {
+		defer sc.s.prepares.Done()
 		inputs, outputs, err := callPrepare(ctx, j.prepare, a)
 		sc.s.post(func(sc *scheduler) { sc.prepared(j, p, inputs, outputs, err) })
 	}()
@@ -571,9 +576,16 @@ func callPrepare(ctx context.Context, prepare func(context.Context, Assignment) 
 // machine can still take it.
 func (sc *scheduler) prepared(j *jobState, p *preparation, inputs map[string]Download, outputs map[string]Upload, err error) {
 	if j.prep != p {
-		return // the job ended meanwhile
+		return // the job ended, or the machine left, meanwhile
 	}
 	sc.endPreparation(j)
+	var retry *JobError
+	if errors.As(err, &retry) && retry.Retryable {
+		e := *retry
+		e.Machine, e.Attempt = p.machine, p.n
+		sc.retry(j, &e)
+		return
+	}
 	var ins map[string]wire.Download
 	var outs map[string]wire.Upload
 	if err == nil {
@@ -696,7 +708,16 @@ func (sc *scheduler) attemptDone(j *jobState, a *attemptState, m wire.Done) {
 func (sc *scheduler) attemptFailed(j *jobState, e *JobError) {
 	a := sc.endAttempt(j)
 	e.Machine, e.Attempt = a.machine, a.n
-	sc.log.Info("moil: attempt failed", "job", j.id, "attempt", a.n, "machine", a.machine, "code", e.Code, "message", e.Message)
+	if !e.Code.NeverStarted() {
+		j.failedOn[a.machine] = true
+	}
+	sc.retry(j, e)
+}
+
+// retry puts a job whose attempt failed with e back in the queue, or ends
+// it if e isn't retryable or no attempts remain.
+func (sc *scheduler) retry(j *jobState, e *JobError) {
+	sc.log.Info("moil: attempt failed", "job", j.id, "attempt", e.Attempt, "machine", e.Machine, "code", e.Code, "message", e.Message)
 	if j.cancelled {
 		sc.finish(j, Cancelled, nil, ErrCancelled)
 		return
@@ -704,12 +725,11 @@ func (sc *scheduler) attemptFailed(j *jobState, e *JobError) {
 	if e.Code.NeverStarted() {
 		// The machine refused; don't hand it the job again until it
 		// reports a change.
-		if lm := sc.machines[a.machine]; lm != nil {
-			j.skip[a.machine] = lm.gen
+		if lm := sc.machines[e.Machine]; lm != nil {
+			j.skip[e.Machine] = lm.gen
 		}
 	} else {
 		j.counted++
-		j.failedOn[a.machine] = true
 	}
 	if !e.Retryable || (!e.Code.NeverStarted() && j.counted >= j.maxAttempts) {
 		sc.finish(j, Failed, nil, e)
@@ -717,7 +737,7 @@ func (sc *scheduler) attemptFailed(j *jobState, e *JobError) {
 	}
 	j.phase = phaseQueued
 	j.run.setState(Queued)
-	j.run.emit(Event{Kind: EventRetrying, Time: time.Now(), Attempt: a.n, Machine: a.machine, Err: e})
+	j.run.emit(Event{Kind: EventRetrying, Time: time.Now(), Attempt: e.Attempt, Machine: e.Machine, Err: e})
 	sc.dirty = true
 }
 

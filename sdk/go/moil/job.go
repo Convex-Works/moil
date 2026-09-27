@@ -39,8 +39,14 @@ type Job struct {
 	// attempt is assigned, instead of Inputs and Outputs. Use it for
 	// pre-signed URLs, which could expire while the job waits for a
 	// machine or between attempts. It runs on its own goroutine before the
-	// machine hears of the attempt; ctx ends if the job does. An error
-	// ends the job, and Run.Wait returns it.
+	// machine hears of the attempt, which holds the machine for the job.
+	// ctx ends if the job ends or the machine leaves, and the job then
+	// waits for a machine again. Server.Close waits for Prepare to
+	// return, so return soon after ctx ends.
+	//
+	// A *JobError with Retryable set puts the job back in the queue, as a
+	// failed attempt that counts toward MaxAttempts; any other error ends
+	// the job, and Run.Wait returns it.
 	Prepare func(ctx context.Context, a Assignment) (inputs map[string]Download, outputs map[string]Upload, err error)
 	// Eligible is the service's policy for which machines may run the
 	// job, for example OwnedBy(room.OwnerID). It is required: machine
