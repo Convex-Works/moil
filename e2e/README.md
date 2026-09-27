@@ -48,8 +48,9 @@ processes it started.
 - `machine_test.go`: a machine with its own `MOIL_HOME` and
   `MOIL_SECRETS=file`: `Pair`, `Approve`, `Start` (waits until the service
   sees it online), `Stop` (SIGTERM), `Kill` (SIGKILL).
-- `link_test.go`: the network between a machine and its service, a TCP
-  proxy that can be cut and remembers what the service said.
+- `link_test.go`: the network in front of the service, which machines
+  pair and connect through: a TCP proxy that can be cut, and that
+  remembers what the service said to each machine.
 - `probe_test.go` and `testdata/bundles/probe`: the bundle the tests run.
   Its params list steps (progress, data, junk output, copying an input to
   an output, revealing what it sees, spawning a SIGTERM-proof grandchild,

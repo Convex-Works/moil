@@ -8,22 +8,26 @@ import (
 	"testing"
 )
 
-// A link is the network between a machine and its service: a TCP proxy
-// that can be cut, and that remembers everything the service sent the
-// machine.
+// A link is the network in front of a service, which its machines reach
+// it through: a TCP proxy that can be cut, and that remembers what went
+// over each connection.
 type link struct {
 	ln     net.Listener
 	target string
 	wg     sync.WaitGroup
 
-	mu     sync.Mutex
-	down   bool
-	conns  map[net.Conn]bool
-	opened int
-	heard  []byte
+	mu      sync.Mutex
+	down    bool
+	conns   map[net.Conn]bool
+	opened  int
+	traffic []*traffic // each connection's, oldest first
 }
 
-// newLink starts a link to target (host:port). The machine that owns it
+// traffic is what went over one connection: what the machine sent, and
+// what the service sent back.
+type traffic struct{ sent, heard []byte }
+
+// newLink starts a link to target (host:port). The service that owns it
 // closes it.
 func newLink(t *testing.T, target string) *link {
 	t.Helper()
@@ -37,7 +41,7 @@ func newLink(t *testing.T, target string) *link {
 	return l
 }
 
-// URL is where the machine reaches the service through the link.
+// URL is where machines reach the service through the link.
 func (l *link) URL() string { return "http://" + l.ln.Addr().String() }
 
 // Cut drops every connection and refuses new ones until Restore.
@@ -57,7 +61,7 @@ func (l *link) Restore() {
 	l.down = false
 }
 
-// Connections returns how many connections the machine opened through the
+// Connections returns how many connections machines opened through the
 // link.
 func (l *link) Connections() int {
 	l.mu.Lock()
@@ -65,13 +69,19 @@ func (l *link) Connections() int {
 	return l.opened
 }
 
-// Heard reports whether the service ever sent the machine s. Control
-// messages travel as plain WebSocket text frames, so a job's ID shows up
-// here once the machine has been told anything about the job.
-func (l *link) Heard(s string) bool {
+// Heard reports whether the service ever sent s over a connection that
+// carried token, as every request of the machine holding it does.
+// Control messages travel as plain WebSocket text frames, so a job's ID
+// shows up here once the machine has been told anything about the job.
+func (l *link) Heard(token, s string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return bytes.Contains(l.heard, []byte(s))
+	for _, t := range l.traffic {
+		if bytes.Contains(t.sent, []byte(token)) && bytes.Contains(t.heard, []byte(s)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *link) close() {
@@ -100,18 +110,20 @@ func (l *link) accept() {
 			machine.Close()
 			continue
 		}
-		if !l.track(machine, service) {
+		t := &traffic{}
+		if !l.track(t, machine, service) {
 			continue
 		}
 		l.wg.Add(2)
-		go l.pipe(service, machine, false)
-		go l.pipe(machine, service, true)
+		go l.pipe(service, machine, &t.sent)
+		go l.pipe(machine, service, &t.heard)
 	}
 }
 
-// track remembers a connection's two ends, so Cut can drop them. It
-// reports false, having closed them, if the link was cut meanwhile.
-func (l *link) track(ends ...net.Conn) bool {
+// track remembers a connection's two ends, so Cut can drop them, and its
+// traffic. It reports false, having closed them, if the link was cut
+// meanwhile.
+func (l *link) track(t *traffic, ends ...net.Conn) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, c := range ends {
@@ -121,17 +133,17 @@ func (l *link) track(ends ...net.Conn) bool {
 		}
 		l.conns[c] = true
 	}
+	if !l.down {
+		l.traffic = append(l.traffic, t)
+	}
 	return !l.down
 }
 
-// pipe copies from src to dst until either end closes, then closes both.
-func (l *link) pipe(dst, src net.Conn, fromService bool) {
+// pipe copies from src to dst, and to record, until either end closes,
+// then closes both.
+func (l *link) pipe(dst, src net.Conn, record *[]byte) {
 	defer l.wg.Done()
-	var w io.Writer = dst
-	if fromService {
-		w = io.MultiWriter(dst, heardWriter{l})
-	}
-	io.Copy(w, src)
+	io.Copy(io.MultiWriter(dst, recorder{l, record}), src)
 	dst.Close()
 	src.Close()
 	l.mu.Lock()
@@ -140,11 +152,16 @@ func (l *link) pipe(dst, src net.Conn, fromService bool) {
 	l.mu.Unlock()
 }
 
-type heardWriter struct{ l *link }
+// A recorder appends what it's written to one direction of a connection's
+// traffic.
+type recorder struct {
+	l  *link
+	to *[]byte
+}
 
-func (h heardWriter) Write(p []byte) (int, error) {
-	h.l.mu.Lock()
-	defer h.l.mu.Unlock()
-	h.l.heard = append(h.l.heard, p...)
+func (r recorder) Write(p []byte) (int, error) {
+	r.l.mu.Lock()
+	defer r.l.mu.Unlock()
+	*r.to = append(*r.to, p...)
 	return len(p), nil
 }

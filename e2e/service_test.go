@@ -27,9 +27,9 @@ type service struct {
 	// sdk is the service's moil.Server. Restart replaces it.
 	sdk *moil.Server
 	cfg moil.Config
-	// addr is the host:port the service listens on.
-	addr string
-	url  string
+	url string
+	// link is the network machines reach the service through.
+	link *link
 	// probe is the probe bundle, which every service publishes.
 	probe *moil.Bundle
 	// record is where probe attempts record their process groups.
@@ -93,8 +93,11 @@ func newService(t *testing.T, options ...serviceOption) *service {
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
-	s.addr, s.url = server.Listener.Addr().String(), server.URL
-	c.moil.VerificationURL = s.url + "/pair"
+	s.url = server.URL
+	s.link = newLink(t, server.Listener.Addr().String())
+	// Machines pair with the service through the link, so that's where
+	// its confirmation page is (spec §4).
+	c.moil.VerificationURL = s.link.URL() + "/pair"
 	s.cfg = c.moil
 	s.start()
 	mux.Handle("/moil/", http.StripPrefix("/moil", c.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +115,7 @@ func newService(t *testing.T, options ...serviceOption) *service {
 		sdk := s.sdk
 		s.mu.Unlock()
 		sdk.Close()
+		s.link.close()
 		server.Close()
 		s.checkNothingOutlivedItsAgent()
 	})

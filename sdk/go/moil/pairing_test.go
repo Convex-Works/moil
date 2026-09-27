@@ -327,8 +327,9 @@ func TestPairRequestsAreChecked(t *testing.T) {
 // The service's own confirmation page drives pairing; moiltest can play
 // the machine against it.
 func TestMoiltestPairsThroughTheServicePage(t *testing.T) {
-	srv := newServer(t)
 	mux := http.NewServeMux()
+	site := httptestServer(t, mux)
+	srv := newServer(t, func(c *moil.Config) { c.VerificationURL = site + "/machines/pair" })
 	mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
 	mux.HandleFunc("POST /machines/pair", func(w http.ResponseWriter, r *http.Request) {
 		// A real page would take the owner from the session.
@@ -336,7 +337,6 @@ func TestMoiltestPairsThroughTheServicePage(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 		}
 	})
-	site := httptestServer(t, mux)
 
 	m := moiltest.New(t, site+"/moil", moiltest.WithName("Ada's desktop"))
 	code := m.StartPairing()
