@@ -92,6 +92,12 @@ transcribe, err := moil.LoadBundle(sub) // validates and hashes
 srv.AddBundle(transcribe)
 ```
 
+`LoadBundle` refuses what machines refuse: a manifest outside spec §5.3,
+or a lockfile that doesn't pin everything it installs (every artifact
+hashed, sources over https, git pinned to a commit). `Packages` lists
+what the lockfile installs, marking the packages machines build from
+source, should your service want to show it as the app does.
+
 A new version of a bundle has a new hash and needs a new approval, so
 keep publishing the old version until owners have approved the new one.
 

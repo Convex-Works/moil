@@ -16,8 +16,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/BurntSushi/toml"
-
 	"git.convex.works/ConvexWorks/moil/sdk/go/internal/wire"
 )
 
@@ -42,6 +40,7 @@ var bundleFiles = [...]string{ScriptFile, LockFile, ManifestFile}
 type Bundle struct {
 	hash     string
 	manifest Manifest
+	packages []Package
 	files    [len(bundleFiles)][]byte
 }
 
@@ -93,9 +92,8 @@ func NewBundle(files map[string][]byte) (*Bundle, error) {
 		return nil, err
 	}
 	b.manifest = *m
-	var lock map[string]any
-	if _, err := toml.Decode(string(b.files[1]), &lock); err != nil {
-		return nil, fmt.Errorf("moil: job.py.lock isn't valid TOML: %w", err)
+	if b.packages, err = parseLockfile(string(b.files[1])); err != nil {
+		return nil, err
 	}
 	b.hash = hashFiles(b.files)
 	return &b, nil
@@ -131,6 +129,10 @@ func (b *Bundle) Manifest() Manifest {
 	m.Assets = maps.Clone(m.Assets)
 	return m
 }
+
+// Packages returns the packages the bundle's lockfile pins, in lockfile
+// order.
+func (b *Bundle) Packages() []Package { return slices.Clone(b.packages) }
 
 // File returns a copy of the named bundle file's exact bytes, or nil if name
 // isn't one of the three bundle files.

@@ -2,8 +2,10 @@ package moil_test
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -120,6 +122,75 @@ func TestBundleVectors(t *testing.T) {
 				t.Fatalf("accepted as %v", b)
 			}
 		})
+	}
+}
+
+// Every lockfile in the vectors makes a valid bundle or not as marked, and
+// the packages machines would build from source are the ones listed.
+func TestLockfileVectors(t *testing.T) {
+	var vectors struct {
+		Cases []struct {
+			Case             string   `json:"case"`
+			Valid            bool     `json:"valid"`
+			Lockfile         string   `json:"lockfile"`
+			BuildsFromSource []string `json:"builds_from_source"`
+		} `json:"cases"`
+	}
+	readJSON(t, vectorPath(t, "lockfiles.json"), &vectors)
+	if len(vectors.Cases) < 15 {
+		t.Fatalf("only %d lockfile vectors", len(vectors.Cases))
+	}
+	base := readBundleFiles(t, "minimal")
+	for _, c := range vectors.Cases {
+		t.Run(c.Case, func(t *testing.T) {
+			files := maps.Clone(base)
+			files[moil.LockFile] = []byte(c.Lockfile)
+			b, err := moil.NewBundle(files)
+			switch {
+			case c.Valid && err != nil:
+				t.Fatalf("rejected a valid lockfile: %v", err)
+			case !c.Valid && err == nil:
+				t.Fatalf("accepted an invalid lockfile, with packages %+v", b.Packages())
+			case !c.Valid:
+				return
+			}
+			built := []string{}
+			for _, p := range b.Packages() {
+				if p.BuildsFromSource {
+					built = append(built, p.Name)
+				}
+			}
+			if !slices.Equal(built, c.BuildsFromSource) {
+				t.Fatalf("builds %v from source, want %v", built, c.BuildsFromSource)
+			}
+		})
+	}
+}
+
+func TestBundleListsItsPackages(t *testing.T) {
+	b := vectorBundle(t, "crlf-unicode")
+	want := []moil.Package{{Name: "idna", Version: "3.20", SourceKind: "registry", Source: "https://pypi.org/simple"}}
+	if got := b.Packages(); !slices.Equal(got, want) {
+		t.Fatalf("packages %+v, want %+v", got, want)
+	}
+	b.Packages()[0].Name = "changed"
+	if b.Packages()[0].Name != "idna" {
+		t.Fatal("a caller changed the bundle's packages")
+	}
+
+	// The attack the rules close: an index the service controls serves an
+	// unhashed sdist, which it could change after approval.
+	files := readBundleFiles(t, "minimal")
+	files[moil.LockFile] = []byte(`
+[[package]]
+name = "evilpkg"
+version = "0.1"
+source = { registry = "https://evil.example.com/simple" }
+sdist = { url = "https://evil.example.com/evilpkg-0.1.tar.gz", size = 900 }
+`)
+	_, err := moil.NewBundle(files)
+	if want := "package evilpkg: https://evil.example.com/evilpkg-0.1.tar.gz has no SHA-256 hash, so it isn't pinned"; err == nil || !strings.HasSuffix(err.Error(), want) {
+		t.Fatalf("err = %v, want one ending %q", err, want)
 	}
 }
 
