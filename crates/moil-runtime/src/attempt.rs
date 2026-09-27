@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,7 +88,7 @@ impl Attempt<'_> {
         self.check_urls()?;
 
         self.phase(Phase::Preparing);
-        let bundle_dir = limits
+        let script = limits
             .guard(runtime.prepare_bundle(&job.bundle, Some(self.events)))
             .await??;
         let work_path = runtime.work_dir(&job.id, job.attempt);
@@ -127,7 +127,7 @@ impl Attempt<'_> {
             assets,
         };
         let accepted = self
-            .run_script(&bundle_dir, &work, &context, limits, &mut registration)
+            .run_script(&script, &work, &context, limits, &mut registration)
             .await?;
 
         self.phase(Phase::Uploading);
@@ -189,7 +189,7 @@ impl Attempt<'_> {
     /// Runs the script to its end and judges it (rules 1–7 of spec §8.5).
     async fn run_script(
         &mut self,
-        bundle_dir: &Path,
+        script: &uv::Script,
         work: &WorkDir,
         context: &JobContext,
         limits: &mut Limits,
@@ -197,10 +197,8 @@ impl Attempt<'_> {
     ) -> Result<Accepted, Ending> {
         let config = &self.runtime.config;
         let uv = self.runtime.uv();
-        let mut command = uv.command();
+        let mut command = script.command(&uv, "run");
         command
-            .args(["run", "--locked", "--script"])
-            .arg(bundle_dir.join(moil_bundle::SCRIPT))
             .env("TMPDIR", work.tmp())
             .env("PYTHONUNBUFFERED", "1")
             .current_dir(work.root())

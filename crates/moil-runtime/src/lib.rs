@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, watch};
 
 mod assets;
 mod attempt;
+mod environments;
 mod http;
 mod locks;
 mod orphans;
@@ -176,6 +177,11 @@ pub struct RuntimeConfig {
     pub jobs_dir: PathBuf,
     /// Where assets are cached, by hash.
     pub assets_dir: PathBuf,
+    /// Where bundles' uv environments are kept, by hash.
+    /// [`Runtime::reap_orphans`] removes those of bundles not in
+    /// [`RuntimeConfig::bundles`], so runtimes that share this directory
+    /// must share the bundle store too.
+    pub environments_dir: PathBuf,
     /// Accept `http` URLs for inputs and outputs on any host, not just
     /// loopback. For development only.
     pub allow_insecure_http: bool,
@@ -206,6 +212,7 @@ impl RuntimeConfig {
             bundles: BundleStore::new(home.join("bundles")),
             jobs_dir: home.join("jobs"),
             assets_dir: home.join("cache").join("assets"),
+            environments_dir: home.join("cache").join("environments"),
             allow_insecure_http: false,
             keep_work_dirs: false,
             kill_grace: Duration::from_secs(10),
@@ -231,6 +238,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     http: http::Http,
     assets: assets::AssetCache,
+    environments: environments::Environments,
     /// Held while a bundle is stored and its environment synced, by hash:
     /// preparing it after approval and for an attempt may overlap.
     preparing: locks::KeyedLocks<BundleHash>,
@@ -248,6 +256,7 @@ impl Runtime {
             .map_err(ConfigError::Https)?;
         Ok(Self {
             assets: assets::AssetCache::new(config.assets_dir.clone()),
+            environments: environments::Environments::new(config.environments_dir.clone()),
             http,
             preparing: locks::KeyedLocks::default(),
             config,
@@ -272,10 +281,15 @@ impl Runtime {
     /// Attempts whose supervising process is still alive, including this
     /// one's, are left alone, so calling it while attempts run is safe. It
     /// also removes asset downloads that were abandoned mid-way, going by
-    /// files nothing has written to for an hour.
+    /// files nothing has written to for an hour, and the environments of
+    /// bundles no longer stored.
     pub fn reap_orphans(&self) -> std::io::Result<usize> {
         let reaped = orphans::reap(&self.config.jobs_dir, self.config.keep_work_dirs)?;
         self.assets.remove_abandoned(Duration::from_secs(60 * 60))?;
+        let pruned = self.environments.prune(&self.config.bundles)?;
+        if pruned > 0 {
+            tracing::info!("removed the environments of {pruned} bundles no longer stored");
+        }
         Ok(reaped)
     }
 
@@ -285,12 +299,12 @@ impl Runtime {
     }
 
     /// Stores `bundle`, creates its environment and fetches its assets.
-    /// Returns the stored bundle's directory.
+    /// Returns the stored bundle's script, ready to run.
     async fn prepare_bundle(
         &self,
         bundle: &Bundle,
         events: Option<&EventSink>,
-    ) -> Result<PathBuf, JobError> {
+    ) -> Result<uv::Script, JobError> {
         let _preparing = self.preparing.lock(&bundle.hash()).await;
         let dir = self.config.bundles.put(bundle).map_err(|e| {
             JobError::new(
@@ -305,10 +319,14 @@ impl Runtime {
             }
             Ok(())
         };
-        let (uv, script) = (self.uv(), dir.join(moil_bundle::SCRIPT));
-        let sync = uv::sync(&uv, &script, self.config.echo_stderr);
+        let environment = self.environments.path(&bundle.hash());
+        let script = uv::Script::new(bundle, &dir, environment);
+        let uv = self.uv();
+        let sync = self
+            .environments
+            .sync(&uv, &script, self.config.echo_stderr);
         tokio::try_join!(sync, fetch_assets)?;
-        Ok(dir)
+        Ok(script)
     }
 }
 

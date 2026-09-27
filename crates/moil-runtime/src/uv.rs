@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+use moil_bundle::Bundle;
 use moil_proto::{ErrorCode, JobError};
 use tokio::process::Command;
 
 use crate::stderr::{self, Tail};
+use crate::workdir::remove_tree;
 
 /// The uv binary, and the environment every uv process gets.
 #[derive(Debug, Clone)]
@@ -78,13 +80,88 @@ fn env_or(name: &str, default: &str) -> OsString {
         .unwrap_or_else(|| default.into())
 }
 
-/// Creates the environment for the script at `script` with
-/// `uv sync --locked --script`, failing with `environment` if uv can't.
-pub(crate) async fn sync(uv: &Uv, script: &Path, echo_stderr: bool) -> Result<(), JobError> {
-    let mut command = uv.command();
+/// A stored bundle's `job.py` as uv syncs and runs it (spec §8.1): with
+/// exactly the dependencies its lockfile pins, in an environment the
+/// runtime chose.
+#[derive(Debug, Clone)]
+pub(crate) struct Script {
+    path: PathBuf,
+    environment: PathBuf,
+    requires_python: Option<String>,
+}
+
+impl Script {
+    /// The script of `bundle`, stored in `dir`, with its environment at
+    /// `environment`.
+    pub fn new(bundle: &Bundle, dir: &Path, environment: PathBuf) -> Self {
+        Self {
+            path: dir.join(moil_bundle::SCRIPT),
+            environment,
+            requires_python: bundle.requires_python().map(str::to_owned),
+        }
+    }
+
+    /// `uv <subcommand> --locked … --script <job.py>`: `sync` installs the
+    /// dependencies, `run` runs the script (syncing first, by the same
+    /// rules).
+    pub fn command(&self, uv: &Uv, subcommand: &str) -> Command {
+        let mut command = uv.command();
+        // `--active` uses the environment at $VIRTUAL_ENV rather than one
+        // in uv's cache, where nothing would ever remove it.
+        command
+            .args([subcommand, "--locked", "--active"])
+            .env("VIRTUAL_ENV", &self.environment);
+        // Last: whatever follows the script's path is the script's own.
+        command.arg("--script").arg(&self.path);
+        command
+    }
+
+    /// Whether the environment exists and its Python is still there.
+    pub fn has_environment(&self) -> bool {
+        self.environment.join("bin/python").is_file()
+    }
+}
+
+/// Makes an empty environment for `script` with `uv venv`, with a Python
+/// its lockfile allows, replacing anything in its place.
+///
+/// `uv sync` would make a missing environment itself, but wouldn't say
+/// which Python it failed to find, and never repairs one whose Python is
+/// gone.
+pub(crate) async fn create_environment(
+    uv: &Uv,
+    script: &Script,
+    echo_stderr: bool,
+) -> Result<(), JobError> {
+    remove_tree(&script.environment).map_err(|error| {
+        JobError::new(
+            ErrorCode::Internal,
+            format!("couldn't remove a broken environment: {error}"),
+        )
+    })?;
+    let mut venv = uv.command();
+    venv.args(["venv", "--no-project", "--quiet"]);
+    if let Some(versions) = &script.requires_python {
+        venv.arg("--python").arg(versions);
+    }
+    venv.arg(&script.environment);
+    run_to_end(uv, venv, &script.path, echo_stderr).await
+}
+
+/// Installs `script`'s dependencies into its environment with `uv sync`.
+pub(crate) async fn sync(uv: &Uv, script: &Script, echo_stderr: bool) -> Result<(), JobError> {
+    run_to_end(uv, script.command(uv, "sync"), &script.path, echo_stderr).await
+}
+
+/// Runs uv `command` next to the script at `script`, without input or
+/// output, and explains its failure.
+async fn run_to_end(
+    uv: &Uv,
+    mut command: Command,
+    script: &Path,
+    echo_stderr: bool,
+) -> Result<(), JobError> {
     command
-        .args(["sync", "--locked", "--script"])
-        .arg(script)
         .current_dir(script.parent().unwrap_or(Path::new("/")))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -118,7 +195,7 @@ pub(crate) fn cant_start(uv: &Uv, error: &std::io::Error) -> JobError {
     )
 }
 
-/// Explains a failed `uv sync` from its stderr. Retryable, as an index
+/// Explains a failed `uv venv` or `uv sync` from its stderr. Retryable, as an index
 /// that is down may be back for the next attempt, unless the bundle itself
 /// is at fault (spec §9).
 fn sync_failure(stderr: &str) -> JobError {
@@ -130,11 +207,12 @@ fn sync_failure(stderr: &str) -> JobError {
         )
         .retryable(false);
     }
-    let message = match stderr
+    let reason = stderr
         .lines()
         .find_map(|line| line.trim().strip_prefix("error:"))
-    {
-        Some(reason) => format!("uv couldn't create the environment: {}", reason.trim()),
+        .map(str::trim);
+    let message = match reason {
+        Some(reason) => format!("uv couldn't create the environment: {reason}"),
         None => "uv couldn't create the environment".into(),
     };
     JobError::new(ErrorCode::Environment, message)

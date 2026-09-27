@@ -439,3 +439,85 @@ mod environment {
         );
     }
 }
+
+mod environments {
+    use super::*;
+
+    #[tokio::test]
+    async fn each_bundle_has_an_environment_that_goes_with_it() {
+        let h = Harness::new().await;
+        let (gone, kept) = (
+            probe(),
+            probe_with_manifest(json!({"moil": 1, "name": "probe", "version": "2"})),
+        );
+        let run = h
+            .run(h.job(
+                &gone,
+                steps(json!([{"prefix": true}, {"emit": {"type": "result"}}])),
+            ))
+            .await;
+        let environments = &h.runtime.config().environments_dir;
+        let environment = environments.join(gone.hash().to_string());
+        let prefix = std::path::PathBuf::from(run.data("prefix").as_str().unwrap());
+        assert_eq!(
+            prefix.canonicalize().unwrap(),
+            environment.canonicalize().unwrap(),
+            "the script ran in its bundle's environment"
+        );
+        h.runtime.prepare(&kept).await.unwrap();
+
+        // The owner revoked `gone`, so its bundle is no longer stored.
+        h.runtime.config().bundles.remove(&gone.hash()).unwrap();
+        h.runtime.reap_orphans().unwrap();
+
+        assert!(!environment.exists());
+        assert!(environments.join(kept.hash().to_string()).is_dir());
+    }
+
+    #[tokio::test]
+    async fn runtimes_sharing_environments_can_make_one_at_once() {
+        // As `moil run`s of one bundle do, each with a runtime of its own.
+        let h = Harness::new().await;
+        let homes: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        let runtimes: Vec<Runtime> = homes
+            .iter()
+            .map(|home| {
+                let mut config = h.runtime.config().clone();
+                config.bundles = BundleStore::new(home.path().join("bundles"));
+                config.jobs_dir = home.path().join("jobs");
+                Runtime::new(config).unwrap()
+            })
+            .collect();
+        // Several fresh bundles, each giving a race another chance.
+        for version in 1..=3 {
+            let bundle = probe_with_manifest(
+                json!({"moil": 1, "name": "probe", "version": version.to_string()}),
+            );
+            let prepared =
+                futures::future::join_all(runtimes.iter().map(|r| r.prepare(&bundle))).await;
+            for result in prepared {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_environment_whose_python_is_gone_is_rebuilt() {
+        // As when the owner uninstalls the Python uv made it with.
+        let h = Harness::new().await;
+        let bundle = probe();
+        h.runtime.prepare(&bundle).await.unwrap();
+        let python = h
+            .runtime
+            .config()
+            .environments_dir
+            .join(bundle.hash().to_string())
+            .join("bin/python");
+        std::fs::remove_file(&python).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/python3", &python).unwrap();
+
+        h.run(h.job(&bundle, steps(json!([{"emit": {"type": "result"}}]))))
+            .await
+            .result();
+    }
+}

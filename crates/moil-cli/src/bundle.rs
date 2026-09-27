@@ -44,8 +44,9 @@ pub enum Command {
     ///
     /// Inputs are served, and outputs received, by a local HTTP server, so
     /// they move as they would for a real job. Without --home the job runs
-    /// in a temporary home, but bundles and assets stay cached (in
-    /// $XDG_CACHE_HOME/moil, ~/Library/Caches/moil on macOS) between runs.
+    /// in a temporary home, but bundles, their environments and assets stay
+    /// cached (in $XDG_CACHE_HOME/moil, ~/Library/Caches/moil on macOS)
+    /// between runs.
     Run(RunArgs),
 }
 
@@ -347,9 +348,10 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("couldn't create {}", args.out_dir.display()))?;
 
-    // A throwaway home unless one is given. Bundles and assets are stored by
-    // hash and verified, so they can be kept between runs all the same: a
-    // bundle's environment is then reused, and big assets fetched once.
+    // A throwaway home unless one is given. Bundles, environments and assets
+    // are kept by hash, and bundles and assets verified, so they can be kept
+    // between runs all the same: a bundle's environment is then reused, and
+    // big assets fetched once.
     let mut temporary = None;
     let home = match &globals.home {
         Some(home) => home.clone(),
@@ -364,6 +366,7 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     {
         config.bundles = moil_bundle::BundleStore::new(cache.join("bundles"));
         config.assets_dir = cache.join("assets");
+        config.environments_dir = cache.join("environments");
     }
     config.extra_env.extend(uv_cache_env());
     config.keep_work_dirs = args.keep;

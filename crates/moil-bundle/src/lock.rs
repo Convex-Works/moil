@@ -40,14 +40,22 @@ impl LockedPackage {
     }
 }
 
+/// What a lockfile pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Lockfile {
+    /// The Python versions it was locked for, such as `>=3.12`.
+    pub requires_python: Option<String>,
+    pub packages: Vec<LockedPackage>,
+}
+
 /// Whether `index` is PyPI's.
 pub fn is_pypi(index: &str) -> bool {
     index.trim_end_matches('/') == "https://pypi.org/simple"
 }
 
-/// Parses the lockfile, checks that it pins everything it can, and lists
-/// its packages. The error says what's wrong, for the bundle's author.
-pub(crate) fn parse_lockfile(text: &str) -> Result<Vec<LockedPackage>, String> {
+/// Parses the lockfile and checks that it pins everything it can. The
+/// error says what's wrong, for the bundle's author.
+pub(crate) fn parse_lockfile(text: &str) -> Result<Lockfile, String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         // The full error says where; keep it on one line.
         let full = e.to_string();
@@ -58,13 +66,23 @@ pub(crate) fn parse_lockfile(text: &str) -> Result<Vec<LockedPackage>, String> {
             .collect();
         lines.join(" ")
     })?;
-    let Some(packages) = table.get("package") else {
-        return Ok(Vec::new());
+    let requires_python = table
+        .get("requires-python")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let packages = match table.get("package") {
+        Some(packages) => packages
+            .as_array()
+            .ok_or("`package` must be an array of tables")?
+            .iter()
+            .map(package)
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
     };
-    let packages = packages
-        .as_array()
-        .ok_or("`package` must be an array of tables")?;
-    packages.iter().map(package).collect()
+    Ok(Lockfile {
+        requires_python,
+        packages,
+    })
 }
 
 fn package(value: &toml::Value) -> Result<LockedPackage, String> {
@@ -193,7 +211,9 @@ mod tests {
             let name = case["case"].as_str().unwrap();
             let result = parse_lockfile(case["lockfile"].as_str().unwrap());
             if case["valid"].as_bool().unwrap() {
-                let packages = result.unwrap_or_else(|e| panic!("{name}: expected valid, got {e}"));
+                let packages = result
+                    .unwrap_or_else(|e| panic!("{name}: expected valid, got {e}"))
+                    .packages;
                 let built: Vec<&str> = packages
                     .iter()
                     .filter(|p| p.builds_from_source)
@@ -223,7 +243,9 @@ mod tests {
             "/../../spec/vectors/bundles/crlf-unicode/job.py.lock"
         ))
         .unwrap();
-        let packages = parse_lockfile(&text).unwrap();
+        let lockfile = parse_lockfile(&text).unwrap();
+        assert_eq!(lockfile.requires_python.as_deref(), Some(">=3.12"));
+        let packages = lockfile.packages;
         assert_eq!(
             packages,
             [LockedPackage {

@@ -15,6 +15,7 @@ params: {"steps": [step, ...]}. Each step is an object with one of:
   {"asset": "name"}              send an asset's contents as data
   {"context": true}              send the job context as data
   {"environ": true}              send the environment as data
+  {"prefix": true}               send the environment's sys.prefix as data
   {"spawn": true}                start a grandchild that ignores SIGTERM,
                                  then send its pid, the script's and uv's
   {"on_sigterm": "message",      on SIGTERM, log the message, wait
@@ -66,6 +67,8 @@ def run(step, job):
         data({"context": job})
     elif "environ" in step:
         data({"environ": dict(os.environ)})
+    elif "prefix" in step:
+        data({"prefix": sys.prefix})
     elif "spawn" in step:
         stubborn = (
             "import signal, time\n"
