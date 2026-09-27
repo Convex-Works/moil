@@ -281,6 +281,45 @@ async fn an_assignment_the_machine_cant_take_fails_at_once() {
 }
 
 #[tokio::test]
+async fn a_refused_assignment_is_answered_once_and_not_kept() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let unapproved = bundle("summarize", "1.0.0", "print('?')");
+    conn.send(assign("j1", 1, unapproved.hash(), 30_000));
+    failure(conn.recv().await);
+
+    // Never acknowledged, it isn't offered again: the service fails the
+    // attempt as lost (spec §7.5).
+    conn.drop_connection();
+    let hello = setup.service().accept().await.hello().await;
+    assert_eq!(hello.attempts, []);
+}
+
+#[tokio::test]
+async fn a_flood_of_refused_assignments_costs_the_machine_nothing() {
+    let setup = Setup::new().await;
+    let conn = setup.connect().await;
+    let unapproved = bundle("summarize", "1.0.0", "print('?')").hash();
+
+    // Kept until acknowledged, and all looked at again after each
+    // message, 40,000 of these took seconds and memory without end.
+    const ASSIGNS: u32 = 20_000;
+    let started = Instant::now();
+    for attempt in 1..=ASSIGNS {
+        conn.send(assign("j1", attempt, unapproved, 30_000));
+    }
+    // The machine reads them all before it sees the connection drop.
+    conn.drop_connection();
+    let mut conn = setup.service().accept().await;
+    assert_eq!(conn.hello().await.attempts, [], "none of them was kept");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "{ASSIGNS} refusals took {took:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_assignment_the_machine_cant_read_is_rejected() {
     let mut setup = Setup::new().await;
     let mut conn = setup.connect().await;

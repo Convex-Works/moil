@@ -10,7 +10,7 @@
 //! things happen, is what makes reconnecting and resuming (spec §7.5) fall
 //! out naturally.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -112,8 +112,12 @@ pub(super) struct Coordinator {
     paused: bool,
     services: BTreeMap<ServiceId, Service>,
     /// Attempts whose messages the machine keeps until the service
-    /// acknowledges their `done`.
+    /// acknowledges their `done`. Only attempts that started: a refused
+    /// one's `done` is sent once and forgotten (spec §7.5).
     attempts: BTreeMap<AttemptKey, Attempt>,
+    /// Attempts with messages their service may not have yet, for
+    /// [`reconcile`](Self::reconcile) to send.
+    unsent: BTreeSet<AttemptKey>,
     /// The one attempt running on this machine, if any.
     running: Option<Running>,
     /// The attempt that ran before, once it ended.
@@ -317,6 +321,7 @@ impl Coordinator {
             snapshot,
             services: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            unsent: BTreeSet::new(),
             running: None,
             last_job: None,
             next_task: 0,
@@ -577,7 +582,10 @@ impl Coordinator {
                 .iter()
                 .find(|r| r.job_id == key.attempt.job_id && r.attempt == key.attempt.attempt);
             match (resumed, self.attempts.get_mut(&key)) {
-                (Some(resume), Some(attempt)) => attempt.delivered = resume.seq,
+                (Some(resume), Some(attempt)) => {
+                    attempt.delivered = resume.seq;
+                    self.unsent.insert(key);
+                }
                 (Some(_), None) => {}
                 (None, _) => {
                     tracing::info!("{id} no longer expects {key}; abandoning it");
@@ -668,11 +676,19 @@ impl Coordinator {
     }
 
     /// Answers an assignment the machine won't run with a failed `done`.
+    /// The machine doesn't keep it (spec §7.5): if it doesn't reach the
+    /// service, the service fails the attempt as `lost`.
     fn refuse(&mut self, key: AttemptKey, error: JobError) {
         tracing::info!("refused {key}: {}", error.message);
-        let mut attempt = Attempt::new(Duration::ZERO);
-        attempt.push_done(&key, Outcome::failed(error));
-        self.attempts.insert(key, attempt);
+        let done = MachineMessage::Done(Done {
+            job_id: key.attempt.job_id.clone(),
+            attempt: key.attempt.attempt,
+            seq: 1,
+            outcome: Outcome::failed(error),
+        });
+        if !self.send(&key.service, &done) {
+            tracing::debug!("couldn't tell {} that {key} was refused", key.service);
+        }
     }
 
     /// Which URLs the jobs of service `id` may use for their files (spec
@@ -778,6 +794,7 @@ impl Coordinator {
         // Abandoned attempts are gone, and so are their late events.
         if let Some(attempt) = self.attempts.get_mut(key) {
             attempt.push_event(key, event, self.options.max_kept_bytes);
+            self.unsent.insert(key.clone());
         }
     }
 
@@ -795,6 +812,7 @@ impl Coordinator {
                 Outcome::Cancelled => tracing::info!("{key} was cancelled"),
             }
             attempt.push_done(&key, outcome);
+            self.unsent.insert(key);
         }
     }
 
@@ -843,23 +861,36 @@ impl Coordinator {
     /// `idle` it leads to.
     fn reconcile(&mut self) {
         let now = Instant::now();
-        let running = self.running.as_ref().map(|r| &r.key);
-        for (key, attempt) in &mut self.attempts {
+        for key in std::mem::take(&mut self.unsent) {
+            let Some(attempt) = self.attempts.get_mut(&key) else {
+                continue;
+            };
+            // Until the service answers hello there's nothing to send;
+            // `welcome` marks what it's missing.
             let Some(link) = self
                 .services
                 .get_mut(&key.service)
                 .and_then(|s| s.link.as_mut())
-                .filter(|l| l.ready())
+                .filter(|l| l.welcomed)
             else {
                 continue;
             };
-            attempt.deliver(link, now);
-            if running == Some(key)
-                && now >= attempt.renew_at()
-                && link.send(&MachineMessage::Renew(key.attempt.clone()))
-            {
-                attempt.last_sent = now;
+            if !attempt.deliver(link, now) {
+                // The rest goes once the outbox has room.
+                self.unsent.insert(key);
             }
+        }
+        if let Some(running) = &self.running
+            && let Some(attempt) = self.attempts.get_mut(&running.key)
+            && let Some(link) = self
+                .services
+                .get_mut(&running.key.service)
+                .and_then(|s| s.link.as_mut())
+                .filter(|l| l.ready())
+            && now >= attempt.renew_at()
+            && link.send(&MachineMessage::Renew(running.key.attempt.clone()))
+        {
+            attempt.last_sent = now;
         }
 
         let state = self.state();
