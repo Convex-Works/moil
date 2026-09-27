@@ -124,6 +124,27 @@ impl From<ServiceId> for String {
 )]
 pub struct InvalidServiceId(String);
 
+/// Fails unless `name` may be what a service calls itself (spec §4): 1 to
+/// 64 characters, none of them a control character. Says why, as a reason
+/// for [`Error::NotAService`](crate::Error::NotAService).
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
+    let chars = name.chars().count();
+    if name.chars().any(char::is_control) {
+        Err(format!(
+            "it calls itself {name:?}, which has control characters"
+        ))
+    } else if !(1..=MAX_NAME_CHARS).contains(&chars) {
+        Err(format!(
+            "it calls itself {name:?}, which isn't 1 to {MAX_NAME_CHARS} characters long"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The longest name a service may give itself, in characters (spec §10).
+const MAX_NAME_CHARS: usize = 64;
+
 /// A service this machine is paired with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedService {

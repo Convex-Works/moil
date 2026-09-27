@@ -158,6 +158,10 @@ impl PairingSession {
                 self.service_name, granted.machine_id
             )));
         }
+        if let Err(reason) = crate::services::check_name(&granted.service.name) {
+            let url = self.base_url.to_string();
+            return Err(Error::NotAService { url, reason });
+        }
         let (base_url, on_paired) = (self.base_url, self.on_paired);
         // One task that runs to the end, whoever waits for it.
         self.machine

@@ -15,6 +15,7 @@ use url::Url;
 use crate::fs::{PUBLIC, read_json, with_path, write_json};
 use crate::hardware::Hardware;
 use crate::net::{self, Net};
+use crate::services;
 use crate::{
     Approval, Error, Home, PairedService, PairingSession, Review, SecretStore, ServiceId, Settings,
 };
@@ -284,6 +285,7 @@ impl Machine {
                 moil_proto::PROTOCOL_VERSION
             )));
         }
+        services::check_name(&info.name).map_err(not_a_service)?;
 
         // The computer's name may take detecting.
         let name = self.blocking(|machine| Ok(machine.name())).await?;
@@ -303,6 +305,7 @@ impl Machine {
             .map_err(|e| net::unreachable(base_url.as_str(), &e))?;
         let started = Instant::now();
         let pairing: PairResponse = net::read_json(&info.name, response).await?;
+        services::check_name(&pairing.service.name).map_err(not_a_service)?;
         for uri in [
             &pairing.verification_uri,
             &pairing.verification_uri_complete,

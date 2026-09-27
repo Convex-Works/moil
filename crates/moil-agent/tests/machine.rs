@@ -293,6 +293,35 @@ async fn pairing_only_starts_with_a_moil_service() {
 }
 
 #[tokio::test]
+async fn a_service_is_paired_only_under_a_name_that_hides_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    for name in [
+        "klisi\x1b[2J\x1b[Hyour-bank",
+        "klisi\r",
+        "",
+        &"x".repeat(65),
+    ] {
+        let service = FakeService::start(name).await;
+        match machine.pair(&service.base_url).await {
+            Err(Error::NotAService { reason, .. }) => {
+                assert!(reason.contains("calls itself"), "{reason}");
+            }
+            other => panic!("paired with {name:?}: {other:?}"),
+        }
+        assert_eq!(service.pair_requests(), [], "{name:?}");
+    }
+    assert_eq!(machine.services().unwrap(), []);
+
+    // What isn't a control character is shown revealed instead (spec
+    // §5.5).
+    for name in ["é".repeat(64), "klisi\u{202e}".to_owned()] {
+        let service = FakeService::start(&name).await;
+        assert_eq!(pair(&machine, &service).await.name, name);
+    }
+}
+
+#[tokio::test]
 async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
