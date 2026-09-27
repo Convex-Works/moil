@@ -29,6 +29,7 @@ use crate::page;
 use crate::pair::{PairEffect, PairWindow};
 use crate::platform;
 use crate::review::{ReviewEffect, ReviewWindow};
+use crate::snapshots::Snapshots;
 use crate::tray::Tray;
 use crate::unpair::{UnpairEffect, UnpairWindow};
 use crate::view::{Action, TrayView, ViewContext};
@@ -41,7 +42,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 /// Everything that wakes the event loop, besides the platform's own events.
 #[derive(Debug)]
 pub enum AppEvent {
-    Snapshot(Box<Snapshot>),
+    /// The agent's state changed: take the latest snapshot.
+    Snapshot,
     Menu(MenuId),
     /// A page posted a message.
     Ipc {
@@ -101,6 +103,7 @@ pub fn run(
         login,
         log_file,
         tray: None,
+        snapshots: None,
         snapshot: Snapshot::default(),
         deferred: HashSet::new(),
         windows: HashMap::new(),
@@ -141,6 +144,7 @@ struct App {
     login: Box<dyn LoginItem>,
     log_file: Option<PathBuf>,
     tray: Option<Tray>,
+    snapshots: Option<Snapshots>,
     snapshot: Snapshot,
     /// Reviews the owner closed without approving.
     deferred: HashSet<(ServiceId, BundleHash)>,
@@ -210,17 +214,11 @@ impl App {
                 return;
             }
         };
-        let mut snapshots = backend.subscribe();
-        self.snapshot = snapshots.borrow_and_update().clone();
         let proxy = self.proxy.clone();
-        self.runtime.spawn(async move {
-            while snapshots.changed().await.is_ok() {
-                let snapshot = Box::new(snapshots.borrow_and_update().clone());
-                if proxy.send_event(AppEvent::Snapshot(snapshot)).is_err() {
-                    break;
-                }
-            }
-        });
+        let wake = move || proxy.send_event(AppEvent::Snapshot).is_ok();
+        let mut snapshots = Snapshots::watch(backend.subscribe(), self.runtime.handle(), wake);
+        self.snapshot = snapshots.take();
+        self.snapshots = Some(snapshots);
         match Tray::new(self.view()) {
             Ok(tray) => self.tray = Some(tray),
             Err(e) => tracing::error!("{e}"),
@@ -253,9 +251,11 @@ impl App {
 
     fn handle(&mut self, event: AppEvent, target: &EventLoopWindowTarget<AppEvent>) {
         match event {
-            AppEvent::Snapshot(snapshot) => {
-                self.snapshot = *snapshot;
-                self.refresh_tray();
+            AppEvent::Snapshot => {
+                if let Some(snapshots) = &mut self.snapshots {
+                    self.snapshot = snapshots.take();
+                    self.refresh_tray();
+                }
             }
             AppEvent::Menu(id) => {
                 let action = self.tray.as_ref().and_then(|t| t.action(&id)).cloned();

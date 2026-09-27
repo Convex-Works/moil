@@ -72,6 +72,7 @@ events to them and carries out what they ask for.
 | `review`, `pair`, `unpair` | one window each: its state machine and its page |
 | `page` | the page shell (policy, style, script) and helpers for untrusted text |
 | `ipc`, `links` | strict parsing of page messages, `moil://` links and navigation |
+| `snapshots` | the agent's snapshots, taken by the event loop when it gets to them, however fast they come |
 | `app` | the tao event loop, wry windows and Tokio tasks |
 
 Pages show text a service controls, so every page is escaped by maud, runs
