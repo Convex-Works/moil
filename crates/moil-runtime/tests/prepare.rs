@@ -440,6 +440,63 @@ mod environment {
     }
 }
 
+mod packages {
+    use super::*;
+    use common::index::{Index, Offer};
+
+    #[tokio::test]
+    async fn a_package_the_lockfile_has_wheels_for_is_never_built_from_source() {
+        // As when the wheels don't cover this platform. Building the sdist
+        // would run build tools the lockfile doesn't pin (spec §5.1).
+        let index = Index::start(&[("trap", Offer::SdistAndForeignWheel)]).await;
+        let h = Harness::with(|c| c.extra_env.push(index.uv_env())).await;
+        let bundle = index.bundle(&["trap"]).await;
+        assert!(!bundle.packages()[0].builds_from_source);
+
+        let prepared = h.runtime.prepare(&bundle).await;
+        assert!(!index.was_built("trap"), "uv built trap from its sdist");
+        let error = prepared.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Environment);
+        assert!(error.retryable, "the wheels may fit another machine");
+        assert!(
+            error
+                .message
+                .contains("wheels for trap==1.0, but none for this machine's platform"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_package_the_lockfile_has_no_wheel_for_is_built_from_source() {
+        let index = Index::start(&[("plain", Offer::Sdist)]).await;
+        let h = Harness::with(|c| c.extra_env.push(index.uv_env())).await;
+        let bundle = index.bundle(&["plain"]).await;
+        assert!(bundle.packages()[0].builds_from_source);
+
+        let run = h.run(h.job(&bundle, Value::Null)).await;
+        assert_eq!(run.result().meta, Some(json!({"plain": "built"})));
+        assert!(index.was_built("plain"));
+    }
+
+    #[tokio::test]
+    async fn an_index_that_is_down_is_a_retryable_environment_failure() {
+        let index = Index::start(&[("plain", Offer::Sdist)]).await;
+        let retries = ("UV_HTTP_RETRIES".into(), "0".into());
+        let h = Harness::with(|c| c.extra_env.extend([index.uv_env(), retries])).await;
+        let bundle = index.bundle(&["plain"]).await;
+        index.go_down();
+
+        let error = h.runtime.prepare(&bundle).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Environment);
+        assert!(
+            error.retryable,
+            "the index may be back for the next attempt"
+        );
+        assert!(!index.was_built("plain"));
+    }
+}
+
 mod environments {
     use super::*;
 

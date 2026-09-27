@@ -1,0 +1,6 @@
+{
+  "moil": 1,
+  "name": "from-source",
+  "version": "1",
+  "description": "A package without a wheel, for testing `moil check`."
+}

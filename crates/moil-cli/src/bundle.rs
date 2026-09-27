@@ -132,8 +132,13 @@ async fn check(dir: &Path) -> anyhow::Result<()> {
         println!("packages");
         for package in bundle.packages() {
             let version = package.version.as_deref().unwrap_or("(no version)");
+            let built = if package.builds_from_source {
+                "  (no wheel: built from source on each machine, with build tools it doesn't pin)"
+            } else {
+                ""
+            };
             println!(
-                "  {} {version}  {}",
+                "  {} {version}  {}{built}",
                 package.name,
                 describe_source(&package.source)
             );

@@ -81,13 +81,15 @@ fn env_or(name: &str, default: &str) -> OsString {
 }
 
 /// A stored bundle's `job.py` as uv syncs and runs it (spec §8.1): with
-/// exactly the dependencies its lockfile pins, in an environment the
-/// runtime chose.
+/// exactly the dependencies its lockfile pins, each installed from a wheel
+/// whenever the lockfile has any, in an environment the runtime chose.
 #[derive(Debug, Clone)]
 pub(crate) struct Script {
     path: PathBuf,
     environment: PathBuf,
     requires_python: Option<String>,
+    /// The packages uv must not build from source.
+    wheels_only: Vec<String>,
 }
 
 impl Script {
@@ -98,6 +100,12 @@ impl Script {
             path: dir.join(moil_bundle::SCRIPT),
             environment,
             requires_python: bundle.requires_python().map(str::to_owned),
+            wheels_only: bundle
+                .packages()
+                .iter()
+                .filter(|package| !package.builds_from_source)
+                .map(|package| package.name.clone())
+                .collect(),
         }
     }
 
@@ -111,6 +119,9 @@ impl Script {
         command
             .args([subcommand, "--locked", "--active"])
             .env("VIRTUAL_ENV", &self.environment);
+        for name in &self.wheels_only {
+            command.arg("--no-build-package").arg(name);
+        }
         // Last: whatever follows the script's path is the script's own.
         command.arg("--script").arg(&self.path);
         command
@@ -212,10 +223,26 @@ fn sync_failure(stderr: &str) -> JobError {
         .find_map(|line| line.trim().strip_prefix("error:"))
         .map(str::trim);
     let message = match reason {
+        // Another machine may have a platform the wheels fit.
+        Some(reason) if reason.contains("marked as `--no-build`") => match no_wheel_for(reason) {
+            Some(package) => format!(
+                "job.py.lock has wheels for {package}, but none for this machine's platform; \
+                 moil installs a package from source only when the lockfile has no wheel for it"
+            ),
+            None => format!("uv couldn't create the environment: {reason}"),
+        },
         Some(reason) => format!("uv couldn't create the environment: {reason}"),
         None => "uv couldn't create the environment".into(),
     };
     JobError::new(ErrorCode::Environment, message)
+}
+
+/// The package in uv's "Distribution `name==version @ source` can't be
+/// installed because it is marked as `--no-build`…", as `name==version`.
+fn no_wheel_for(reason: &str) -> Option<&str> {
+    let (_, rest) = reason.split_once("Distribution `")?;
+    let (distribution, _) = rest.split_once('`')?;
+    Some(distribution.split(" @ ").next().unwrap_or(distribution))
 }
 
 /// Where uv is: `explicit` (`$MOIL_UV`) if given, else a `uv` next to

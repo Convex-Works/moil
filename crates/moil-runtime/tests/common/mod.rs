@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod index;
+
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -327,6 +329,8 @@ pub enum Reply {
     Status(u16),
     /// `302` to this URL.
     Redirect(String),
+    /// `200` with this HTML page.
+    Html(String),
     /// Never answers.
     Hang,
 }
@@ -457,6 +461,7 @@ async fn handle(
         Some(Reply::Redirect(to)) => {
             (StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
         }
+        Some(Reply::Html(page)) => axum::response::Html(page).into_response(),
         Some(Reply::Hang) => std::future::pending().await,
         None if method == Method::GET => StatusCode::NOT_FOUND.into_response(),
         None => StatusCode::OK.into_response(),

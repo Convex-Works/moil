@@ -178,6 +178,27 @@ fn hash_is_the_sha256sum_listing_the_spec_describes() {
 }
 
 #[test]
+fn check_marks_packages_built_from_source() {
+    let ws = Workspace::new();
+    let bundle = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bundles/from-source");
+    let check = ws
+        .run(&["check", bundle.to_str().unwrap()])
+        .success()
+        .stdout();
+    let index = "from https://packages.example.com/simple";
+    assert!(
+        check.contains(&format!(
+            "  plain 1.0  {index}  (no wheel: built from source on each machine, with build tools it doesn't pin)\n"
+        )),
+        "{check}"
+    );
+    assert!(
+        check.contains(&format!("  wheeled 2.0  {index}\n")),
+        "{check}"
+    );
+}
+
+#[test]
 fn check_explains_a_lockfile_that_no_longer_matches() {
     let ws = Workspace::new();
     ws.run(&["init", "b"]).success();
