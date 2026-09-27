@@ -11,10 +11,11 @@
 //! out naturally. Inputs that arrive together make one round, after which
 //! the owner gets one new [`Snapshot`], however many there were.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
@@ -113,7 +114,14 @@ pub(super) struct Coordinator {
     inputs: mpsc::UnboundedSender<Input>,
     snapshot: watch::Sender<Snapshot>,
     paused: bool,
+    /// What the settings should say about pausing, for the writes that
+    /// save it.
+    paused_choice: Arc<AtomicBool>,
     services: BTreeMap<ServiceId, Service>,
+    /// Verified copies of the bundles some service's approval names, by
+    /// hash: offers and assignments are answered from these, without
+    /// reading the store.
+    bundles: HashMap<BundleHash, Bundle>,
     /// Attempts whose messages the machine keeps until the service
     /// acknowledges their `done`. Only attempts that started: a refused
     /// one's `done` is sent once and forgotten (spec §7.5).
@@ -315,14 +323,17 @@ impl Coordinator {
         inputs: mpsc::UnboundedSender<Input>,
         snapshot: watch::Sender<Snapshot>,
     ) -> Self {
+        let paused = machine.settings().paused;
         let mut coordinator = Self {
-            paused: machine.settings().paused,
+            paused,
+            paused_choice: Arc::new(AtomicBool::new(paused)),
             machine,
             executor,
             options,
             inputs,
             snapshot,
             services: BTreeMap::new(),
+            bundles: HashMap::new(),
             attempts: BTreeMap::new(),
             unsent: BTreeSet::new(),
             running: None,
@@ -340,6 +351,7 @@ impl Coordinator {
     }
 
     pub(super) async fn run(mut self, mut inputs: mpsc::UnboundedReceiver<Input>) {
+        self.bundles = self.warm_up().await;
         while !self.shut_down() {
             let renew_at = self.renew_at();
             let deliver_by = self.shutdown.as_ref().and_then(|s| s.deliver_by);
@@ -372,6 +384,38 @@ impl Coordinator {
         }
     }
 
+    /// Gets ready, off the coordinator, what answering services takes: the
+    /// hardware `hello` describes, and verified copies of the approved
+    /// bundles. A copy that fails verification is left out, so the machine
+    /// declines its jobs.
+    async fn warm_up(&self) -> HashMap<BundleHash, Bundle> {
+        let approved: BTreeSet<BundleHash> = self
+            .services
+            .values()
+            .flat_map(|s| s.paired.approved_hashes())
+            .collect();
+        let loaded = self.machine.blocking(move |machine| {
+            machine.info();
+            let store = machine.home().bundles();
+            let verified = approved.into_iter().filter_map(|hash| match store.get(&hash) {
+                Ok(Some(bundle)) => Some((hash, bundle)),
+                Ok(None) => {
+                    tracing::error!("the approved bundle {hash} isn't stored; approve it again to take its jobs");
+                    None
+                }
+                Err(e) => {
+                    tracing::error!("the stored copy of approved bundle {hash} failed verification ({e}); approve it again to take its jobs");
+                    None
+                }
+            });
+            Ok(verified.collect())
+        });
+        loaded.await.unwrap_or_else(|e| {
+            tracing::error!("couldn't read the approved bundles: {e}");
+            HashMap::new()
+        })
+    }
+
     fn handle(&mut self, input: Input) {
         match input {
             Input::Command(command) => self.command(command),
@@ -402,7 +446,9 @@ impl Coordinator {
             }
             Command::Disconnect(id, reply) => {
                 self.drop_attempts(&id);
-                match self.services.remove(&id) {
+                let removed = self.services.remove(&id);
+                self.drop_unapproved_bundles();
+                match removed {
                     Some(service) => {
                         service.stop.cancel();
                         let inputs = self.inputs.clone();
@@ -430,17 +476,17 @@ impl Coordinator {
                     service.paired = *paired;
                 }
                 if let Some(bundle) = approved {
+                    self.bundles.insert(bundle.hash(), (*bundle).clone());
                     self.prepare(*bundle);
                 }
+                self.drop_unapproved_bundles();
                 self.replies.push(reply);
             }
             Command::SetPaused(paused) => {
                 if paused != self.paused {
                     self.paused = paused;
                     tracing::info!("{}", if paused { "paused" } else { "resumed" });
-                    if let Err(e) = self.machine.update_settings(|s| s.paused = paused) {
-                        tracing::warn!("couldn't remember that the machine is paused: {e}");
-                    }
+                    self.remember_paused();
                 }
             }
             Command::StopJob => {
@@ -639,7 +685,7 @@ impl Coordinator {
             return;
         }
         let bundle = match self.availability(id, &assign.bundle_hash) {
-            Ok(bundle) => bundle,
+            Ok(bundle) => bundle.clone(),
             Err(unavailable) => return self.refuse(key, unavailable.into()),
         };
         tracing::info!("starting {key}: {}", bundle.manifest().name);
@@ -718,7 +764,7 @@ impl Coordinator {
 
     /// Whether the machine takes a job for `hash` from `id` now (spec
     /// §7.1): idle, approved, and holding a verified copy.
-    fn availability(&self, id: &ServiceId, hash: &BundleHash) -> Result<Bundle, Unavailable> {
+    fn availability(&self, id: &ServiceId, hash: &BundleHash) -> Result<&Bundle, Unavailable> {
         if self.running.is_some() {
             return Err(Unavailable::Busy);
         }
@@ -734,18 +780,31 @@ impl Coordinator {
                 "the machine's owner hasn't approved bundle {hash}"
             )));
         }
-        match self.machine.approved_bundle(id, *hash) {
-            Ok(Some(bundle)) => Ok(bundle),
-            Ok(None) => Err(Unavailable::NotApproved(format!(
-                "the machine has no approved copy of bundle {hash}"
-            ))),
-            Err(e) => {
-                tracing::error!("the approved copy of bundle {hash} failed verification: {e}");
-                Err(Unavailable::NotApproved(format!(
-                    "the machine's copy of bundle {hash} failed verification"
-                )))
+        self.bundles.get(hash).ok_or_else(|| {
+            Unavailable::NotApproved(format!("the machine has no verified copy of bundle {hash}"))
+        })
+    }
+
+    /// Forgets the verified bundles no service's approval names anymore.
+    fn drop_unapproved_bundles(&mut self) {
+        let services = &self.services;
+        self.bundles
+            .retain(|hash, _| services.values().any(|s| s.paired.is_approved(hash)));
+    }
+
+    /// Saves in the settings whether the machine is paused, off the
+    /// coordinator. Each write saves the latest choice, so the last one to
+    /// run leaves it on disk, whichever order they run in.
+    fn remember_paused(&self) {
+        self.paused_choice.store(self.paused, Ordering::SeqCst);
+        let choice = self.paused_choice.clone();
+        let machine = self.machine.clone();
+        tokio::task::spawn_blocking(move || {
+            let saved = machine.update_settings(|s| s.paused = choice.load(Ordering::SeqCst));
+            if let Err(e) = saved {
+                tracing::warn!("couldn't remember whether the machine is paused: {e}");
             }
-        }
+        });
     }
 
     fn spawn_attempt(&self, key: AttemptKey, job: Job, stop: StopSignal) {
@@ -985,7 +1044,7 @@ impl Coordinator {
         let stop = CancellationToken::new();
         let join = connection::spawn(
             self.machine.clone(),
-            paired.id.clone(),
+            &paired,
             task,
             self.options.clone(),
             self.inputs.clone(),

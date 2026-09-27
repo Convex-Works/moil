@@ -4,11 +4,12 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use moil_agent::{
-    Agent, AgentHandle, AgentOptions, Connection, JobOutcome, JobReport, Machine, PairedService,
-    Settings,
+    Agent, AgentHandle, AgentOptions, Connection, Home, JobOutcome, JobReport, Machine,
+    MachineConfig, PairedService, Settings,
 };
 use moil_bundle::Bundle;
 use moil_proto::control::{EventMessage, Hello, Welcome};
@@ -231,15 +232,6 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     conn.send(offer("j2", unapproved.hash()));
     assert_eq!(conn.recv().await, decline("j2", DeclineReason::NotApproved));
 
-    // The stored copy no longer matches the approved hash.
-    let store = setup.agent.machine().home().bundles();
-    std::fs::write(store.dir(&hash).join("job.py"), "print('edited')\n").unwrap();
-    conn.send(offer("j3", hash));
-    assert_eq!(conn.recv().await, decline("j3", DeclineReason::NotApproved));
-    store.put(&setup.bundle).unwrap();
-    conn.send(offer("j4", hash));
-    assert_eq!(conn.recv().await, bid("j4"));
-
     setup.agent.set_paused(true);
     assert_eq!(conn.recv().await, state(MachineState::Paused));
     conn.send(offer("j5", hash));
@@ -252,6 +244,87 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     let _run = setup.runs.next().await;
     conn.send(offer("j7", hash));
     assert_eq!(conn.recv().await, decline("j7", DeclineReason::Busy));
+}
+
+#[tokio::test]
+async fn jobs_run_the_copy_verified_at_approval_whatever_happens_to_the_store() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let hash = setup.hash();
+
+    // Offers are answered from memory: the store isn't read, let alone
+    // hashed, for each one...
+    let store = setup.agent.machine().home().bundles();
+    std::fs::write(store.dir(&hash).join("job.py"), "import os\n").unwrap();
+    conn.send(offer("j1", hash));
+    assert_eq!(conn.recv().await, bid("j1"));
+
+    // ...and the job gets the approved bundle, which the runtime checks
+    // the stored copy against before it runs.
+    conn.send(assign("j1", 1, hash, 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    assert_eq!(setup.runs.next().await.job.bundle, setup.bundle);
+}
+
+#[tokio::test]
+async fn a_stored_copy_that_fails_verification_takes_no_jobs_until_approved_again() {
+    let mut setup = Setup::build(&["klisi"], fast(), |machine, services| {
+        let hash = services[0].1.approvals[0].hash;
+        let dir = machine.home().bundles().dir(&hash);
+        std::fs::write(dir.join("job.py"), "import os\n").unwrap();
+    })
+    .await;
+    let mut conn = setup.connect().await;
+    let hash = setup.hash();
+    conn.send(offer("j1", hash));
+    assert_eq!(conn.recv().await, decline("j1", DeclineReason::NotApproved));
+    conn.send(assign("j1", 1, hash, 30_000));
+    let (_, error) = failure(conn.recv().await);
+    assert_eq!(error.code, ErrorCode::NotApproved);
+
+    let review = setup.agent.review(&setup.paired().id, hash).await.unwrap();
+    setup.agent.approve(&review).await.unwrap();
+    conn.send(offer("j2", hash));
+    assert_eq!(conn.recv().await, bid("j2"));
+    conn.send(assign("j2", 1, hash, 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    assert_eq!(setup.runs.next().await.job.bundle, setup.bundle);
+}
+
+#[tokio::test]
+async fn a_keychain_that_keeps_moil_waiting_doesnt_hold_up_the_agent() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = Arc::new(SlowSecrets::new(dir.path().join("secrets.json")));
+    let machine = Machine::open(MachineConfig {
+        home: Home::new(dir.path()),
+        secrets: keychain.clone(),
+        app_version: "0.1.0-test".into(),
+    })
+    .unwrap();
+    pair(&machine, &service).await;
+    let (executor, _runs) = fake_executor();
+
+    // Like a keychain asking the owner for permission, every read takes
+    // its time: connecting, then unpairing, read the token.
+    keychain.slow_down(Duration::from_secs(1));
+    let agent = Agent::start_with(machine, executor, fast());
+    let started = Instant::now();
+    agent.set_paused(true);
+    snapshot_where(&agent, "the pause to show", |s| s.paused).await;
+    let id = agent.snapshot().services[0].id.clone();
+    let unpairing = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.unpair(&id).await }
+    });
+    agent.set_paused(false);
+    snapshot_where(&agent, "the resumption to show", |s| !s.paused).await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(500),
+        "the agent was held up for {took:?}"
+    );
+    within("unpairing", unpairing).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1030,17 +1103,24 @@ async fn pausing_is_told_to_every_service_and_remembered() {
     assert_eq!(klisi.recv().await, state(MachineState::Paused));
     assert_eq!(notes.recv().await, state(MachineState::Paused));
     assert!(setup.agent.snapshot().paused);
-    let saved: Settings = serde_json::from_str(
-        &std::fs::read_to_string(setup.dir.path().join("settings.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(saved.paused, "the pause survives a restart");
+    let saved = || -> Option<Settings> {
+        let text = std::fs::read_to_string(setup.dir.path().join("settings.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    };
+    until("the pause to be saved", || {
+        saved().is_some_and(|s| s.paused)
+    })
+    .await;
     klisi.send(offer("j1", setup.hash()));
     assert_eq!(klisi.recv().await, decline("j1", DeclineReason::Paused));
 
     setup.agent.set_paused(false);
     assert_eq!(klisi.recv().await, state(MachineState::Idle));
     assert_eq!(notes.recv().await, state(MachineState::Idle));
+    until("the resumption to be saved", || {
+        saved().is_some_and(|s| !s.paused)
+    })
+    .await;
     assert!(!setup.agent.machine().settings().paused);
 }
 

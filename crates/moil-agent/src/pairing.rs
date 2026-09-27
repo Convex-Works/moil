@@ -153,12 +153,18 @@ impl PairingSession {
                 self.service_name, granted.machine_id
             )));
         }
-        let (service, replaced) = self.machine.record_pairing(
-            &self.base_url,
-            granted.service.name,
-            granted.machine_id,
-            &granted.token,
-        )?;
+        let base_url = self.base_url.clone();
+        let (service, replaced) = self
+            .machine
+            .blocking(move |machine| {
+                machine.record_pairing(
+                    &base_url,
+                    granted.service.name,
+                    granted.machine_id,
+                    &granted.token,
+                )
+            })
+            .await?;
         // Pairing again made the service a new machine record; the old one
         // would otherwise linger there, offline forever.
         if let Some(old_token) = replaced {

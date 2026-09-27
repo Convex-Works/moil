@@ -38,10 +38,6 @@ impl Agent {
         executor: Arc<dyn Executor>,
         options: AgentOptions,
     ) -> AgentHandle {
-        // Detecting the hardware runs a few commands; better here than when
-        // the first hello is due.
-        let detect = machine.clone();
-        tokio::task::spawn_blocking(move || detect.info());
         let (inputs, receiver) = mpsc::unbounded_channel();
         let (snapshot, snapshot_receiver) = watch::channel(Snapshot::default());
         let coordinator =
@@ -128,7 +124,10 @@ impl AgentHandle {
     /// Disconnects from a service and forgets it, stopping its running
     /// attempt, if any.
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
-        self.machine.service(id)?;
+        let known = id.clone();
+        self.machine
+            .blocking(move |machine| machine.service(&known))
+            .await?;
         self.call(|done| Command::Disconnect(id.clone(), done))
             .await;
         self.machine.unpair(id).await
@@ -141,8 +140,12 @@ impl AgentHandle {
     /// Approves the reviewed bundle, tells the service, and prepares the
     /// bundle in the background.
     pub async fn approve(&self, review: &Review) -> Result<(), Error> {
-        let service = Box::new(self.machine.approve(review)?);
-        let bundle = Box::new(review.bundle.clone());
+        let reviewed = review.clone();
+        let service = self
+            .machine
+            .blocking(move |machine| machine.approve(&reviewed))
+            .await?;
+        let (service, bundle) = (Box::new(service), Box::new(review.bundle.clone()));
         self.call(|done| Command::Approvals(service, Some(bundle), done))
             .await;
         Ok(())
@@ -152,8 +155,12 @@ impl AgentHandle {
     /// bundle for that service is running, it is stopped as
     /// `interrupted`, which the service may retry elsewhere.
     pub async fn revoke(&self, id: &ServiceId, hash: BundleHash) -> Result<(), Error> {
-        let service = Box::new(self.machine.revoke(id, hash)?);
-        self.call(|done| Command::Approvals(service, None, done))
+        let revoked = id.clone();
+        let service = self
+            .machine
+            .blocking(move |machine| machine.revoke(&revoked, hash))
+            .await?;
+        self.call(|done| Command::Approvals(Box::new(service), None, done))
             .await;
         Ok(())
     }

@@ -31,7 +31,7 @@ use url::Url;
 
 use super::AgentOptions;
 use super::coordinator::Input;
-use crate::{Error, Machine, ServiceId, net};
+use crate::{Error, Machine, PairedService, ServiceId, net};
 
 /// The largest control message either side may send (spec §10).
 const MAX_MESSAGE_BYTES: usize = 1 << 20;
@@ -133,7 +133,7 @@ fn outbox() -> (Outbox, Frames) {
 /// can tell it from the tasks it replaced.
 pub(super) fn spawn(
     machine: Machine,
-    service: ServiceId,
+    service: &PairedService,
     task: u64,
     options: AgentOptions,
     inputs: mpsc::UnboundedSender<Input>,
@@ -141,7 +141,9 @@ pub(super) fn spawn(
 ) -> JoinHandle<()> {
     let channel = Channel {
         machine,
-        service,
+        service: service.id.clone(),
+        name: service.name.clone(),
+        base_url: service.base_url.clone(),
         task,
         options,
         inputs,
@@ -153,6 +155,8 @@ pub(super) fn spawn(
 struct Channel {
     machine: Machine,
     service: ServiceId,
+    name: String,
+    base_url: Url,
     task: u64,
     options: AgentOptions,
     inputs: mpsc::UnboundedSender<Input>,
@@ -201,20 +205,21 @@ impl Channel {
 
     /// Opens the WebSocket with the machine's token (spec §6).
     async fn open(&self) -> Result<Socket, End> {
-        let service = match self.machine.service(&self.service) {
-            Ok(service) => service,
-            Err(Error::UnknownService(_)) => return Err(End::Unpaired),
-            Err(e) => return Err(End::Lost(e.to_string())),
-        };
         let lost = |e: Error| End::Lost(e.to_string());
-        self.machine.check_url(&service.base_url).map_err(lost)?;
-        let token = match self.machine.token(&self.service) {
-            Ok(Some(token)) => token,
-            Ok(None) => return Err(End::Unpaired),
-            Err(e) => return Err(lost(e)),
+        self.machine.check_url(&self.base_url).map_err(lost)?;
+        // The keychain may even ask the owner first.
+        let id = self.service.clone();
+        let token = self.machine.blocking(move |machine| machine.token(&id));
+        let token = tokio::select! {
+            () = self.stop.cancelled() => return Err(End::Stopped),
+            token = token => match token {
+                Ok(Some(token)) => token,
+                Ok(None) => return Err(End::Unpaired),
+                Err(e) => return Err(lost(e)),
+            },
         };
 
-        let mut url = Url::parse(&net::endpoint(&service.base_url, "v1/connect"))
+        let mut url = Url::parse(&net::endpoint(&self.base_url, "v1/connect"))
             .expect("a base URL stays a URL when a path is added");
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
         url.set_scheme(scheme)
@@ -254,15 +259,15 @@ impl Channel {
             }
             Ok(Err(tungstenite::Error::Http(response))) => Err(End::Lost(format!(
                 "{} answered {} instead of opening the channel",
-                service.name,
+                self.name,
                 response.status()
             ))),
             Ok(Err(e)) => Err(End::Lost(format!(
                 "couldn't reach {}: {}",
-                service.base_url,
+                self.base_url,
                 net::describe(&e)
             ))),
-            Err(_) => Err(End::Lost(format!("{} didn't answer", service.base_url))),
+            Err(_) => Err(End::Lost(format!("{} didn't answer", self.base_url))),
         }
     }
 

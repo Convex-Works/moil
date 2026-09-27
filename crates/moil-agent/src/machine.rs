@@ -64,6 +64,12 @@ impl fmt::Debug for Inner {
     }
 }
 
+/// A paired service and the token that proves this machine to it.
+struct Credentials {
+    service: PairedService,
+    token: String,
+}
+
 /// How long unpairing waits for the service before forgetting it anyway.
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -279,8 +285,10 @@ impl Machine {
             )));
         }
 
+        // The computer's name may take detecting.
+        let name = self.blocking(|machine| Ok(machine.name())).await?;
         let request = PairRequest {
-            name: self.name(),
+            name,
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             app_version: self.inner.app_version.clone(),
@@ -354,10 +362,20 @@ impl Machine {
     /// (`DELETE /v1/machine`, best effort), then deletes its token and
     /// approvals here.
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
-        let service = self.service(id)?;
-        if let Some(token) = self.token(id)? {
+        let found = id.clone();
+        let (service, token) = self
+            .blocking(move |machine| Ok((machine.service(&found)?, machine.token(&found)?)))
+            .await?;
+        if let Some(token) = token {
             self.forget_token_on(&service.base_url, &token).await;
         }
+        let id = id.clone();
+        self.blocking(move |machine| machine.forget(&id, &service))
+            .await
+    }
+
+    /// Deletes a service's token and approvals here.
+    fn forget(&self, id: &ServiceId, service: &PairedService) -> Result<(), Error> {
         let _services = self.lock_services();
         self.inner.secrets.delete(&self.token_key(id))?;
         let path = self.inner.home.service_file(id);
@@ -396,29 +414,35 @@ impl Machine {
     /// The bundles a service may send jobs for (`GET /v1/bundles`), as the
     /// service describes them.
     pub async fn bundles(&self, id: &ServiceId) -> Result<Vec<BundleInfo>, Error> {
-        let service = self.service(id)?;
-        let response = self.get(&service, "v1/bundles").await?;
-        let listing: BundlesResponse = net::read_json(&service.name, response).await?;
+        let credentials = self.credentials(id).await?;
+        let response = self.get(&credentials, "v1/bundles").await?;
+        let listing: BundlesResponse = net::read_json(&credentials.service.name, response).await?;
         Ok(listing.bundles)
     }
 
     /// Fetches a bundle for the owner to review and verifies it against
     /// `hash`.
     pub async fn review(&self, id: &ServiceId, hash: BundleHash) -> Result<Review, Error> {
-        let service = self.service(id)?;
-        let response = self.get(&service, &format!("v1/bundles/{hash}")).await?;
+        let credentials = self.credentials(id).await?;
+        let response = self
+            .get(&credentials, &format!("v1/bundles/{hash}"))
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(Error::UnknownBundle(hash));
         }
+        let service = credentials.service;
         let response: BundleResponse = net::read_json(&service.name, response).await?;
-        let bundle = Bundle::from_response(response, &hash)?;
-        let previous = self.previous_version(&service, &bundle);
-        Ok(Review {
-            approved: service.is_approved(&hash),
-            service,
-            bundle,
-            previous,
+        self.blocking(move |machine| {
+            let bundle = Bundle::from_response(response, &hash)?;
+            let previous = machine.previous_version(&service, &bundle);
+            Ok(Review {
+                approved: service.is_approved(&hash),
+                service,
+                bundle,
+                previous,
+            })
         })
+        .await
     }
 
     /// The most recently approved bundle from `service` with `bundle`'s
@@ -514,15 +538,43 @@ impl Machine {
         net::check_url(url, self.settings().allow_insecure_http)
     }
 
-    /// `GET`s a machine-authenticated endpoint.
-    async fn get(&self, service: &PairedService, path: &str) -> Result<reqwest::Response, Error> {
+    /// Runs `work` where blocking is fine. State files take a moment to
+    /// read and write, and the keychain may even ask the owner first; on an
+    /// async worker thread either would hold up everything scheduled there.
+    pub(crate) async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Machine) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let machine = self.clone();
+        match tokio::task::spawn_blocking(move || work(&machine)).await {
+            Ok(result) => result,
+            Err(e) => match e.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_) => Err(Error::Io(std::io::Error::other("moil is shutting down"))),
+            },
+        }
+    }
+
+    /// Service `id` and this machine's token for it.
+    async fn credentials(&self, id: &ServiceId) -> Result<Credentials, Error> {
+        let id = id.clone();
+        self.blocking(move |machine| {
+            let service = machine.service(&id)?;
+            let token = machine.token(&id)?.ok_or(Error::Unauthorized)?;
+            Ok(Credentials { service, token })
+        })
+        .await
+    }
+
+    /// `GET`s a machine-authenticated endpoint of a service.
+    async fn get(&self, to: &Credentials, path: &str) -> Result<reqwest::Response, Error> {
+        let service = &to.service;
         self.check_url(&service.base_url)?;
-        let token = self.token(&service.id)?.ok_or(Error::Unauthorized)?;
         let url = net::endpoint(&service.base_url, path);
         self.net()
             .http
             .get(&url)
-            .bearer_auth(token)
+            .bearer_auth(&to.token)
             .send()
             .await
             .map_err(|e| net::unreachable(service.base_url.as_str(), &e))

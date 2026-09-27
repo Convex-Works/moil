@@ -22,7 +22,8 @@ use axum::{Json, Router};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use moil_agent::{
-    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, PairedService, Snapshot,
+    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, PairedService,
+    SecretStore, Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::control::{BundleInfo, Hello, Resume, Welcome};
@@ -47,6 +48,17 @@ pub async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
+/// Waits until `condition` holds, checking every few milliseconds, for
+/// what the agent does without telling: files it writes.
+pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    within(what, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
 /// Timings that keep tests fast: reconnects in milliseconds.
 pub fn fast() -> AgentOptions {
     AgentOptions {
@@ -55,6 +67,48 @@ pub fn fast() -> AgentOptions {
         channel_timeout: Duration::from_secs(5),
         shutdown_grace: Duration::from_secs(5),
         ..AgentOptions::default()
+    }
+}
+
+/// Tokens in a file, read as slowly as a keychain that asks the owner
+/// first, once [`slow_down`](Self::slow_down) says so.
+#[derive(Debug)]
+pub struct SlowSecrets {
+    file: FileSecrets,
+    delay: Mutex<Duration>,
+}
+
+impl SlowSecrets {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            file: FileSecrets::new(path),
+            delay: Mutex::new(Duration::ZERO),
+        }
+    }
+
+    pub fn slow_down(&self, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+    }
+
+    fn wait(&self) {
+        std::thread::sleep(*self.delay.lock().unwrap());
+    }
+}
+
+impl SecretStore for SlowSecrets {
+    fn get(&self, key: &str) -> Result<Option<String>, moil_agent::Error> {
+        self.wait();
+        self.file.get(key)
+    }
+
+    fn set(&self, key: &str, secret: &str) -> Result<(), moil_agent::Error> {
+        self.wait();
+        self.file.set(key, secret)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), moil_agent::Error> {
+        self.wait();
+        self.file.delete(key)
     }
 }
 
