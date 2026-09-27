@@ -10,14 +10,14 @@ use std::time::Duration;
 const PATIENCE: Duration = Duration::from_secs(10);
 
 /// `moil` with its home at `home`, keeping tokens in a file there. The
-/// agent never gets as far as running a job, so uv needn't exist.
+/// agent never gets as far as running a job, so uv can be any executable.
 fn moil(home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_moil"));
     command
         .args(args)
         .env("MOIL_HOME", home)
         .env("MOIL_SECRETS", "file")
-        .env("MOIL_UV", home.join("no-uv-here"))
+        .env("MOIL_UV", "/usr/bin/false")
         .env("RUST_LOG", "info")
         .stdin(Stdio::null());
     command
