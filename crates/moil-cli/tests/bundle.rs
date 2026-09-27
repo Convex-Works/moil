@@ -160,6 +160,36 @@ fn init_leaves_existing_bundles_and_bad_names_alone() {
 }
 
 #[test]
+fn a_failed_init_leaves_nothing_behind() {
+    let ws = Workspace::new();
+    // A uv that can't lock, as without a network.
+    let broken = ws.write("uv", "#!/bin/sh\necho 'error: no network' >&2\nexit 2\n");
+    std::fs::set_permissions(&broken, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::create_dir(ws.path().join("mine")).unwrap();
+    ws.write("mine/README.md", "notes");
+
+    for dir in ["new", "mine"] {
+        let init = Run(ws
+            .moil(&["init", dir])
+            .env("MOIL_UV", &broken)
+            .output()
+            .unwrap())
+        .failure(1);
+        assert!(init.stderr().contains("no network"), "{}", init.stderr());
+    }
+    assert!(!ws.path().join("new").exists());
+    let left: Vec<_> = std::fs::read_dir(ws.path().join("mine"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["README.md"]);
+
+    // So trying again, with a uv that works, just works.
+    ws.run(&["init", "new"]).success();
+    ws.run(&["init", "mine"]).success();
+}
+
+#[test]
 fn hash_is_the_sha256sum_listing_the_spec_describes() {
     let ws = Workspace::new();
     let hash = ws

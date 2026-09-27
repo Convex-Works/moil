@@ -275,7 +275,30 @@ async fn init(dir: &Path, name: Option<String>) -> anyhow::Result<()> {
             );
         }
     }
+    let created = !dir.exists();
     std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
+    let bundle = match scaffold(dir, &name).await {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            // Leave nothing half-made that would stop a second try.
+            for file in moil_bundle::FILE_NAMES {
+                let _ = std::fs::remove_file(dir.join(file));
+            }
+            if created {
+                let _ = std::fs::remove_dir(dir);
+            }
+            return Err(error);
+        }
+    };
+    println!("created bundle {name} in {}", dir.display());
+    println!("hash {}", bundle.hash());
+    println!();
+    println!("next: edit job.py, then `moil check` and `moil run` in that directory");
+    Ok(())
+}
+
+/// Writes a bundle named `name` into `dir`, which holds none of its files.
+async fn scaffold(dir: &Path, name: &str) -> anyhow::Result<Bundle> {
     // Written out rather than serialized, to keep the fields in the order
     // people read them. The name has been checked to need no escaping.
     let manifest = format!(
@@ -289,7 +312,7 @@ async fn init(dir: &Path, name: Option<String>) -> anyhow::Result<()> {
     );
     std::fs::write(
         dir.join(moil_bundle::SCRIPT),
-        TEMPLATE.replace("__NAME__", &name),
+        TEMPLATE.replace("__NAME__", name),
     )?;
     std::fs::write(dir.join(moil_bundle::MANIFEST), manifest)?;
     let output = uv()?
@@ -305,12 +328,7 @@ async fn init(dir: &Path, name: Option<String>) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let bundle = load(dir)?;
-    println!("created bundle {name} in {}", dir.display());
-    println!("hash {}", bundle.hash());
-    println!();
-    println!("next: edit job.py, then `moil check` and `moil run` in that directory");
-    Ok(())
+    load(dir)
 }
 
 /// A bundle name made from the name of `dir`.
