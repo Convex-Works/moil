@@ -52,24 +52,85 @@ func TestLeaseExpiryMovesTheJob(t *testing.T) {
 	}
 }
 
-// Events, renewals and a slow script keep a lease alive for longer than
-// its TTL.
+// Events and renewals keep a lease alive for longer than its TTL.
 func TestRenewalsKeepAnAttemptAlive(t *testing.T) {
-	srv := newServer(t, func(c *moil.Config) { c.LeaseTTL = 90 * time.Millisecond })
+	const lease = 300 * time.Millisecond
+	srv := newServer(t, func(c *moil.Config) { c.LeaseTTL = lease })
 	bundle := loadBundle(t, srv, "minimal")
 	m := moiltest.Pair(t, srv, "alice")
 	m.Approve(bundle)
 	m.Connect()
 	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
 	a := m.NextAttempt()
-	// The fake renews every 30ms; wait out several lease lengths.
-	deadline := time.Now().Add(400 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		m.Sync()
+	// Word from the machine every 10ms, for three leases, leaves each
+	// lease far more slack than a busy test machine needs.
+	for start := time.Now(); time.Since(start) < 3*lease; time.Sleep(10 * time.Millisecond) {
+		if time.Since(start) < 3*lease/2 {
+			a.Log("info", "working")
+		} else {
+			m.Send(map[string]any{"type": "renew", "job_id": a.JobID, "attempt": a.Number})
+		}
 	}
 	a.Succeed(nil)
 	if res := succeeded(t, run); res.Attempt != 1 {
 		t.Fatalf("the attempt was replaced; result from attempt %d", res.Attempt)
+	}
+}
+
+// A lease keeps running while its machine is away. If the machine doesn't
+// come back in time, the job moves on, and the machine drops the attempt
+// when it does come back.
+func TestLeasesRunOutWhileDisconnected(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.LeaseTTL = 150 * time.Millisecond })
+	bundle := loadBundle(t, srv, "minimal")
+	away := moiltest.Pair(t, srv, "alice")
+	away.Approve(bundle)
+	away.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	first := away.NextAttempt()
+	away.Disconnect()
+	eventually(t, "the lease to run out", func() bool { return len(retries(eventsSoFar(run))) == 1 })
+	if got := retries(eventsSoFar(run)); got[0] != moil.CodeLeaseExpired {
+		t.Fatalf("the attempt failed with %s", got[0])
+	}
+
+	away.Connect() // the service no longer lists the attempt
+	if !first.Abandoned() {
+		t.Fatal("the machine still holds an attempt its lease ended")
+	}
+	second := away.NextAttempt()
+	second.Succeed(nil)
+	if res := succeeded(t, run); res.Attempt != 2 {
+		t.Fatalf("result from attempt %d", res.Attempt)
+	}
+}
+
+// The service acknowledges every done, even for an attempt that's no
+// longer current, so the machine can let go of it, and the stale outcome
+// changes nothing.
+func TestStaleDonesAreAcknowledgedAndIgnored(t *testing.T) {
+	srv := newServer(t, func(c *moil.Config) { c.LeaseTTL = 150 * time.Millisecond })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	hung := m.NextAttempt()
+	hung.GoSilent()
+	hung.WaitCancelled() // the lease ran out, and the service gave up on it
+	other := moiltest.Pair(t, srv, "alice")
+	other.Approve(bundle)
+	other.Connect()
+	second := other.NextAttempt()
+
+	hung.Succeed(map[string]any{"late": true}) // the hung attempt ends after all
+	hung.WaitAcked()
+	if run.State() != moil.Running {
+		t.Fatalf("a stale done changed the job: %s", run.State())
+	}
+	second.Succeed(nil)
+	if res := succeeded(t, run); res.Attempt != 2 || res.Meta != nil {
+		t.Fatalf("result from attempt %d with meta %s", res.Attempt, res.Meta)
 	}
 }
 
@@ -304,6 +365,55 @@ func TestCancel(t *testing.T) {
 		m.Connect() // the service no longer lists the attempt, so the machine drops it
 		if !a.Abandoned() {
 			t.Fatal("the machine still holds the cancelled attempt")
+		}
+	})
+
+	t.Run("offers out", func(t *testing.T) {
+		m := moiltest.Pair(t, srv, "erin")
+		m.Approve(bundle)
+		answered, bid := make(chan struct{}), make(chan struct{})
+		m.OnOffer(func(moiltest.Offer) moiltest.Answer { close(answered); <-bid; return moiltest.Bid })
+		m.Connect()
+		run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.OwnedBy("erin")})
+		<-answered // the offer is out; the machine is thinking it over
+		run.Cancel()
+		if _, err := wait(t, run); !errors.Is(err, moil.ErrCancelled) {
+			t.Fatalf("err %v", err)
+		}
+		close(bid)
+		m.OnOffer(func(moiltest.Offer) moiltest.Answer { return moiltest.Bid })
+		next := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.OwnedBy("erin")})
+		a := m.NextAttempt() // the late bid won nothing; the machine is free
+		if a.JobID != next.ID() {
+			t.Fatalf("the cancelled job was assigned")
+		}
+		a.Succeed(nil)
+		succeeded(t, next)
+	})
+
+	t.Run("attempt ended first", func(t *testing.T) {
+		m := moiltest.Pair(t, srv, "frank")
+		m.Approve(bundle)
+		m.Connect()
+		// The machine doesn't see the request before its attempts end:
+		// a success stands, a failure ends the job as cancelled.
+		won := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.OwnedBy("frank")})
+		a := m.NextAttempt()
+		a.GoSilent()
+		won.Cancel()
+		a.WaitCancelled()
+		a.Succeed(nil)
+		if _, err := wait(t, won); err != nil {
+			t.Fatalf("an attempt that succeeded before seeing the cancel: %v", err)
+		}
+		lost := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.OwnedBy("frank")})
+		b := m.NextAttempt()
+		b.GoSilent()
+		lost.Cancel()
+		b.WaitCancelled()
+		b.Fail(moil.CodeInterrupted, "the owner stopped it")
+		if _, err := wait(t, lost); !errors.Is(err, moil.ErrCancelled) {
+			t.Fatalf("an attempt that failed before seeing the cancel: %v", err)
 		}
 	})
 

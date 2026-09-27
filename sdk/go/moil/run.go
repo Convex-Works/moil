@@ -128,9 +128,10 @@ func (r *Run) Wait(ctx context.Context) (*Result, error) {
 
 // Cancel asks for the job to stop. A job that is waiting for a machine
 // ends at once; a running one ends when its machine confirms, or at once
-// if the machine is offline. If the attempt finishes before its machine
-// sees the request, the run ends with that attempt's outcome instead.
-// Cancelling an ended run does nothing.
+// if the machine is offline. Either way Wait returns ErrCancelled, even if
+// the attempt failed before its machine saw the request; only an attempt
+// that succeeded first ends the run with its Result. Cancelling an ended
+// run does nothing.
 func (r *Run) Cancel() { r.cancel() }
 
 // The methods below are called by the scheduler.

@@ -192,7 +192,8 @@ res, err := run.Wait(ctx)
   `MaxAttempts`, not counting attempts machines refused before starting
   them, of which a job tolerates ten.
 - `run.Cancel()` stops a job: at once if it's waiting or its machine is
-  offline, otherwise when the machine confirms.
+  offline, otherwise when the machine confirms. It ends as cancelled
+  unless its attempt succeeded before the machine saw the request.
 
 Jobs live in memory. If the service restarts, unfinished jobs are gone and
 machines drop their attempts; resubmit what must finish, by the same ID,
