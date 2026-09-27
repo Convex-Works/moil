@@ -206,6 +206,7 @@ func (d *demo) home(w http.ResponseWriter, r *http.Request) {
 	d.mu.Unlock()
 	render(w, "home.html", map[string]any{
 		"MoilURL":  d.public + "/moil",
+		"AppURL":   moil.AppURL,
 		"Machines": machines,
 		"Bundles":  d.srv.Bundles(),
 		"Jobs":     jobs,
