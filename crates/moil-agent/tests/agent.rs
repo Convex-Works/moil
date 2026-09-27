@@ -694,7 +694,7 @@ async fn a_chatty_attempt_is_relayed_as_briskly_as_a_quiet_one() {
     // The fake service doesn't ping; a slow relay should fail the
     // assertion below, not look like a dead channel.
     let options = AgentOptions {
-        receive_timeout: Duration::from_secs(60),
+        channel_timeout: Duration::from_secs(60),
         ..fast()
     };
     let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
@@ -803,7 +803,7 @@ async fn other_failures_are_retried() {
 #[tokio::test]
 async fn a_silent_service_is_given_up_on_but_pings_keep_it_alive() {
     let options = AgentOptions {
-        receive_timeout: Duration::from_millis(300),
+        channel_timeout: Duration::from_millis(300),
         ..fast()
     };
     let setup = Setup::build(&["klisi"], options, |_, _| {}).await;
@@ -821,6 +821,104 @@ async fn a_silent_service_is_given_up_on_but_pings_keep_it_alive() {
 
     // Now silence: the machine gives up and connects again.
     let _conn = setup.connect().await;
+}
+
+/// A `data` event of `kib` KiB.
+fn bulky(i: usize, kib: usize) -> JobEvent {
+    JobEvent::Data {
+        payload: serde_json::json!({"i": i, "text": "x".repeat(kib << 10)}),
+    }
+}
+
+/// Sends `events` bulky events, then waits until the agent has handled
+/// them: sent them on, or held them back for a service that isn't reading.
+async fn flood(agent: &AgentHandle, run: &FakeRun, events: usize, kib: usize) {
+    for i in 0..events {
+        run.emit(bulky(i, kib));
+    }
+    run.emit(progress(0.5, "flooded"));
+    snapshot_where(agent, "the agent to handle the flood", |s| {
+        s.job.as_ref().is_some_and(|j| j.fraction == Some(0.5))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_service_that_stops_reading_is_given_up_on_even_while_it_pings() {
+    let options = AgentOptions {
+        channel_timeout: Duration::from_millis(500),
+        ..fast()
+    };
+    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+
+    // The service stops reading, but it keeps pinging: the machine hears
+    // from it all along, and only its writes stall.
+    conn.stop_reading();
+    flood(&setup.agent, &run, 100, 200).await;
+    let pinging = async {
+        loop {
+            conn.ping();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let mut conn = tokio::select! {
+        conn = setup.service().accept() => conn,
+        () = pinging => unreachable!(),
+    };
+    assert_eq!(conn.hello().await.attempts, [attempt("j1", 1)]);
+}
+
+#[tokio::test]
+async fn unpairing_doesnt_wait_on_a_service_that_stopped_reading() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let mut run = setup.runs.next().await;
+    conn.stop_reading();
+    flood(&setup.agent, &run, 100, 200).await;
+
+    within("unpairing", setup.agent.unpair(&setup.paired().id))
+        .await
+        .unwrap();
+    assert_eq!(run.stopped().await, StopReason::Interrupted);
+    assert_eq!(setup.agent.snapshot().services, []);
+}
+
+#[tokio::test]
+async fn a_slow_service_gets_every_message_in_order_once_it_reads_again() {
+    // Neither silence nor stalled writes run out while the service rests.
+    let options = AgentOptions {
+        channel_timeout: Duration::from_secs(60),
+        max_kept_bytes: 64 << 20,
+        ..fast()
+    };
+    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut conn = setup.connect().await;
+    conn.send(assign("j1", 1, setup.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+
+    // More than the outbox and the network hold together: the machine
+    // holds the rest back until there's room.
+    conn.stop_reading();
+    const EVENTS: u64 = 800;
+    flood(&setup.agent, &run, EVENTS as usize, 32).await;
+    run.finish(succeeded());
+    snapshot_where(&setup.agent, "the job to end", |s| s.job.is_none()).await;
+
+    conn.resume_reading();
+    for (i, seq) in (1..=EVENTS).enumerate() {
+        assert_eq!(conn.recv().await, event("j1", 1, seq, bulky(i, 32)));
+    }
+    let marker = progress(0.5, "flooded");
+    assert_eq!(conn.recv().await, event("j1", 1, EVENTS + 1, marker));
+    assert_eq!(conn.recv().await, done("j1", 1, EVENTS + 2, succeeded()));
+    assert_eq!(conn.recv().await, state(MachineState::Idle));
 }
 
 #[tokio::test]

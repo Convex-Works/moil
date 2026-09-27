@@ -52,7 +52,7 @@ pub fn fast() -> AgentOptions {
     AgentOptions {
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(40),
-        receive_timeout: Duration::from_secs(5),
+        channel_timeout: Duration::from_secs(5),
         shutdown_grace: Duration::from_secs(5),
         ..AgentOptions::default()
     }
@@ -495,6 +495,9 @@ enum Out {
     Close(u16),
     /// Drop the connection without a close frame.
     Drop,
+    /// Stop or resume reading what the machine sends, as a stuck service
+    /// would. Writing goes on.
+    Read(bool),
 }
 
 async fn relay(socket: WebSocket, shared: Arc<Shared>, token: String) {
@@ -511,9 +514,10 @@ async fn relay(socket: WebSocket, shared: Arc<Shared>, token: String) {
         to_machine,
     });
     let (mut sink, mut stream) = socket.split();
+    let mut reading = true;
     loop {
         tokio::select! {
-            frame = stream.next() => match frame {
+            frame = stream.next(), if reading => match frame {
                 Some(Ok(Message::Text(text))) => {
                     let frame = match serde_json::from_str::<MachineMessage>(&text) {
                         Ok(MachineMessage::Unknown) => Frame::Invalid(format!("unknown type: {text}")),
@@ -545,6 +549,7 @@ async fn relay(socket: WebSocket, shared: Arc<Shared>, token: String) {
                     let _ = frames.send(Frame::Closed(Some(code)));
                     return;
                 }
+                Some(Out::Read(read)) => reading = read,
                 Some(Out::Drop) | None => return,
             },
         }
@@ -606,6 +611,17 @@ impl Conn {
 
     pub fn ping(&self) {
         let _ = self.to_machine.send(Out::Ping);
+    }
+
+    /// Stops reading what the machine sends, leaving it to pile up in the
+    /// network's buffers until the machine can't write any more. Sending
+    /// and pinging go on.
+    pub fn stop_reading(&self) {
+        let _ = self.to_machine.send(Out::Read(false));
+    }
+
+    pub fn resume_reading(&self) {
+        let _ = self.to_machine.send(Out::Read(true));
     }
 
     /// Closes the channel with a close code, as the service.

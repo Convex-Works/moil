@@ -1,16 +1,22 @@
 //! One service's control channel: opens it, relays messages both ways, and
 //! reopens it with backoff until told to stop (spec §6).
 //!
-//! The task only moves frames. What to say is the coordinator's business:
-//! it gets every message the service sends, and sends through the outbox
-//! it's handed when the channel opens.
+//! The task only moves frames. What to say is the coordinator's business: a
+//! reader hands it every message the service sends, and a writer sends what
+//! it queues in the channel's [`Outbox`]. Either one ending ends the
+//! channel, so a service that stops reading is noticed as surely as one
+//! that stops talking.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use moil_proto::{ServiceMessage, close_code};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header};
@@ -28,6 +34,13 @@ use crate::{Error, Machine, ServiceId, net};
 /// The largest control message either side may send (spec §10).
 const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
+/// How many frames may wait in an [`Outbox`].
+const OUTBOX_FRAMES: usize = 64;
+
+/// How long closing a channel may take: writing what the coordinator
+/// queued last, then the close frame.
+pub(super) const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// What a connection task tells the coordinator.
@@ -37,8 +50,11 @@ pub(super) enum LinkEvent {
     Connecting,
     /// The channel is open. The coordinator speaks first (`hello`), and
     /// every frame it sends goes through `outbox`.
-    Open(mpsc::UnboundedSender<String>),
+    Open(Outbox),
     Message(ServiceMessage),
+    /// The outbox was full, and the connection has since written what it
+    /// held.
+    Drained,
     /// The channel is gone; the task opens it again at `retry_at`.
     Lost {
         error: String,
@@ -49,6 +65,56 @@ pub(super) enum LinkEvent {
     /// Another connection with this machine's token took over (4409). The
     /// task has ended.
     Replaced,
+}
+
+/// Where the coordinator queues frames for an open channel. It holds a few
+/// frames at most, so a service that reads slowly holds the machine back
+/// instead of making it queue without end: once [`queue`](Self::queue)
+/// has failed, the connection reports [`LinkEvent::Drained`] when there is
+/// room again.
+#[derive(Debug)]
+pub(super) struct Outbox {
+    frames: mpsc::Sender<String>,
+    /// Set when a frame didn't fit, for the writer to report `Drained`.
+    full: Arc<AtomicBool>,
+}
+
+impl Outbox {
+    /// Queues `frame`. Fails if the outbox is full, or the channel is gone
+    /// (the connection then reports that).
+    pub(super) fn queue(&self, frame: String) -> bool {
+        match self.frames.try_send(frame) {
+            Ok(()) => true,
+            Err(TrySendError::Closed(_)) => false,
+            Err(TrySendError::Full(frame)) => {
+                self.full.store(true, Ordering::SeqCst);
+                // The writer may have emptied the outbox since: trying again
+                // either queues the frame or leaves the writer to find the
+                // flag once it has written what's there.
+                self.frames.try_send(frame).is_ok()
+            }
+        }
+    }
+}
+
+/// The writer's end of an [`Outbox`].
+struct Frames {
+    frames: mpsc::Receiver<String>,
+    full: Arc<AtomicBool>,
+}
+
+fn outbox() -> (Outbox, Frames) {
+    let (sender, receiver) = mpsc::channel(OUTBOX_FRAMES);
+    let full = Arc::new(AtomicBool::new(false));
+    let outbox = Outbox {
+        frames: sender,
+        full: full.clone(),
+    };
+    let frames = Frames {
+        frames: receiver,
+        full,
+    };
+    (outbox, frames)
 }
 
 /// Starts the task that keeps `service`'s channel open until `stop` is
@@ -91,6 +157,9 @@ enum End {
     /// Anything else; worth trying again.
     Lost(String),
 }
+
+type Sink = SplitSink<Socket, Message>;
+type Stream = SplitStream<Socket>;
 
 impl Channel {
     async fn run(self) {
@@ -163,7 +232,7 @@ impl Channel {
         );
         let connected = tokio::select! {
             () = self.stop.cancelled() => return Err(End::Stopped),
-            connected = tokio::time::timeout(self.options.receive_timeout, connecting) => connected,
+            connected = tokio::time::timeout(self.options.channel_timeout, connecting) => connected,
         };
         match connected {
             Ok(Ok((socket, _))) => Ok(socket),
@@ -186,50 +255,81 @@ impl Channel {
         }
     }
 
-    /// Relays frames until the channel ends.
+    /// Relays frames both ways until the channel ends.
     async fn serve(&self, socket: Socket, backoff: &mut Backoff) -> End {
-        let (mut sink, mut stream) = socket.split();
-        let (outbox, mut frames) = mpsc::unbounded_channel::<String>();
+        let (sink, stream) = socket.split();
+        let (outbox, frames) = outbox();
         self.report(LinkEvent::Open(outbox));
-        let silence = self.options.receive_timeout;
-        let mut dead_at = tokio::time::Instant::now() + silence;
+        tokio::select! {
+            end = self.write(sink, frames) => end,
+            end = self.read(stream, backoff) => end,
+        }
+    }
+
+    /// Writes what the coordinator queues until the agent stops the channel,
+    /// then closes it. A write that makes no progress for the channel
+    /// timeout means the service stopped reading, and the channel is dead
+    /// (spec §6.1).
+    async fn write(&self, mut sink: Sink, mut frames: Frames) -> End {
+        let timeout = self.options.channel_timeout;
         loop {
-            tokio::select! {
-                () = self.stop.cancelled() => {
-                    // Whatever the coordinator queued last (such as a final
-                    // `done`) goes out before the close frame.
-                    while let Ok(text) = frames.try_recv() {
-                        if sink.send(Message::text(text)).await.is_err() {
-                            return End::Stopped;
-                        }
-                    }
-                    let close = CloseFrame { code: CloseCode::Normal, reason: "moil stopped".into() };
-                    let _ = sink.send(Message::Close(Some(close))).await;
-                    return End::Stopped;
+            let first = tokio::select! {
+                () = self.stop.cancelled() => return close(&mut sink, &mut frames).await,
+                first = frames.frames.recv() => match first {
+                    Some(first) => first,
+                    // The coordinator let go of the channel.
+                    None => return close(&mut sink, &mut frames).await,
+                },
+            };
+            // Everything queued goes out together, flushed once.
+            let written = async {
+                sink.feed(Message::text(first)).await?;
+                while let Ok(frame) = frames.frames.try_recv() {
+                    sink.feed(Message::text(frame)).await?;
                 }
-                () = tokio::time::sleep_until(dead_at) => {
+                sink.flush().await
+            };
+            let written = tokio::select! {
+                () = self.stop.cancelled() => None,
+                written = tokio::time::timeout(timeout, written) => Some(written),
+            };
+            match written {
+                None => return close(&mut sink, &mut frames).await,
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => return End::Lost(net::describe(&e)),
+                Some(Err(_)) => {
                     return End::Lost(format!(
-                        "the service sent nothing for {} seconds",
-                        silence.as_secs_f64()
+                        "the service took nothing for {} seconds",
+                        timeout.as_secs_f64()
                     ));
                 }
-                frame = stream.next() => {
-                    dead_at = tokio::time::Instant::now() + silence;
-                    match frame {
-                        None => return End::Lost("the service closed the connection".into()),
-                        Some(Err(e)) => return End::Lost(net::describe(&e)),
-                        Some(Ok(Message::Text(text))) => self.receive(&text, backoff),
-                        Some(Ok(Message::Close(frame))) => return closed(frame),
-                        // Pings only show the channel is alive; tungstenite
-                        // answers them.
-                        Some(Ok(_)) => {}
-                    }
-                }
-                Some(text) = frames.recv() => {
-                    if let Err(e) = sink.send(Message::text(text)).await {
-                        return End::Lost(net::describe(&e));
-                    }
-                }
+            }
+            if frames.full.swap(false, Ordering::SeqCst) {
+                self.report(LinkEvent::Drained);
+            }
+        }
+    }
+
+    /// Hands the coordinator every message the service sends. Silence for
+    /// the channel timeout, pings included, means the channel is dead (spec
+    /// §6.1).
+    async fn read(&self, mut stream: Stream, backoff: &mut Backoff) -> End {
+        let timeout = self.options.channel_timeout;
+        loop {
+            let Ok(frame) = tokio::time::timeout(timeout, stream.next()).await else {
+                return End::Lost(format!(
+                    "the service sent nothing for {} seconds",
+                    timeout.as_secs_f64()
+                ));
+            };
+            match frame {
+                None => return End::Lost("the service closed the connection".into()),
+                Some(Err(e)) => return End::Lost(net::describe(&e)),
+                Some(Ok(Message::Text(text))) => self.receive(&text, backoff),
+                Some(Ok(Message::Close(frame))) => return closed(frame),
+                // Pings only show the channel is alive; tungstenite answers
+                // them.
+                Some(Ok(_)) => {}
             }
         }
     }
@@ -258,6 +358,23 @@ impl Channel {
             event,
         });
     }
+}
+
+/// Writes what the coordinator queued last (such as a final `done`), then
+/// a close frame, giving a service that doesn't read [`CLOSE_TIMEOUT`].
+async fn close(sink: &mut Sink, frames: &mut Frames) -> End {
+    let closing = async {
+        while let Ok(frame) = frames.frames.try_recv() {
+            sink.feed(Message::text(frame)).await?;
+        }
+        let close = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "moil stopped".into(),
+        };
+        sink.send(Message::Close(Some(close))).await
+    };
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, closing).await;
+    End::Stopped
 }
 
 /// What a close frame from the service means (spec §6.4).

@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::connection::{self, LinkEvent};
+use super::connection::{self, LinkEvent, Outbox};
 use super::{
     AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
 };
@@ -97,8 +97,10 @@ impl fmt::Display for AttemptKey {
 const MIN_RENEW_INTERVAL: Duration = Duration::from_millis(50);
 /// ...and at least this often, however long.
 const MAX_RENEW_INTERVAL: Duration = Duration::from_secs(3600);
-/// How long shutting down waits for connections to close.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the coordinator waits for a connection to close. The
+/// connection gives up on its own after [`connection::CLOSE_TIMEOUT`]; this
+/// only guards against a bug there.
+const CLOSE_WAIT: Duration = connection::CLOSE_TIMEOUT.saturating_mul(2);
 
 pub(super) struct Coordinator {
     machine: Machine,
@@ -135,7 +137,10 @@ struct Service {
 
 /// An open channel to a service.
 struct Link {
-    outbox: mpsc::UnboundedSender<String>,
+    outbox: Outbox,
+    /// The outbox was full: nothing more is sent until the connection has
+    /// written what it holds.
+    held: bool,
     /// Whether the service answered `hello`. Until it has, the machine
     /// sends nothing else.
     welcomed: bool,
@@ -147,9 +152,23 @@ struct Link {
 }
 
 impl Link {
-    fn send(&self, message: &MachineMessage) {
-        let text = serde_json::to_string(message).expect("machine messages serialize");
-        let _ = self.outbox.send(text);
+    /// Queues `message` for the service. Returns whether it was: not while
+    /// the outbox is full.
+    fn send(&mut self, message: &MachineMessage) -> bool {
+        self.queue(|| serde_json::to_string(message).expect("machine messages serialize"))
+    }
+
+    fn queue(&mut self, frame: impl FnOnce() -> String) -> bool {
+        if !self.held {
+            self.held = !self.outbox.queue(frame());
+        }
+        !self.held
+    }
+
+    /// Whether the service takes messages now: it answered `hello` and
+    /// its outbox has room.
+    fn ready(&self) -> bool {
+        self.welcomed && !self.held
     }
 }
 
@@ -212,6 +231,23 @@ impl Attempt {
         self.kept_bytes += text.len();
         self.kept.push_back((self.next_seq, text));
         self.next_seq += 1;
+    }
+
+    /// Sends `link` the kept messages it hasn't had, oldest first. Returns
+    /// whether all of them went: not if the outbox filled up.
+    fn deliver(&mut self, link: &mut Link, now: Instant) -> bool {
+        // Kept messages are in `seq` order, so the unsent ones are the
+        // newest: an attempt's every event isn't looked at again each
+        // round, however many it sends.
+        let unsent = self.kept.partition_point(|(seq, _)| *seq <= self.delivered);
+        for (seq, text) in self.kept.range(unsent..) {
+            if !link.queue(|| text.clone()) {
+                return false;
+            }
+            self.delivered = *seq;
+            self.last_sent = now;
+        }
+        true
     }
 
     fn renew_at(&self) -> Instant {
@@ -341,7 +377,7 @@ impl Coordinator {
                         service.stop.cancel();
                         let inputs = self.inputs.clone();
                         tokio::spawn(async move {
-                            let _ = service.join.await;
+                            let _ = tokio::time::timeout(CLOSE_WAIT, service.join).await;
                             let _ = inputs.send(Input::Reply(reply));
                         });
                     }
@@ -408,6 +444,11 @@ impl Coordinator {
             }
             LinkEvent::Open(outbox) => self.hello(id, outbox),
             LinkEvent::Message(message) => self.message(id, message),
+            LinkEvent::Drained => {
+                if let Some(link) = &mut service.link {
+                    link.held = false;
+                }
+            }
             LinkEvent::Lost { error, retry_at } => {
                 tracing::info!("lost {}: {error}", service.paired.name);
                 service.link = None;
@@ -435,7 +476,7 @@ impl Coordinator {
     }
 
     /// Opens the conversation (spec §6.2).
-    fn hello(&mut self, id: &ServiceId, outbox: mpsc::UnboundedSender<String>) {
+    fn hello(&mut self, id: &ServiceId, outbox: Outbox) {
         let state = self.state();
         let announced: Vec<AttemptRef> = self
             .attempts
@@ -447,8 +488,9 @@ impl Coordinator {
             return;
         };
         let approved = service.paired.approved_hashes();
-        let link = Link {
+        let mut link = Link {
             outbox,
+            held: false,
             welcomed: false,
             announced: announced.clone(),
             state,
@@ -541,7 +583,10 @@ impl Coordinator {
                 },
             },
         };
-        self.send(id, &answer);
+        if !self.send(id, &answer) {
+            // The offer expires unanswered, as if it had been lost.
+            tracing::debug!("couldn't answer an offer from {id}: its channel is backed up");
+        }
     }
 
     /// Starts an attempt, or reports at once why it can't start (spec
@@ -770,58 +815,47 @@ impl Coordinator {
         for (key, attempt) in &mut self.attempts {
             let Some(link) = self
                 .services
-                .get(&key.service)
-                .and_then(|s| s.link.as_ref())
-                .filter(|l| l.welcomed)
+                .get_mut(&key.service)
+                .and_then(|s| s.link.as_mut())
+                .filter(|l| l.ready())
             else {
                 continue;
             };
-            // Kept messages are in `seq` order, so the unsent ones are the
-            // newest: an attempt's every event isn't looked at again each
-            // round, however many it sends.
-            let unsent = attempt
-                .kept
-                .partition_point(|(seq, _)| *seq <= attempt.delivered);
-            let mut sent = false;
-            for (_, text) in attempt.kept.range(unsent..) {
-                let _ = link.outbox.send(text.clone());
-                sent = true;
-            }
-            if sent {
-                attempt.delivered = attempt.kept.back().map_or(0, |(seq, _)| *seq);
-                attempt.last_sent = now;
-            }
-            if running == Some(key) && now >= attempt.renew_at() {
-                link.send(&MachineMessage::Renew(key.attempt.clone()));
+            attempt.deliver(link, now);
+            if running == Some(key)
+                && now >= attempt.renew_at()
+                && link.send(&MachineMessage::Renew(key.attempt.clone()))
+            {
                 attempt.last_sent = now;
             }
         }
 
         let state = self.state();
         for service in self.services.values_mut() {
-            let Some(link) = service.link.as_mut().filter(|l| l.welcomed) else {
+            let Some(link) = service.link.as_mut().filter(|l| l.ready()) else {
                 continue;
             };
-            if link.state != state {
-                link.send(&MachineMessage::State { state });
+            if link.state != state && link.send(&MachineMessage::State { state }) {
                 link.state = state;
             }
             let approved = service.paired.approved_hashes();
             if link.approved != approved {
-                link.send(&MachineMessage::Approved {
+                let message = MachineMessage::Approved {
                     hashes: approved.clone(),
-                });
-                link.approved = approved;
+                };
+                if link.send(&message) {
+                    link.approved = approved;
+                }
             }
         }
     }
 
-    /// When the running attempt next needs a `renew`, if its service is
-    /// connected.
+    /// When the running attempt next needs a `renew`, if its service takes
+    /// messages now.
     fn renew_at(&self) -> Option<Instant> {
         let key = &self.running.as_ref()?.key;
         let link = self.services.get(&key.service)?.link.as_ref()?;
-        link.welcomed
+        link.ready()
             .then(|| self.attempts.get(key).map(Attempt::renew_at))
             .flatten()
     }
@@ -867,7 +901,7 @@ impl Coordinator {
                 service.join
             })
             .collect();
-        let _ = tokio::time::timeout(CLOSE_TIMEOUT, futures::future::join_all(closing)).await;
+        let _ = tokio::time::timeout(CLOSE_WAIT, futures::future::join_all(closing)).await;
     }
 
     fn connect(&mut self, paired: PairedService) {
@@ -909,10 +943,15 @@ impl Coordinator {
         });
     }
 
-    fn send(&self, id: &ServiceId, message: &MachineMessage) {
-        if let Some(link) = self.services.get(id).and_then(|s| s.link.as_ref()) {
-            link.send(message);
-        }
+    /// Answers service `id` right away, such as with a bid; what follows
+    /// from the machine's state goes out in [`reconcile`](Self::reconcile).
+    /// Returns whether the message went: not while the service's outbox is
+    /// full.
+    fn send(&mut self, id: &ServiceId, message: &MachineMessage) -> bool {
+        self.services
+            .get_mut(id)
+            .and_then(|s| s.link.as_mut())
+            .is_some_and(|link| link.send(message))
     }
 
     fn publish(&self) {

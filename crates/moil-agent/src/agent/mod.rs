@@ -64,10 +64,11 @@ pub struct AgentOptions {
     pub reconnect_min: Duration,
     /// The longest delay before reconnecting (spec §6.1: 60 s).
     pub reconnect_max: Duration,
-    /// How long a control channel may stay silent, pings included, before
-    /// the agent treats it as dead (spec §6.1: 60 s). Also bounds how long
+    /// How long a control channel may go without receiving anything (pings
+    /// included), or without taking what the machine writes, before the
+    /// agent treats it as dead (spec §6.1: 60 s). Also bounds how long
     /// opening one may take.
-    pub receive_timeout: Duration,
+    pub channel_timeout: Duration,
     /// How long [`AgentHandle::shutdown`] waits for services to acknowledge
     /// the attempts it reports, once the running attempt has stopped.
     pub shutdown_grace: Duration,
@@ -82,7 +83,7 @@ impl Default for AgentOptions {
         Self {
             reconnect_min: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
-            receive_timeout: Duration::from_secs(60),
+            channel_timeout: Duration::from_secs(60),
             shutdown_grace: Duration::from_secs(5),
             max_kept_bytes: 16 << 20,
         }
