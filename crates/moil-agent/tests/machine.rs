@@ -329,7 +329,7 @@ async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
     let err = machine.pair("http://moil.invalid/moil").await.unwrap_err();
     assert!(matches!(err, Error::InsecureUrl(_)), "{err}");
     let err = machine.pair("ftp://moil.invalid/moil").await.unwrap_err();
-    assert!(matches!(err, Error::NotAService { .. }), "{err}");
+    assert!(matches!(err, Error::InvalidAddress(_)), "{err}");
 
     // With the owner's permission the machine goes on and tries to reach it.
     machine

@@ -221,7 +221,7 @@ impl Machine {
         }
         let url = query
             .contains("://")
-            .then(|| net::parse_base_url(query).ok())
+            .then(|| services::parse_base_url(query).ok())
             .flatten();
         let matches: Vec<&PairedService> = services
             .iter()
@@ -254,7 +254,7 @@ impl Machine {
     /// Starts pairing with the service at `base_url`, after checking that it
     /// is a moil service (`GET /v1/info`).
     pub async fn pair(&self, base_url: &str) -> Result<PairingSession, Error> {
-        let base_url = net::parse_base_url(base_url)?;
+        let base_url = services::parse_base_url(base_url)?;
         self.check_url(&base_url)?;
         let not_a_service = |reason: String| Error::NotAService {
             url: base_url.to_string(),

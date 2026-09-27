@@ -8,6 +8,8 @@ use moil_proto::BundleHash;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::Error;
+
 /// This machine's name for a paired service: derived from the service's
 /// host and port (`klisi.example.com`, `localhost-8787`), unique among the
 /// machine's services, and safe as a file name. An ID is 1 to 128
@@ -123,6 +125,51 @@ impl From<ServiceId> for String {
     "{0:?} isn't a service ID: IDs are 1 to 128 lowercase letters, digits, dots and hyphens, starting and ending with a letter or digit"
 )]
 pub struct InvalidServiceId(String);
+
+/// A service's base URL from what the owner typed, or a link supplied:
+/// surrounding whitespace is ignored, `https://` is assumed when there's no
+/// scheme, and a trailing slash is dropped. It must be an `http` or `https`
+/// URL with a host, and without a user name, password, query or fragment,
+/// which a base URL has no use for. Whether plain `http` is acceptable is
+/// checked when pairing (spec §3).
+pub fn parse_base_url(input: &str) -> Result<Url, Error> {
+    let input = input.trim();
+    let refuse = |why: String| Err(Error::InvalidAddress(why));
+    if input.is_empty() {
+        return refuse(
+            "Enter the service's address, such as https://klisi.example.com/moil.".into(),
+        );
+    }
+    let with_scheme;
+    let input = if input.contains("://") {
+        input
+    } else {
+        with_scheme = format!("https://{input}");
+        &with_scheme
+    };
+    let mut url = match Url::parse(input) {
+        Ok(url) => url,
+        Err(e) => return refuse(format!("{input} isn't a valid address: {e}.")),
+    };
+    if !matches!(url.scheme(), "https" | "http") {
+        return refuse(format!(
+            "moil services have https addresses, not {}:// ones.",
+            url.scheme()
+        ));
+    }
+    if url.host().is_none() {
+        return refuse(format!("{input} doesn't name a host."));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return refuse("The address mustn't contain a user name or password.".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return refuse("The address can't contain a query (?…) or a fragment (#…).".into());
+    }
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&path);
+    Ok(url)
+}
 
 /// Fails unless `name` may be what a service calls itself (spec §4): 1 to
 /// 64 characters, none of them a control character. Says why, as a reason
@@ -271,6 +318,35 @@ mod tests {
         ] {
             let err = ServiceId::new(bad).unwrap_err();
             assert!(err.to_string().contains("isn't a service ID"), "{err}");
+        }
+    }
+
+    #[test]
+    fn base_urls_come_from_what_the_owner_typed() {
+        let url = |s| parse_base_url(s).unwrap().to_string();
+        assert_eq!(
+            url("https://klisi.example.com/moil/"),
+            "https://klisi.example.com/moil"
+        );
+        assert_eq!(
+            url("  klisi.example.com/moil \n"),
+            "https://klisi.example.com/moil"
+        );
+        assert_eq!(
+            url("http://127.0.0.1:8787/moil"),
+            "http://127.0.0.1:8787/moil"
+        );
+        assert_eq!(url("https://a.example"), "https://a.example/");
+        for (input, why) in [
+            ("", "Enter the service's address"),
+            ("ftp://a.example", "not ftp:// ones"),
+            ("https://", "isn't a valid address"),
+            ("https://u:p@a.example/", "user name or password"),
+            ("https://a.example/moil?x=1", "query"),
+            ("https://a.example/moil#top", "fragment"),
+        ] {
+            let error = parse_base_url(input).unwrap_err().to_string();
+            assert!(error.contains(why), "{input:?}: {error}");
         }
     }
 

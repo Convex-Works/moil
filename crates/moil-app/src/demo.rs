@@ -17,18 +17,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use moil_agent::services::parse_base_url;
 use moil_agent::{
     Approval, BundleStatus, Connection, Error, JobOutcome, JobReport, JobStatus, PairedService,
     Review, ServiceId, ServiceStatus, Snapshot,
 };
 use moil_bundle::Bundle;
-use moil_proto::{BundleHash, BundleInfo, ErrorCode, JobId, Phase};
+use moil_proto::{BundleHash, BundleInfo, ErrorCode, JobId, Phase, UrlPolicy};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use url::Url;
 
 use crate::backend::{Backend, Pairing, PairingCode, Result};
-use crate::links::service_address;
 
 /// transcribe 0.2.0, the version the demo's owner approved weeks ago.
 pub fn transcribe_0_2() -> Bundle {
@@ -475,15 +475,11 @@ impl Backend for Demo {
 
     fn pair(&self, base_url: String) -> BoxFuture<'_, Result<Pairing>> {
         async move {
-            let url = service_address(&base_url).map_err(|reason| Error::NotAService {
-                url: base_url.clone(),
-                reason,
-            })?;
-            let host = url.host_str().unwrap_or_default().to_owned();
-            let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
-            if url.scheme() == "http" && !loopback {
+            let url = parse_base_url(&base_url)?;
+            if UrlPolicy::for_base_urls(false).check(&url).is_err() {
                 return Err(Error::InsecureUrl(url.to_string()));
             }
+            let host = url.host_str().unwrap_or_default().to_owned();
             sleep(pace::CONTACT).await;
             if host.ends_with(".invalid") {
                 return Err(Error::NotAService {

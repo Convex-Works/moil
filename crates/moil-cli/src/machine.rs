@@ -417,11 +417,11 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
     let uv = moil_runtime::find_uv()
         .context("couldn't find uv; install it (https://docs.astral.sh/uv/) or set $MOIL_UV")?;
     let runtime = Runtime::new(machine.runtime_config(uv));
-    let reaped = runtime
-        .reap_orphans()
-        .context("couldn't clean up after an earlier crash")?;
-    if reaped > 0 {
-        tracing::info!("cleaned up {reaped} attempts left over from a crash");
+    // As in the app: leftovers are worth a warning, not refusing to work.
+    match runtime.reap_orphans() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("cleaned up {n} attempts left over from a crash"),
+        Err(e) => tracing::warn!("couldn't clean up attempts left over from a crash: {e}"),
     }
     let services = machine.services()?;
     if services.is_empty() {

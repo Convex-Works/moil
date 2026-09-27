@@ -49,37 +49,6 @@ impl Net {
     }
 }
 
-/// A service's base URL from what the owner typed: `https://` is assumed
-/// when there's no scheme, and any trailing slash, query or fragment is
-/// dropped.
-pub(crate) fn parse_base_url(input: &str) -> Result<Url, Error> {
-    let input = input.trim();
-    let not_a_service = |reason: String| Error::NotAService {
-        url: input.to_owned(),
-        reason,
-    };
-    let with_scheme = if input.contains("://") {
-        input.to_owned()
-    } else {
-        format!("https://{input}")
-    };
-    let mut url =
-        Url::parse(&with_scheme).map_err(|e| not_a_service(format!("it isn't a URL ({e})")))?;
-    if !matches!(url.scheme(), "https" | "http") {
-        return Err(not_a_service("moil services are reached over https".into()));
-    }
-    if url.host().is_none() {
-        return Err(not_a_service("it has no host".into()));
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&path);
-    Ok(url)
-}
-
 /// Fails unless `url` may be a service's base URL (spec §3): `https`, or
 /// `http` to a loopback host, or `http` anywhere when the owner allowed it.
 pub(crate) fn check_url(url: &Url, allow_insecure_http: bool) -> Result<(), Error> {
@@ -175,32 +144,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_urls_are_normalized() {
-        let url = |s| parse_base_url(s).unwrap().to_string();
-        assert_eq!(
-            url("https://klisi.example.com/moil/"),
-            "https://klisi.example.com/moil"
-        );
-        assert_eq!(
-            url("klisi.example.com/moil"),
-            "https://klisi.example.com/moil"
-        );
-        assert_eq!(
-            url(" https://a.example/moil?x=1#y "),
-            "https://a.example/moil"
-        );
-        assert_eq!(url("https://u:p@a.example/"), "https://a.example/");
-        assert!(matches!(
-            parse_base_url("ftp://a.example"),
-            Err(Error::NotAService { .. })
-        ));
-        assert!(matches!(
-            parse_base_url("https://"),
-            Err(Error::NotAService { .. })
-        ));
-    }
-
-    #[test]
     fn plain_http_is_only_for_loopback_unless_allowed() {
         let check = |s: &str, allow| check_url(&Url::parse(s).unwrap(), allow);
         for ok in [
@@ -228,9 +171,9 @@ mod tests {
 
     #[test]
     fn endpoints_are_relative_to_the_base_url() {
-        let base = parse_base_url("https://a.example/moil").unwrap();
+        let base = crate::services::parse_base_url("https://a.example/moil").unwrap();
         assert_eq!(endpoint(&base, "v1/info"), "https://a.example/moil/v1/info");
-        let root = parse_base_url("https://a.example").unwrap();
+        let root = crate::services::parse_base_url("https://a.example").unwrap();
         assert_eq!(endpoint(&root, "v1/info"), "https://a.example/v1/info");
     }
 }

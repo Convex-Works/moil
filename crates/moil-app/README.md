@@ -71,7 +71,7 @@ events to them and carries out what they ask for.
 | `icon` | draws the tray icon as a template image |
 | `review`, `pair`, `unpair` | one window each: its state machine and its page |
 | `page` | the page shell (policy, style, script) and helpers for untrusted text |
-| `ipc`, `links` | strict parsing of page messages, `moil://` links, typed addresses and navigation |
+| `ipc`, `links` | strict parsing of page messages, `moil://` links and navigation |
 | `app` | the tao event loop, wry windows and Tokio tasks |
 
 Pages show text a service controls, so every page is escaped by maud, runs
