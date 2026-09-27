@@ -42,7 +42,7 @@ func TestDemo(t *testing.T) {
 	m := moiltest.New(t, ts.URL+"/moil", moiltest.WithName("Ada's MacBook"))
 	code := m.StartPairing()
 	page := get(t, ts.URL+"/pair?code="+url.QueryEscape(code))
-	for _, want := range []string{"Ada&#39;s MacBook", code, "Confirm", "Only confirm a code your own moil app shows you."} {
+	for _, want := range []string{"Ada&#39;s MacBook", code, "<b>" + ts.URL + "/moil</b>", "Confirm", "Only confirm a code your own moil app shows you."} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("the confirmation page lacks %q:\n%s", want, page)
 		}

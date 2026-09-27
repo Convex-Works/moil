@@ -8,7 +8,8 @@
     <tr><th>Name</th><td><b>{{.Pairing.Name}}</b></td></tr>
     <tr><th>System</th><td>{{.Pairing.OS}}/{{.Pairing.Arch}}, moil {{.Pairing.AppVersion}}</td></tr>
   </table>
-  <p>Check that the app on that machine shows this code:</p>
+  <p>Check that the app on that machine is pairing with
+    <b>{{.MoilURL}}</b> and shows this code:</p>
   <div class="code">{{.Pairing.Code}}</div>
   <p class="warning"><b>Only confirm a code your own moil app shows you.</b>
     If someone sent you this link, or you didn't just add this service in

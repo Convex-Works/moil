@@ -214,11 +214,13 @@ func (d *demo) home(w http.ResponseWriter, r *http.Request) {
 }
 
 // pairPage is the page at Config.VerificationURL: the app opens it with
-// the machine's code, and the signed-in user checks the machine is theirs.
+// the machine's code, and the signed-in user checks the machine is theirs,
+// and that its app is pairing with this service rather than with one
+// that sent them on here.
 func (d *demo) pairPage(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	p, ok := d.srv.PendingPairing(code)
-	render(w, "pair.html", map[string]any{"Code": code, "Pairing": p, "Found": ok})
+	render(w, "pair.html", map[string]any{"Code": code, "Pairing": p, "Found": ok, "MoilURL": d.public + "/moil"})
 }
 
 func (d *demo) pair(w http.ResponseWriter, r *http.Request) {
