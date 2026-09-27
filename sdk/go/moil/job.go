@@ -93,11 +93,12 @@ const (
 	CodeNoResult      ErrorCode = "no_result"      // exited without a result
 	CodeOutputMissing ErrorCode = "output_missing" // the result named an undeclared or absent file
 	CodeTimeout       ErrorCode = "timeout"        // ran past Job.Timeout
-	CodeEnvironment   ErrorCode = "environment"    // uv couldn't create the environment
+	CodeEnvironment   ErrorCode = "environment"    // uv couldn't create the environment; retryable unless the machine can tell it's permanent
 	CodeAssetDownload ErrorCode = "asset_download" // an asset couldn't be downloaded
 	CodeAssetMismatch ErrorCode = "asset_mismatch" // an asset's hash didn't match the manifest
 	CodeInputDownload ErrorCode = "input_download" // an input couldn't be downloaded
 	CodeOutputUpload  ErrorCode = "output_upload"  // an output couldn't be uploaded
+	CodeRejected      ErrorCode = "rejected"       // the machine couldn't read the assignment; never started
 	CodeInterrupted   ErrorCode = "interrupted"    // stopped by the machine's owner, or the app quit
 	CodeBusy          ErrorCode = "busy"           // assigned while not idle; never started
 	CodeNotApproved   ErrorCode = "not_approved"   // bundle not approved or not stored; never started
@@ -106,19 +107,23 @@ const (
 	CodeLost          ErrorCode = "lost"           // the machine came back without the attempt, or was removed
 )
 
-// Retryable reports whether the spec says another attempt could succeed
-// after an error with this code. For CodeScriptError the script decides;
-// this reports false, the default when it doesn't say.
+// Retryable reports whether, by default, the spec says another attempt
+// could succeed after an error with this code. The machine has the last
+// word: the script decides for CodeScriptError (this reports false, the
+// default when it doesn't say), and a machine reports CodeEnvironment,
+// CodeInputDownload or CodeOutputUpload as final when it can tell the
+// failure is permanent. Codes from newer machines are retryable.
 func (c ErrorCode) Retryable() bool {
 	switch c {
-	case CodeScriptError, CodeExit, CodeNoResult, CodeOutputMissing, CodeTimeout, CodeEnvironment, CodeAssetMismatch:
+	case CodeScriptError, CodeExit, CodeNoResult, CodeOutputMissing, CodeTimeout, CodeAssetMismatch, CodeRejected:
 		return false
 	}
 	return true
 }
 
-// NeverStarted reports whether an attempt that failed with this code never
-// started, so it doesn't count toward a job's attempt limit (spec §7.2).
+// NeverStarted reports whether the machine refused the attempt before
+// starting it because it was busy or lacked the bundle (spec §7.2). Such
+// attempts don't count toward a job's attempt limit.
 func (c ErrorCode) NeverStarted() bool { return c == CodeBusy || c == CodeNotApproved }
 
 // A JobError is why an attempt failed. Run.Wait returns the last attempt's

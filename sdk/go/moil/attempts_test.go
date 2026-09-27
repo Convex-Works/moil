@@ -352,3 +352,55 @@ func TestRemovingAMachineMovesItsJob(t *testing.T) {
 		t.Fatalf("retries %v", got)
 	}
 }
+
+// A machine that can't read an assignment rejects it. Another attempt
+// would be no different, so the job fails at once.
+func TestRejectedAssignmentsEndTheJob(t *testing.T) {
+	srv := newServer(t)
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Approve(bundle)
+	m.RefuseNext(1, moil.CodeRejected)
+	m.Connect()
+	run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine})
+	_, err := wait(t, run)
+	var jerr *moil.JobError
+	if !errors.As(err, &jerr) || jerr.Code != moil.CodeRejected || jerr.Retryable || jerr.Attempt != 1 || jerr.Machine != m.ID() {
+		t.Fatalf("err = %#v, want the machine's rejection of attempt 1", err)
+	}
+	if got := retries(events(t, run)); len(got) != 0 {
+		t.Fatalf("a rejected job was retried: %v", got)
+	}
+}
+
+// Each code's default retryability is spec §9's; the machine may say
+// otherwise when it knows better.
+func TestErrorCodesAreRetryableAsTheSpecSays(t *testing.T) {
+	for code, retryable := range map[moil.ErrorCode]bool{
+		moil.CodeScriptError:   false,
+		moil.CodeExit:          false,
+		moil.CodeNoResult:      false,
+		moil.CodeOutputMissing: false,
+		moil.CodeTimeout:       false,
+		moil.CodeEnvironment:   true,
+		moil.CodeAssetDownload: true,
+		moil.CodeAssetMismatch: false,
+		moil.CodeInputDownload: true,
+		moil.CodeOutputUpload:  true,
+		moil.CodeRejected:      false,
+		moil.CodeInterrupted:   true,
+		moil.CodeBusy:          true,
+		moil.CodeNotApproved:   true,
+		moil.CodeInternal:      true,
+		moil.CodeLeaseExpired:  true,
+		moil.CodeLost:          true,
+		"from_a_newer_machine": true,
+	} {
+		if code.Retryable() != retryable {
+			t.Errorf("%s.Retryable() = %v, want %v", code, !retryable, retryable)
+		}
+		if code.NeverStarted() != (code == moil.CodeBusy || code == moil.CodeNotApproved) {
+			t.Errorf("%s.NeverStarted() = %v", code, code.NeverStarted())
+		}
+	}
+}

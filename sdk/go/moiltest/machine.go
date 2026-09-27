@@ -392,9 +392,11 @@ func (m *Machine) SetState(s moil.MachineState) {
 	m.reportStateLocked()
 }
 
-// RefuseNext makes the machine refuse its next n assignments with code,
+// RefuseNext makes the machine refuse its next n assignments with code:
 // moil.CodeBusy or moil.CodeNotApproved, as the app does when it became
-// busy or lost the bundle between bidding and being assigned.
+// busy or lost the bundle between bidding and being assigned, or
+// moil.CodeRejected, as it does with an assignment it can't read. The
+// refusal is retryable as code.Retryable says.
 func (m *Machine) RefuseNext(n int, code moil.ErrorCode) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -822,7 +824,7 @@ func (m *Machine) assign(msg wire.Assign) {
 	case m.refuse > 0:
 		m.refuse--
 		a.doneLocked(wire.Done{Outcome: wire.OutcomeFailed, Error: &wire.JobError{
-			Code: string(m.refuseCode), Message: "refused, as the test asked", Retryable: true,
+			Code: string(m.refuseCode), Message: "refused, as the test asked", Retryable: m.refuseCode.Retryable(),
 		}})
 		return
 	case m.effectiveState() != wire.StateIdle:
