@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,5 +75,57 @@ func TestFileStoreRefusesACorruptFile(t *testing.T) {
 		if _, err := moil.NewFileStore(path); err == nil {
 			t.Errorf("%s: opened a store it can't read; saving would lose the machines in it", name)
 		}
+	}
+}
+
+// slowStore holds every SaveReport until released, and counts them.
+type slowStore struct {
+	moil.Store
+	release chan struct{}
+	mu      sync.Mutex
+	saves   int
+}
+
+func (s *slowStore) SaveReport(ctx context.Context, id string, r moil.MachineReport) error {
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	s.saves++
+	s.mu.Unlock()
+	return s.Store.SaveReport(ctx, id, r)
+}
+
+// A machine that reports faster than the Store saves can't make the
+// Server hold more than its latest report, and Close doesn't wait to save
+// the ones it replaced.
+func TestOnlyTheLatestReportWaitsForTheStore(t *testing.T) {
+	store := &slowStore{Store: moil.NewMemoryStore(), release: make(chan struct{})}
+	srv := newServer(t, func(c *moil.Config) { c.Store = store })
+	bundle := loadBundle(t, srv, "minimal")
+	m := moiltest.Pair(t, srv, "alice")
+	m.Connect() // its hello waits for the Store
+	for range 200 {
+		m.Approve(bundle)
+		m.Revoke(bundle)
+	}
+	m.Approve(bundle)
+	m.Sync()
+	close(store.release)
+	eventually(t, "the last report to be saved", func() bool {
+		rec, err := store.Machine(context.Background(), m.ID())
+		return err == nil && slices.Equal(rec.Report.Approved, []string{bundle.Hash()})
+	})
+	start := time.Now()
+	srv.Close()
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("Close took %v", took)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.saves > 3 {
+		t.Errorf("the Store saved %d reports of 402; only the latest should wait", store.saves)
 	}
 }

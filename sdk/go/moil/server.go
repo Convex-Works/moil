@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/url"
 	"sync"
@@ -161,8 +160,7 @@ type Server struct {
 	closing bool
 	conns   sync.WaitGroup
 
-	reports     *queue[func(context.Context)]
-	reportsDone chan struct{}
+	reports *reporter
 
 	closeOnce sync.Once
 }
@@ -173,20 +171,18 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:         cfg,
-		log:         cfg.Logger,
-		store:       cfg.Store,
-		pairings:    newPairings(),
-		cmds:        make(chan func(*scheduler)),
-		stop:        make(chan struct{}),
-		loopDone:    make(chan struct{}),
-		reports:     newQueue[func(context.Context)](math.MaxInt),
-		reportsDone: make(chan struct{}),
+		cfg:      cfg,
+		log:      cfg.Logger,
+		store:    cfg.Store,
+		pairings: newPairings(),
+		cmds:     make(chan func(*scheduler)),
+		stop:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		reports:  newReporter(cfg.Store, cfg.Logger),
 	}
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
 	s.handler = s.routes()
 	go s.loop(newScheduler(s))
-	go s.writeReports()
 	return s, nil
 }
 
@@ -197,7 +193,8 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // Close disconnects every machine and ends every unfinished Run with
-// ErrClosed. It waits for the Server's goroutines to finish.
+// ErrClosed. It saves what machines last reported, giving the Store up to
+// closeGrace, and waits for the Server's goroutines to finish.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.connMu.Lock()
@@ -208,11 +205,14 @@ func (s *Server) Close() error {
 		close(s.stop)
 		<-s.loopDone
 		s.conns.Wait()
-		s.reports.close()
-		<-s.reportsDone
+		s.reports.close(closeGrace)
 	})
 	return nil
 }
+
+// closeGrace is how long Close waits for the Store to save what machines
+// last reported.
+const closeGrace = 5 * time.Second
 
 func (s *Server) loop(sc *scheduler) {
 	defer close(s.loopDone)
@@ -254,29 +254,9 @@ func (s *Server) call(f func(*scheduler)) error {
 	return nil
 }
 
-// saveReport persists what a machine reported, in the order the scheduler
-// saw the reports, without making the scheduler wait for the Store.
-func (s *Server) saveReport(id string, r MachineReport) {
-	s.reports.push(func(ctx context.Context) {
-		err := s.store.SaveReport(ctx, id, r)
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			s.log.Error("moil: saving a machine's report", "machine", id, "err", err)
-		}
-	})
-}
-
-func (s *Server) writeReports() {
-	defer close(s.reportsDone)
-	for {
-		write, ok := s.reports.pop(nil)
-		if !ok {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		write(ctx)
-		cancel()
-	}
-}
+// saveReport persists what a machine reported, without making the
+// scheduler wait for the Store.
+func (s *Server) saveReport(id string, r MachineReport) { s.reports.save(id, r) }
 
 // AddBundle makes bundles available for jobs. Connected machines are told
 // at once, so their owners can review them; machines connecting later
