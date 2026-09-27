@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use moil_proto::{ServiceMessage, close_code};
+use moil_proto::{AttemptRef, JobId, ServiceMessage, close_code};
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -34,6 +36,9 @@ use crate::{Error, Machine, ServiceId, net};
 /// The largest control message either side may send (spec §10).
 const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
+/// The deepest `params` may nest (spec §10).
+const MAX_PARAMS_DEPTH: usize = 64;
+
 /// How many frames may wait in an [`Outbox`].
 const OUTBOX_FRAMES: usize = 64;
 
@@ -52,6 +57,12 @@ pub(super) enum LinkEvent {
     /// every frame it sends goes through `outbox`.
     Open(Outbox),
     Message(ServiceMessage),
+    /// An `assign` naming `attempt` that the machine can't read in full,
+    /// or that asks for more than the protocol allows (spec §7.2).
+    Unreadable {
+        attempt: AttemptRef,
+        reason: String,
+    },
     /// The outbox was full, and the connection has since written what it
     /// held.
     Drained,
@@ -335,7 +346,7 @@ impl Channel {
     }
 
     fn receive(&self, text: &str, backoff: &mut Backoff) {
-        match serde_json::from_str::<ServiceMessage>(text) {
+        match read_message(text) {
             Ok(ServiceMessage::Unknown) => {
                 tracing::debug!(service = %self.service, "ignoring a message type moil doesn't know");
             }
@@ -345,8 +356,15 @@ impl Channel {
                 }
                 self.report(LinkEvent::Message(message));
             }
-            Err(e) => {
-                tracing::warn!(service = %self.service, "ignoring a message moil can't read: {e}");
+            Err(Unreadable {
+                assign: Some(attempt),
+                reason,
+            }) => self.report(LinkEvent::Unreadable { attempt, reason }),
+            Err(Unreadable {
+                assign: None,
+                reason,
+            }) => {
+                tracing::warn!(service = %self.service, "ignoring a message moil can't read: {reason}");
             }
         }
     }
@@ -375,6 +393,81 @@ async fn close(sink: &mut Sink, frames: &mut Frames) -> End {
     };
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, closing).await;
     End::Stopped
+}
+
+/// A message the machine can't use.
+#[derive(Debug, PartialEq)]
+struct Unreadable {
+    /// The attempt, if the message is an `assign` whose `job_id` and
+    /// `attempt` could be read.
+    assign: Option<AttemptRef>,
+    reason: String,
+}
+
+/// Reads a message from the service, holding assignments to the limits of
+/// spec §10.
+fn read_message(text: &str) -> Result<ServiceMessage, Unreadable> {
+    let message = serde_json::from_str(text).map_err(|e| match assign_head(text) {
+        Some(attempt) => Unreadable {
+            assign: Some(attempt),
+            reason: format!("the machine can't read this assignment: {e}"),
+        },
+        None => Unreadable {
+            assign: None,
+            reason: e.to_string(),
+        },
+    })?;
+    if let ServiceMessage::Assign(assign) = &message {
+        let refuse = |reason: String| Unreadable {
+            assign: Some(assign.attempt_ref()),
+            reason,
+        };
+        if assign.timeout_ms == Some(0) {
+            return Err(refuse("timeout_ms is 0; it must be at least 1".into()));
+        }
+        if depth(&assign.params) > MAX_PARAMS_DEPTH {
+            return Err(refuse(format!(
+                "params are nested more than {MAX_PARAMS_DEPTH} levels deep"
+            )));
+        }
+    }
+    Ok(message)
+}
+
+/// The attempt `text` assigns, if it is an `assign` whose `job_id` and
+/// `attempt` can be read, whatever the rest of it holds. The fields it
+/// doesn't read are skipped without being parsed, so no nesting or number
+/// there can stop it.
+fn assign_head(text: &str) -> Option<AttemptRef> {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(rename = "type")]
+        kind: String,
+        job_id: JobId,
+        attempt: u32,
+    }
+    let head: Head = serde_json::from_str(text).ok()?;
+    (head.kind == "assign").then_some(AttemptRef {
+        job_id: head.job_id,
+        attempt: head.attempt,
+    })
+}
+
+/// How many arrays and objects enclose the deepest value in `value`: 0 for
+/// a scalar, 1 for `[1]` or `{}`.
+fn depth(value: &Value) -> usize {
+    let mut deepest = 0;
+    let mut pending = vec![(value, 0)];
+    while let Some((value, level)) = pending.pop() {
+        let inner = level + 1;
+        match value {
+            Value::Array(items) => pending.extend(items.iter().map(|item| (item, inner))),
+            Value::Object(fields) => pending.extend(fields.values().map(|item| (item, inner))),
+            _ => continue,
+        }
+        deepest = deepest.max(inner);
+    }
+    deepest
 }
 
 /// What a close frame from the service means (spec §6.4).
@@ -446,5 +539,15 @@ mod tests {
         }
         backoff.reset();
         assert!(backoff.next() <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn depth_counts_the_arrays_and_objects_around_the_deepest_value() {
+        let depth = |json: &str| depth(&serde_json::from_str(json).unwrap());
+        assert_eq!(depth("1"), 0);
+        assert_eq!(depth("null"), 0);
+        assert_eq!(depth("[]"), 1);
+        assert_eq!(depth("{}"), 1);
+        assert_eq!(depth(r#"{"a": [1, {"b": [[]]}], "c": 2}"#), 5);
     }
 }

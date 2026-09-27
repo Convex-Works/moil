@@ -281,6 +281,66 @@ async fn an_assignment_the_machine_cant_take_fails_at_once() {
 }
 
 #[tokio::test]
+async fn an_assignment_the_machine_cant_read_is_rejected() {
+    let mut setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let hash = setup.hash();
+    let assign = |attempt: u32, params: &str, more: &str| {
+        format!(
+            r#"{{"type": "assign", "job_id": "j1", "attempt": {attempt}, "bundle_hash": "{hash}",
+                "params": {params}, "lease_ms": 30000{more}}}"#
+        )
+    };
+    let nested = |levels| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+    let unreadable = [
+        // Deeper than any JSON parser need follow...
+        assign(1, &nested(10_000), ""),
+        // ...or than the spec allows (§10).
+        assign(2, &nested(65), ""),
+        // No double holds it.
+        assign(3, r#"{"x": 1e400}"#, ""),
+        // An upload method from a later protocol.
+        assign(
+            4,
+            "null",
+            r#", "outputs": {"out.json": {"url": "https://s3.example/o", "method": "PATCH"}}"#,
+        ),
+        // A time limit of nothing (§6.3).
+        assign(5, "null", r#", "timeout_ms": 0"#),
+    ];
+    for (attempt, text) in (1..).zip(&unreadable) {
+        conn.send_text(text);
+        match conn.recv().await {
+            MachineMessage::Done(Done {
+                job_id,
+                attempt: done_attempt,
+                seq: 1,
+                outcome: Outcome::Failed { error },
+            }) => {
+                assert_eq!((job_id.as_str(), done_attempt), ("j1", attempt));
+                assert_eq!(
+                    (error.code, error.retryable),
+                    (ErrorCode::Rejected, false),
+                    "{error}"
+                );
+            }
+            other => panic!("expected a rejected done for attempt {attempt}, got {other:?}"),
+        }
+    }
+    assert!(!setup.runs.has_pending_run(), "none of them ran");
+
+    // At the spec's limits, an attempt runs...
+    conn.send_text(&assign(6, &nested(64), r#", "timeout_ms": 1"#));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+    assert_eq!(run.job.attempt, 6);
+    // ...and an unreadable assign for it changes nothing.
+    conn.send_text(&assign(6, "1e400", ""));
+    conn.send(offer("j2", hash));
+    assert_eq!(conn.recv().await, decline("j2", DeclineReason::Busy));
+}
+
+#[tokio::test]
 async fn an_attempt_reports_its_events_and_outcome_in_order() {
     let mut setup = Setup::new().await;
     let mut conn = setup.connect().await;
@@ -1222,6 +1282,9 @@ async fn messages_the_machine_cant_use_are_ignored() {
     conn.send_text(r#"{"type": "poll", "question": "lunch?"}"#);
     conn.send_text("not json");
     conn.send_text(r#"{"type": "offer", "job_id": "../../etc", "bundle_hash": "x"}"#);
+    // An assign whose attempt can't be named can't be answered either.
+    conn.send_text(r#"{"type": "assign", "job_id": "../../etc", "attempt": 1}"#);
+    conn.send_text(r#"{"type": "assign", "job_id": "j1", "attempt": -1}"#);
     conn.send(offer("j1", setup.hash()));
     assert_eq!(conn.recv().await, bid("j1"));
 }

@@ -287,6 +287,19 @@ enum Unavailable {
     NotApproved(String),
 }
 
+impl From<Unavailable> for JobError {
+    /// The error of a `done` refusing an assignment (spec §7.2).
+    fn from(unavailable: Unavailable) -> Self {
+        match unavailable {
+            Unavailable::Busy => {
+                JobError::new(ErrorCode::Busy, "the machine is running another job")
+            }
+            Unavailable::Paused => JobError::new(ErrorCode::Busy, "the machine is paused"),
+            Unavailable::NotApproved(why) => JobError::new(ErrorCode::NotApproved, why),
+        }
+    }
+}
+
 impl Coordinator {
     pub(super) fn new(
         machine: Machine,
@@ -444,6 +457,11 @@ impl Coordinator {
             }
             LinkEvent::Open(outbox) => self.hello(id, outbox),
             LinkEvent::Message(message) => self.message(id, message),
+            LinkEvent::Unreadable { attempt, reason } => {
+                if service.link.as_ref().is_some_and(|l| l.welcomed) {
+                    self.unreadable(id, attempt, reason);
+                }
+            }
             LinkEvent::Drained => {
                 if let Some(link) = &mut service.link {
                     link.held = false;
@@ -600,22 +618,9 @@ impl Coordinator {
             tracing::warn!("ignoring a second assign for {key}");
             return;
         }
-        let mut attempt = Attempt::new(Duration::from_millis(assign.lease_ms));
         let bundle = match self.availability(id, &assign.bundle_hash) {
             Ok(bundle) => bundle,
-            Err(unavailable) => {
-                let error = match unavailable {
-                    Unavailable::Busy => {
-                        JobError::new(ErrorCode::Busy, "the machine is running another job")
-                    }
-                    Unavailable::Paused => JobError::new(ErrorCode::Busy, "the machine is paused"),
-                    Unavailable::NotApproved(why) => JobError::new(ErrorCode::NotApproved, why),
-                };
-                tracing::info!("refused {key}: {}", error.message);
-                attempt.push_done(&key, Outcome::failed(error));
-                self.attempts.insert(key, attempt);
-                return;
-            }
+            Err(unavailable) => return self.refuse(key, unavailable.into()),
         };
         tracing::info!("starting {key}: {}", bundle.manifest().name);
         let (stopper, stop) = moil_runtime::stop_signal();
@@ -631,7 +636,10 @@ impl Coordinator {
             started_at: Instant::now(),
             stopping: false,
         };
-        self.attempts.insert(key.clone(), attempt);
+        self.attempts.insert(
+            key.clone(),
+            Attempt::new(Duration::from_millis(assign.lease_ms)),
+        );
         self.running = Some(Running {
             key: key.clone(),
             bundle: bundle.hash(),
@@ -641,6 +649,30 @@ impl Coordinator {
         let mut job = Job::from_assign(assign, bundle);
         job.url_policy = self.url_policy(&key.service);
         self.spawn_attempt(key, job, stop);
+    }
+
+    /// Refuses an assignment the machine can't read (spec §7.2), unless it
+    /// names an attempt the machine already holds.
+    fn unreadable(&mut self, id: &ServiceId, attempt: AttemptRef, reason: String) {
+        let key = AttemptKey {
+            service: id.clone(),
+            attempt,
+        };
+        if self.attempts.contains_key(&key) {
+            tracing::warn!(
+                "ignoring a second assign for {key}, which moil can't read either: {reason}"
+            );
+            return;
+        }
+        self.refuse(key, JobError::new(ErrorCode::Rejected, reason));
+    }
+
+    /// Answers an assignment the machine won't run with a failed `done`.
+    fn refuse(&mut self, key: AttemptKey, error: JobError) {
+        tracing::info!("refused {key}: {}", error.message);
+        let mut attempt = Attempt::new(Duration::ZERO);
+        attempt.push_done(&key, Outcome::failed(error));
+        self.attempts.insert(key, attempt);
     }
 
     /// Which URLs the jobs of service `id` may use for their files (spec
