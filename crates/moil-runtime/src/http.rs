@@ -1,7 +1,6 @@
 //! Moving files over HTTP: inputs, outputs and assets (spec §3, §7.4).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -164,21 +163,18 @@ impl Http {
         })
     }
 
-    /// Uploads the file at `path` to `target`, whose URL `policy` must
-    /// allow, streaming it with a `Content-Length`. Any `2xx` answer is
-    /// success; a redirect is not. Returns the size and SHA-256 of the bytes
-    /// sent.
+    /// Uploads `file` to `target`, whose URL `policy` must allow,
+    /// streaming it with a `Content-Length`. Any `2xx` answer is success; a
+    /// redirect is not. Returns the size and SHA-256 of the bytes sent.
     pub async fn upload(
         &self,
         policy: UrlPolicy,
         target: &Upload,
-        path: &Path,
+        file: std::fs::File,
     ) -> Result<FileInfo, TransferError> {
         let failed = TransferError::Failed;
         let url = check(policy, &target.url)?;
-        let file = tokio::fs::File::open(path)
-            .await
-            .map_err(|e| failed(format!("couldn't open it: {e}")))?;
+        let file = tokio::fs::File::from_std(file);
         let size = file
             .metadata()
             .await

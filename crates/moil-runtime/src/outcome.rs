@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::StopReason;
 use crate::stdout::Report;
+use crate::workdir::open_output;
 
 /// Why an attempt ended before running its course.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +44,8 @@ impl Cut {
 /// What the script produced, once it's accepted as a success.
 #[derive(Debug)]
 pub(crate) struct Accepted {
-    /// The outputs to upload.
-    pub files: Vec<FileName>,
+    /// The outputs to upload, open: what was judged is what gets uploaded.
+    pub files: Vec<(FileName, std::fs::File)>,
     pub meta: Option<Value>,
 }
 
@@ -78,22 +79,20 @@ pub(crate) fn judge(
     let mut seen = BTreeSet::new();
     for name in result.files {
         let missing = |why: String| JobError::new(ErrorCode::OutputMissing, why);
-        let Some(file) = FileName::new(name.as_str())
+        let Some(output) = FileName::new(name.as_str())
             .ok()
-            .filter(|file| declared.contains_key(file))
+            .filter(|output| declared.contains_key(output))
         else {
             return Err(missing(format!(
                 "the result names {name:?}, which isn't one of the job's outputs"
             )));
         };
-        if !out_dir.join(file.as_str()).is_file() {
-            return Err(missing(format!(
-                "the result names {name:?}, but the script didn't write out/{name}"
-            )));
+        if !seen.insert(output.clone()) {
+            continue;
         }
-        if seen.insert(file.clone()) {
-            files.push(file);
-        }
+        let file = open_output(out_dir, &output)
+            .map_err(|why| missing(format!("the result names {name:?}, but {why}")))?;
+        files.push((output, file));
     }
     Ok(Accepted {
         files,

@@ -131,7 +131,7 @@ impl Attempt<'_> {
             .await?;
 
         self.phase(Phase::Uploading);
-        let files = limits.guard(self.upload(&work, &accepted.files)).await??;
+        let files = limits.guard(self.upload(accepted.files)).await??;
         Ok(JobResult {
             meta: accepted.meta,
             files,
@@ -271,17 +271,15 @@ impl Attempt<'_> {
 
     async fn upload(
         &self,
-        work: &WorkDir,
-        files: &[FileName],
+        files: Vec<(FileName, std::fs::File)>,
     ) -> Result<BTreeMap<FileName, FileInfo>, JobError> {
         let mut uploaded = BTreeMap::new();
-        for name in files {
-            let target = &self.job.outputs[name];
-            let path = work.outputs().join(name.as_str());
+        for (name, file) in files {
+            let target = &self.job.outputs[&name];
             let info = self
                 .runtime
                 .http
-                .upload(self.url_policy(), target, &path)
+                .upload(self.url_policy(), target, file)
                 .await
                 .map_err(|e| {
                     JobError::new(
@@ -290,7 +288,7 @@ impl Attempt<'_> {
                     )
                     .retryable(e.is_retryable())
                 })?;
-            uploaded.insert(name.clone(), info);
+            uploaded.insert(name, info);
         }
         Ok(uploaded)
     }

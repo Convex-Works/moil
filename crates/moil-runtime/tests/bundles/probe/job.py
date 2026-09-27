@@ -11,6 +11,9 @@ params: {"steps": [step, ...]}. Each step is an object with one of:
   {"raw": [byte, ...]}           write raw bytes to stdout
   {"stderr": "text", "times": n} write a line to stderr, n times
   {"write": "name", "text": "."} write out/<name>
+  {"symlink": "path", "to": "."} make a symbolic link at <work dir>/<path>,
+                                 replacing an empty directory there
+  {"fifo": "path"}               make a FIFO at <work dir>/<path>
   {"input": "name"}              send an input's contents as data
   {"asset": "name"}              send an asset's contents as data
   {"context": true}              send the job context as data
@@ -57,6 +60,13 @@ def run(step, job):
     elif "write" in step:
         with open(os.path.join(job["output_dir"], step["write"]), "w") as f:
             f.write(step["text"])
+    elif "symlink" in step:
+        path = os.path.join(job["work_dir"], step["symlink"])
+        if os.path.isdir(path):
+            os.rmdir(path)
+        os.symlink(step["to"], path)
+    elif "fifo" in step:
+        os.mkfifo(os.path.join(job["work_dir"], step["fifo"]))
     elif "input" in step:
         with open(job["inputs"][step["input"]], "rb") as f:
             data({"input": f.read().decode()})

@@ -262,11 +262,53 @@ mod outcome {
         let run = h.run(job).await;
         let error = run.error();
         assert_eq!(error.code, ErrorCode::OutputMissing);
-        assert!(error.message.contains("out/b.txt"), "{}", error.message);
+        assert!(
+            error.message.contains("the script didn't write out/b.txt"),
+            "{}",
+            error.message
+        );
         assert!(
             h.server.received("/out/a.txt").is_empty(),
             "nothing is uploaded"
         );
+    }
+
+    #[tokio::test]
+    async fn outputs_must_be_regular_files_in_out() {
+        // As a script extracting an archive from an input could be tricked
+        // into leaving them.
+        let h = Harness::new().await;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let secret = elsewhere.path().join("result.txt");
+        std::fs::write(&secret, "the owner's secret").unwrap();
+        let secret = secret.to_str().unwrap();
+        let dir = elsewhere.path().to_str().unwrap();
+
+        for (make, why) in [
+            (
+                json!({"symlink": "out/result.txt", "to": secret}),
+                "out/result.txt is a symbolic link",
+            ),
+            (
+                json!({"symlink": "out", "to": dir}),
+                "out/ is a symbolic link",
+            ),
+            (
+                json!({"fifo": "out/result.txt"}),
+                "out/result.txt isn't a regular file",
+            ),
+        ] {
+            let mut job = h.job(
+                &probe(),
+                steps(json!([make, {"emit": {"type": "result", "files": ["result.txt"]}}])),
+            );
+            job.outputs.extend([output(&h.server, "result.txt")]);
+            let run = h.run(job).await;
+            let error = run.error();
+            assert_eq!(error.code, ErrorCode::OutputMissing, "{make}");
+            assert!(error.message.contains(why), "{make}: {}", error.message);
+        }
+        assert!(h.server.received("/out/result.txt").is_empty());
     }
 
     #[tokio::test]
