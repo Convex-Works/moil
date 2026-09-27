@@ -14,6 +14,12 @@ pub enum Error {
     InvalidAddress(String),
     #[error("{url} isn't a moil service: {reason}")]
     NotAService { url: String, reason: String },
+    /// A service that asked the owner to confirm pairing on another site's
+    /// page, as one relaying another service's pairing would (spec §4).
+    #[error(
+        "{url} wants you to confirm on {site}, another site, which is how a service would get you to pair its own machine with your account there; to pair with {site}, use the address it shows for moil"
+    )]
+    ForeignPairingPage { url: String, site: String },
     #[error("{0} must use https; only loopback addresses may use http")]
     InsecureUrl(String),
     #[error("the pairing was rejected on the service")]

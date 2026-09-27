@@ -265,6 +265,9 @@ struct Shared {
 struct Pairing {
     interval: u64,
     expires_in: u64,
+    /// `verification_uri` and `verification_uri_complete`, if not the
+    /// service's own page.
+    pages: Option<(String, String)>,
     replies: VecDeque<TokenReply>,
     requests: Vec<PairRequest>,
     polls: Vec<Instant>,
@@ -283,6 +286,7 @@ impl FakeService {
             pairing: Mutex::new(Pairing {
                 interval: 0,
                 expires_in: 600,
+                pages: None,
                 replies: VecDeque::new(),
                 requests: Vec::new(),
                 polls: Vec::new(),
@@ -340,6 +344,15 @@ impl FakeService {
         let mut pairing = self.shared.pairing.lock().unwrap();
         pairing.interval = interval;
         pairing.expires_in = expires_in;
+    }
+
+    /// Sends machines that pair to confirm on these pages instead of the
+    /// service's own.
+    pub fn pairing_pages(&self, verification_uri: &str, verification_uri_complete: &str) {
+        self.shared.pairing.lock().unwrap().pages = Some((
+            verification_uri.to_owned(),
+            verification_uri_complete.to_owned(),
+        ));
     }
 
     pub fn pair_requests(&self) -> Vec<PairRequest> {
@@ -451,11 +464,18 @@ async fn pair_handler(
 ) -> Json<PairResponse> {
     let mut pairing = shared.pairing.lock().unwrap();
     pairing.requests.push(request);
+    let (verification_uri, verification_uri_complete) =
+        pairing.pages.clone().unwrap_or_else(|| {
+            (
+                format!("{}/pair", shared.base_url),
+                format!("{}/pair?code=WDJB-MJHT", shared.base_url),
+            )
+        });
     Json(PairResponse {
         device_code: "device-code-1".into(),
         user_code: "WDJB-MJHT".into(),
-        verification_uri: format!("{}/pair", shared.base_url),
-        verification_uri_complete: format!("{}/pair?code=WDJB-MJHT", shared.base_url),
+        verification_uri,
+        verification_uri_complete,
         expires_in: pairing.expires_in,
         interval: pairing.interval,
         service: ServiceInfo {

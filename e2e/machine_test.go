@@ -34,7 +34,6 @@ type machine struct {
 	svc       *service // the harness service, if paired with one
 	id        string   // the service's ID for this machine
 	serviceID string   // this machine's ID for the service
-	link      *link    // the network between the machine and the service
 
 	agent *agentProcess // the running agent, if any
 }
@@ -53,9 +52,6 @@ func newMachine(t *testing.T, name string) *machine {
 	t.Cleanup(func() {
 		if m.agent != nil {
 			m.Stop()
-		}
-		if m.link != nil {
-			m.link.close()
 		}
 	})
 	return m
@@ -138,8 +134,7 @@ func (m *machine) moil(args ...string) string {
 func (m *machine) Pair(svc *service, owner string) {
 	m.t.Helper()
 	m.svc = svc
-	m.link = newLink(m.t, svc.addr)
-	m.PairWith(m.link.URL()+"/moil", func(code string) {
+	m.PairWith(svc.link.URL()+"/moil", func(code string) {
 		paired, err := svc.sdk.ConfirmPairing(context.Background(), code, owner)
 		if err != nil {
 			m.t.Fatalf("confirming pairing code %s: %v", code, err)
@@ -178,6 +173,13 @@ func (m *machine) PairWith(baseURL string, confirm func(code string)) {
 	if err := cmd.Wait(); err != nil || m.serviceID == "" {
 		m.t.Fatalf("moil pair %s: %v; it printed:\n%s", baseURL, err, strings.Join(shown, "\n"))
 	}
+}
+
+// Heard reports whether the service it's paired with ever sent the
+// machine s.
+func (m *machine) Heard(s string) bool {
+	m.t.Helper()
+	return slices.ContainsFunc(m.tokens(), func(token string) bool { return m.svc.link.Heard(token, s) })
 }
 
 // Approve approves bundle for the service, as the owner would after

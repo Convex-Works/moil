@@ -144,11 +144,20 @@ POST /v1/pair
   the middle. The service compares codes case-insensitively and ignores the
   hyphen.
 - `expires_in` and `interval` are seconds, as in RFC 8628.
+- `verification_uri` and `verification_uri_complete` MUST be `http` or
+  `https` URLs on the same origin (scheme, host and port) as the service's
+  base URL, without a user name or password, and machines MUST refuse to
+  pair otherwise. A service could otherwise relay another service's
+  pairing: passing on that service's code and confirmation page, it would
+  have the owner pair the relay's machine with their account there.
 
 The app shows `user_code` and opens `verification_uri_complete`. The
 service's page shows the pending machine's name, OS and code, and asks the
 signed-in user to confirm. On confirmation the service records the machine
-with that user as its owner.
+with that user as its owner. A relay can still send the owner on from a
+page of its own to another service's, so the page SHOULD also show the
+service's base URL, for the user to check that their app is pairing with
+it.
 
 **Poll:**
 

@@ -238,12 +238,12 @@ func TestMachineRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := newServer(t, func(c *moil.Config) { c.Store = store })
 	// The service's address outlives the Server, as a restarted
 	// service's does.
 	var front swapHandler
-	front.set(srv.Handler())
 	base := httptestServer(t, &front)
+	srv := newServer(t, func(c *moil.Config) { c.Store = store; c.VerificationURL = base + "/machines/pair" })
+	front.set(srv.Handler())
 	bundle := loadBundle(t, srv, "minimal")
 	ada := moiltest.Pair(t, srv, "alice", moiltest.At(base), moiltest.WithName("Ada's desktop"), moiltest.WithHardware(16, 64<<30), moiltest.WithGPU("RTX 4090", 24<<30))
 	moiltest.Pair(t, srv, "alice", moiltest.At(base), moiltest.WithName("Ada's laptop"))

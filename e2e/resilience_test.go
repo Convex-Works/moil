@@ -95,15 +95,15 @@ func TestAJobSurvivesTheNetworkDropping(t *testing.T) {
 	)})
 	awaitCount(t, run, 5)
 
-	connections := m.link.Connections()
-	m.link.Cut()
+	connections := svc.link.Connections()
+	svc.link.Cut()
 	eventually(t, "the service to see the machine go offline", func() bool { return !svc.Machine(m.ID()).Online() })
 	dropped.Open(t)
 	sentOffline.Await(t, "the script to send events while the machine is offline")
 
-	m.link.Restore()
+	svc.link.Restore()
 	awaitCount(t, run, 10)
-	if m.link.Connections() == connections {
+	if svc.link.Connections() == connections {
 		t.Fatal("the events sent offline arrived without the agent reconnecting")
 	}
 	back.Open(t)
@@ -164,7 +164,7 @@ func TestRemovingAMachineCutsItOff(t *testing.T) {
 	never := newGate(t)
 	run := svc.Submit(moil.Job{Params: probe(do.Spawn(), do.WaitFor(never))})
 	p := awaitPids(t, run, 1)
-	connections := m.link.Connections()
+	connections := svc.link.Connections()
 
 	if err := svc.sdk.RemoveMachine(context.Background(), m.ID()); err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestRemovingAMachineCutsItOff(t *testing.T) {
 	awaitGone(t, "the removed machine's job processes", p.all()...)
 
 	time.Sleep(reconnectWindow)
-	if n := m.link.Connections() - connections; n != 0 {
+	if n := svc.link.Connections() - connections; n != 0 {
 		t.Errorf("the removed machine connected %d more times", n)
 	}
 	if _, err := svc.sdk.Machine(context.Background(), m.ID()); !errors.Is(err, moil.ErrNotFound) {

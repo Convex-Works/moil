@@ -34,7 +34,7 @@ func TestMachinesRunOnlyWhatTheirOwnerApproved(t *testing.T) {
 	// talks to it in order, so once it has run one it has heard all the
 	// service had to say about the job before.
 	succeed(t, svc.Submit(moil.Job{Bundle: echo, Params: map[string]any{"text": "hi"}}))
-	if m.link.Heard(waiting.ID()) || waiting.State() != moil.Queued {
+	if m.Heard(waiting.ID()) || waiting.State() != moil.Queued {
 		t.Fatalf("the job for a bundle the owner never approved reached the machine; it is %s", waiting.State())
 	}
 
@@ -125,7 +125,7 @@ func TestTamperedBundlesAreRefused(t *testing.T) {
 	}
 	waiting := svc.Submit(moil.Job{Params: probe(do.Result(nil))})
 	succeed(t, svc.Submit(moil.Job{Bundle: echo, Params: map[string]any{"text": "hi"}}))
-	if m.link.Heard(waiting.ID()) || waiting.State() != moil.Queued {
+	if m.Heard(waiting.ID()) || waiting.State() != moil.Queued {
 		t.Fatalf("a job for the tampered bundle reached the machine; it is %s", waiting.State())
 	}
 }
@@ -155,7 +155,7 @@ func TestScriptsSeeOnlyTheirJob(t *testing.T) {
 	})
 	succeed(t, run)
 
-	secrets := append(m.tokens(), svc.url, m.link.URL(), "/moil/v1", audio.URL, audio.Headers["Authorization"], transcript.URL)
+	secrets := append(m.tokens(), svc.url, svc.link.URL(), "/moil/v1", audio.URL, audio.Headers["Authorization"], transcript.URL)
 	for _, secret := range secrets {
 		if strings.Contains(string(revealed.Data), secret) {
 			t.Errorf("the script can see %q", secret)
@@ -203,10 +203,10 @@ func TestJobsGoOnlyToEligibleMachines(t *testing.T) {
 	if res := succeed(t, public); res.Machine != bob.ID() {
 		t.Errorf("the job anyone may run ran on %s, not on bob's preferred machine %s", res.Machine, bob.ID())
 	}
-	if bob.link.Heard(meeting.ID()) {
+	if bob.Heard(meeting.ID()) {
 		t.Error("bob's machine heard of alice's meeting")
 	}
-	if !alice.link.Heard(meeting.ID()) || !bob.link.Heard(public.ID()) {
+	if !alice.Heard(meeting.ID()) || !bob.Heard(public.ID()) {
 		t.Error("the machines didn't hear of the jobs they ran")
 	}
 }

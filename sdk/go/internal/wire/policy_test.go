@@ -44,3 +44,49 @@ func TestURLPolicy(t *testing.T) {
 		t.Errorf("loopback http from a remote service: %v", err)
 	}
 }
+
+// The same cases as moil-agent's check of confirmation pages, so that
+// moiltest refuses to pair where machines would.
+func TestCheckPairingPage(t *testing.T) {
+	klisi, local := "https://klisi.example.com/moil", "http://127.0.0.1:8787/moil"
+	for _, c := range []struct {
+		base, page string
+		allowed    bool
+	}{
+		{klisi, "https://klisi.example.com/machines/pair?code=WDJB-MJHT", true},
+		{klisi, "https://KLISI.example.com:443/machines", true},
+		{"https://klisi.example.com/", "https://klisi.example.com", true},
+		{local, "http://127.0.0.1:8787/pair", true},
+		{"http://[::1]:8787/moil", "http://[0:0::1]:8787/pair", true},
+		// A relay, passing on the page of the service it relays to.
+		{"https://evil.example/moil", "https://klisi.example.com/machines/pair?code=WDJB-MJHT", false},
+		// Other hosts, however related.
+		{klisi, "https://machines.klisi.example.com/pair", false},
+		{klisi, "https://example.com/pair", false},
+		{"http://localhost:8787/moil", "http://127.0.0.1:8787/pair", false},
+		// Other ports.
+		{klisi, "https://klisi.example.com:8443/pair", false},
+		{local, "http://127.0.0.1:8788/pair", false},
+		// Other schemes.
+		{klisi, "http://klisi.example.com/pair", false},
+		{local, "https://127.0.0.1:8787/pair", false},
+		// A user name that reads like the service's host.
+		{klisi, "https://klisi.example.com@evil.example/pair", false},
+		{klisi, "https://klisi.example.com:443@evil.example/pair", false},
+		{"https://evil.example/moil", "https://klisi.example.com@evil.example/pair", false},
+		{"https://evil.example/moil", "https://owner:secret@evil.example/pair", false},
+		// Pages that aren't on the web.
+		{klisi, "file:///Applications/Calculator.app", false},
+		{klisi, "javascript:alert(1)", false},
+		{klisi, "/machines/pair", false},
+		{klisi, "", false},
+	} {
+		if err := CheckPairingPage(c.base, c.page); (err == nil) != c.allowed {
+			t.Errorf("CheckPairingPage(%q, %q) = %v, want allowed %v", c.base, c.page, err, c.allowed)
+		}
+	}
+	err := CheckPairingPage("https://evil.example/moil", "https://klisi.example.com/machines/pair")
+	if err == nil || err.Error() != `"https://klisi.example.com/machines/pair" is on https://klisi.example.com:443, not on https://evil.example:443, the origin of the base URL` {
+		t.Errorf("a relayed page: %v", err)
+	}
+}

@@ -327,8 +327,9 @@ func TestPairRequestsAreChecked(t *testing.T) {
 // The service's own confirmation page drives pairing; moiltest can play
 // the machine against it.
 func TestMoiltestPairsThroughTheServicePage(t *testing.T) {
-	srv := newServer(t)
 	mux := http.NewServeMux()
+	site := httptestServer(t, mux)
+	srv := newServer(t, func(c *moil.Config) { c.VerificationURL = site + "/machines/pair" })
 	mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
 	mux.HandleFunc("POST /machines/pair", func(w http.ResponseWriter, r *http.Request) {
 		// A real page would take the owner from the session.
@@ -336,7 +337,6 @@ func TestMoiltestPairsThroughTheServicePage(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 		}
 	})
-	site := httptestServer(t, mux)
 
 	m := moiltest.New(t, site+"/moil", moiltest.WithName("Ada's desktop"))
 	code := m.StartPairing()
@@ -353,5 +353,30 @@ func TestMoiltestPairsThroughTheServicePage(t *testing.T) {
 	m.Connect()
 	if got := machine(t, srv, m.ID()); got.Owner != "alice" || got.Name != "Ada's desktop" || !got.Online() {
 		t.Fatalf("paired machine %+v", got)
+	}
+}
+
+// Like a machine, moiltest refuses to pair when the service's
+// confirmation page isn't on the origin it reaches the service at, so
+// that the service's own tests catch the mistake (spec §4).
+func TestMoiltestRefusesAConfirmationPageElsewhere(t *testing.T) {
+	mux := http.NewServeMux()
+	site := httptestServer(t, mux)
+	srv := newServer(t) // its page is on https://klisi.example.com
+	mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
+
+	want := `moiltest: machines refuse to pair: the confirmation page "https://klisi.example.com/machines/pair" is on https://klisi.example.com:443, not on ` +
+		site + `, the origin of the base URL (spec §4)`
+	tb := &failureRecorder{TB: t}
+	for name, pair := range map[string]func(){
+		"New":     func() { moiltest.New(tb, site+"/moil").StartPairing() },
+		"Pair At": func() { moiltest.Pair(tb, srv, "alice", moiltest.At(site+"/moil")) },
+	} {
+		if got := tb.failure(pair); got != want {
+			t.Errorf("%s failed the test with %q, want %q", name, got, want)
+		}
+	}
+	if ms, _ := srv.Machines(context.Background(), "alice"); len(ms) != 0 {
+		t.Errorf("paired %+v", ms)
 	}
 }
