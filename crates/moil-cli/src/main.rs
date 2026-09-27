@@ -5,8 +5,10 @@
 //! `approve` and `agent`.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use moil_agent::display::reveal;
 
 mod bundle;
 mod machine;
@@ -40,14 +42,47 @@ pub struct Globals {
     pub home: Option<PathBuf>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let globals = Globals { home: cli.home };
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        match cli.command {
-            Command::Bundle(command) => bundle::run(command, &globals).await,
-            Command::Machine(command) => machine::run(command, &globals).await,
+    let ran = tokio::runtime::Runtime::new()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                match cli.command {
+                    Command::Bundle(command) => bundle::run(command, &globals).await,
+                    Command::Machine(command) => machine::run(command, &globals).await,
+                }
+            })
+        });
+    match ran {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", failure(&e));
+            ExitCode::FAILURE
         }
-    })
+    }
+}
+
+/// How a failed command reports `error`, with its causes. Errors can quote
+/// what a service said, so hidden characters are revealed.
+fn failure(error: &anyhow::Error) -> String {
+    format!("Error: {}", reveal(&format!("{error:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failures_reveal_what_a_service_hid_in_them() {
+        let said = moil_agent::Error::Http(
+            "klisi answered 500: \x1b[2J\x1b[Hbundle approved\u{202e}".into(),
+        );
+        let error = anyhow::Error::from(said).context("couldn't review the bundle");
+        assert_eq!(
+            failure(&error),
+            "Error: couldn't review the bundle: klisi answered 500: ␛[2J␛[Hbundle approved\\u{202e}"
+        );
+    }
 }

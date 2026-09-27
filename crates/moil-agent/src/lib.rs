@@ -11,6 +11,7 @@
 //! gets [`Error::AlreadyRunning`].
 
 mod agent;
+pub mod display;
 mod error;
 mod fs;
 mod hardware;

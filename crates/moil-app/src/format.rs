@@ -2,38 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
-/// A download size in decimal units, as Finder shows them: `483.5 MB`.
-pub fn size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
-    if bytes < 1000 {
-        return format!("{bytes} bytes");
-    }
-    let mut value = bytes as f64 / 1000.0;
-    let mut unit = 0;
-    while value >= 999.95 && unit + 1 < UNITS.len() {
-        value /= 1000.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
-}
-
-/// An amount of memory in binary units, as manifests usually mean it:
-/// `8 GiB`, `1.5 GiB`.
-pub fn memory(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} bytes");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    let rounded = format!("{value:.1}");
-    let rounded = rounded.strip_suffix(".0").unwrap_or(&rounded);
-    format!("{rounded} {}", UNITS[unit])
-}
+pub use moil_agent::display::{memory, size};
 
 /// A job's progress as a whole percentage, rounded down so that it never
 /// reads 100% before the job is done. `None` for a meaningless fraction.
@@ -99,13 +68,13 @@ pub fn count(n: usize, noun: &str) -> String {
 
 /// Text from a service, made fit for a menu or a window title: one line of
 /// at most `max` characters, without the characters that are invisible or
-/// reorder text (see [`crate::page`]).
+/// reorder text ([`moil_agent::display::is_hidden`]).
 pub fn one_line(text: &str, max: usize) -> String {
     let mut out = String::new();
     let mut chars = text
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|&c| !crate::page::is_hidden(c));
+        .filter(|&c| !moil_agent::display::is_hidden(c));
     for c in chars.by_ref().take(max) {
         out.push(c);
     }
@@ -119,25 +88,6 @@ pub fn one_line(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sizes_read_like_finder() {
-        assert_eq!(size(5), "5 bytes");
-        assert_eq!(size(2370), "2.4 KB");
-        assert_eq!(size(483_546_902), "483.5 MB");
-        assert_eq!(size(999_999), "1.0 MB", "never `1000.0 KB`");
-        assert_eq!(size(532_462_568), "532.5 MB");
-        assert_eq!(size(u64::MAX), "18446.7 PB");
-    }
-
-    #[test]
-    fn memory_uses_binary_units_without_needless_decimals() {
-        assert_eq!(memory(8 << 30), "8 GiB");
-        assert_eq!(memory(6_442_450_944), "6 GiB");
-        assert_eq!(memory(1536 << 20), "1.5 GiB");
-        assert_eq!(memory(512 << 20), "512 MiB");
-        assert_eq!(memory(100), "100 bytes");
-    }
 
     #[test]
     fn percent_never_claims_completion_early() {
