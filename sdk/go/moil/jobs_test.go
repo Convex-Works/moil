@@ -632,6 +632,204 @@ func TestPrepareEndsWhenItsMachineLeaves(t *testing.T) {
 	}
 }
 
+// A heldCall is one call of a Job.Prepare made by heldPrepare, waiting for
+// the test to release it.
+type heldCall struct {
+	moil.Assignment
+	release chan struct{}
+}
+
+// heldPrepare returns a Job.Prepare that hands each call to the test on
+// calls, then waits until the test closes its release channel or ctx ends.
+func heldPrepare(calls chan<- heldCall) func(context.Context, moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+	return func(ctx context.Context, a moil.Assignment) (map[string]moil.Download, map[string]moil.Upload, error) {
+		c := heldCall{Assignment: a, release: make(chan struct{})}
+		select {
+		case calls <- c:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+		select {
+		case <-c.release:
+			return nil, nil, nil
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+}
+
+// nextCall waits for the next call of a heldPrepare, and returns false if
+// the run ended instead.
+func nextCall(t *testing.T, calls <-chan heldCall, run *moil.Run) (heldCall, bool) {
+	t.Helper()
+	select {
+	case c := <-calls:
+		return c, true
+	case <-run.Done():
+		return heldCall{}, false
+	case <-time.After(10 * time.Second):
+		t.Fatalf("waited 10s for Prepare or the end of run %s", run.ID())
+		return heldCall{}, false
+	}
+}
+
+// givenUp waits until the run has retried n attempts, or ended.
+func givenUp(t *testing.T, run *moil.Run, n int) {
+	t.Helper()
+	eventually(t, fmt.Sprintf("attempt %d to be given up", n), func() bool {
+		select {
+		case <-run.Done():
+			return true
+		default:
+			return len(retries(eventsSoFar(run))) >= n
+		}
+	})
+}
+
+// A backOut is a way a machine that bid can back out of the attempt while
+// Job.Prepare makes it, with the refusal the service charges it with.
+type backOut struct {
+	name string
+	code moil.ErrorCode
+}
+
+var backOuts = []backOut{
+	{"paused", moil.CodeBusy},
+	{"busy elsewhere", moil.CodeBusy},
+	{"approval withdrawn", moil.CodeNotApproved},
+	{"disconnected", moil.CodeBusy},
+}
+
+// out backs the machine out, and returns once the service has seen it.
+func (b backOut) out(t *testing.T, srv *moil.Server, m *moiltest.Machine, bundle *moil.Bundle) {
+	t.Helper()
+	switch b.name {
+	case "paused":
+		m.SetState(moil.Paused)
+	case "busy elsewhere":
+		m.SetState(moil.Busy)
+	case "approval withdrawn":
+		m.Revoke(bundle)
+	case "disconnected":
+		m.Disconnect()
+		eventually(t, "the service to see the machine leave", func() bool { return !machine(t, srv, m.ID()).Online() })
+		return
+	}
+	m.Sync()
+}
+
+// in brings the machine back, ready for the job again.
+func (b backOut) in(m *moiltest.Machine, bundle *moil.Bundle) {
+	switch b.name {
+	case "approval withdrawn":
+		m.Approve(bundle)
+	case "disconnected":
+		m.Connect()
+	default:
+		m.SetState(moil.Idle)
+	}
+}
+
+// A machine that backs out once while Prepare makes its attempt costs the
+// job nothing: the attempt never reached it, so like one it refused, it
+// doesn't count toward MaxAttempts, and the job runs when the machine is
+// back.
+func TestBackingOutDuringPrepareOnceCostsNothing(t *testing.T) {
+	for _, back := range backOuts {
+		t.Run(back.name, func(t *testing.T) {
+			srv := newServer(t, func(c *moil.Config) { c.MaxAttempts = 1 })
+			bundle := loadBundle(t, srv, "minimal")
+			m := moiltest.Pair(t, srv, "alice")
+			m.Approve(bundle)
+			m.Connect()
+			calls := make(chan heldCall)
+			run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: heldPrepare(calls)})
+
+			first, ok := nextCall(t, calls, run)
+			if !ok {
+				t.Fatal("the job ended before Prepare ran")
+			}
+			back.out(t, srv, m, bundle)
+			close(first.release)
+			givenUp(t, run, 1)
+			back.in(m, bundle)
+
+			second, ok := nextCall(t, calls, run)
+			if !ok {
+				_, err := wait(t, run)
+				t.Fatalf("the job ended after the machine backed out once: %v", err)
+			}
+			if second.Attempt != 2 || second.Machine.ID != m.ID() {
+				t.Fatalf("prepared attempt %d for %s", second.Attempt, second.Machine.ID)
+			}
+			close(second.release)
+			a := m.NextAttempt()
+			if a.Number != 2 {
+				t.Fatalf("attempt %d assigned, want 2", a.Number)
+			}
+			a.Succeed(nil)
+			if res := succeeded(t, run); res.Attempt != 2 {
+				t.Fatalf("result from attempt %d", res.Attempt)
+			}
+			evs := events(t, run)
+			if got := retries(evs); !slices.Equal(got, []moil.ErrorCode{back.code}) {
+				t.Fatalf("retries %v, want [%s]", got, back.code)
+			}
+			for _, ev := range evs {
+				if ev.Kind == moil.EventRetrying && (ev.Attempt != 1 || ev.Machine != m.ID() || ev.Err.Attempt != 1 || ev.Err.Machine != m.ID()) {
+					t.Fatalf("retrying event %+v, error %+v; want attempt 1 on %s", ev, ev.Err, m.ID())
+				}
+			}
+		})
+	}
+}
+
+// A machine that keeps bidding and then backing out while Prepare makes
+// its attempt can't make Prepare run forever: the job fails after ten such
+// attempts, as it does after ten refusals, with the last one's error.
+func TestMachinesCantBackOutDuringPrepareForever(t *testing.T) {
+	for _, back := range backOuts {
+		t.Run(back.name, func(t *testing.T) {
+			srv := newServer(t, func(c *moil.Config) { c.MaxAttempts = 1 })
+			bundle := loadBundle(t, srv, "minimal")
+			m := moiltest.Pair(t, srv, "alice")
+			m.Approve(bundle)
+			m.Connect()
+			calls := make(chan heldCall)
+			run := submit(t, srv, moil.Job{Bundle: bundle, Eligible: moil.AnyMachine, Prepare: heldPrepare(calls)})
+			prepared := 0
+			for {
+				c, ok := nextCall(t, calls, run)
+				if !ok {
+					break
+				}
+				prepared++
+				if prepared > 20 {
+					t.Fatal("Prepare ran 20 times for a machine that backs out of every attempt")
+				}
+				if c.Attempt != prepared {
+					t.Fatalf("prepared attempt %d, want %d", c.Attempt, prepared)
+				}
+				back.out(t, srv, m, bundle)
+				close(c.release)
+				givenUp(t, run, prepared)
+				back.in(m, bundle)
+			}
+			if prepared != 10 {
+				t.Fatalf("Prepare ran %d times, want 10", prepared)
+			}
+			_, err := wait(t, run)
+			var jerr *moil.JobError
+			if !errors.As(err, &jerr) || jerr.Code != back.code || !jerr.Retryable || jerr.Attempt != 10 || jerr.Machine != m.ID() || run.State() != moil.Failed {
+				t.Fatalf("err = %#v, state %s; want attempt 10's %s", err, run.State(), back.code)
+			}
+			if n := len(retries(events(t, run))); n != 9 {
+				t.Fatalf("%d attempts were retried, want 9", n)
+			}
+		})
+	}
+}
+
 // Prepare can ask for another try, as when storage is briefly down; the
 // job goes back to the queue, and the tries count toward MaxAttempts.
 func TestPrepareCanRetry(t *testing.T) {

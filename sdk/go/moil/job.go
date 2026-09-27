@@ -44,6 +44,19 @@ type Job struct {
 	// machine again. Server.Close waits for Prepare, so return soon after
 	// ctx ends.
 	//
+	// The machine isn't bound by its bid. If it leaves while Prepare runs,
+	// or has reported busy or paused, or withdrawn its approval of the
+	// bundle, by the time Prepare returns, the attempt is given up unsent
+	// and the job waits for a machine again, as after a refusal: the
+	// attempt doesn't count toward MaxAttempts, but a job fails after 10
+	// attempts that never started (see Config.MaxAttempts). One machine
+	// backing out costs the job nothing, and one that keeps bidding and
+	// backing out can't make Prepare run forever: it runs at most
+	// MaxAttempts + 9 times per run, not counting attempts given up
+	// because Eligible turned their machine away meanwhile. Not every
+	// attempt Prepare makes reaches a machine, then; EventAssigned says
+	// which did.
+	//
 	// A *JobError with Retryable set puts the job back in the queue, as a
 	// failed attempt that counts toward MaxAttempts; any other error ends
 	// the job, and Run.Wait returns it.
@@ -133,8 +146,10 @@ func (c ErrorCode) Retryable() bool {
 }
 
 // NeverStarted reports whether the machine refused the attempt before
-// starting it because it was busy or lacked the bundle (spec §7.2). Such
-// attempts don't count toward a job's attempt limit.
+// starting it because it was busy or lacked the bundle (spec §7.2), or
+// backed out of it for one of those reasons, or by leaving, while
+// Job.Prepare made it. Such attempts don't count toward a job's attempt
+// limit (see Config.MaxAttempts).
 func (c ErrorCode) NeverStarted() bool { return c == CodeBusy || c == CodeNotApproved }
 
 // A JobError is why an attempt failed. Run.Wait returns the last attempt's

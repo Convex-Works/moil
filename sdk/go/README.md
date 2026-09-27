@@ -176,7 +176,9 @@ res, err := run.Wait(ctx)
   `Prepare` instead of `Inputs` and `Outputs`: it makes each attempt's URLs
   as the attempt is assigned. A `*moil.JobError` with `Retryable` set
   tries again later, counting toward `MaxAttempts`; any other error ends
-  the job.
+  the job. If the machine leaves, pauses, goes busy or withdraws its
+  approval while `Prepare` runs, the attempt is given up unsent, like one
+  the machine refused.
 - **JSON values, not bytes.** `Params`, `ev.Data` and `Result.Meta` reach
   the other side as the same JSON value, but machines re-encode them, so
   key order, whitespace and the spelling of numbers may change. Keep them
@@ -198,8 +200,9 @@ res, err := run.Wait(ctx)
 - **Leases and retries.** An attempt whose machine goes quiet for
   `LeaseTTL` fails with `lease_expired`; a machine that restarts without its
   attempt loses it (`lost`). Retryable failures are retried up to
-  `MaxAttempts`, not counting attempts machines refused before starting
-  them, of which a job tolerates ten.
+  `MaxAttempts`, not counting attempts that never started, because
+  machines refused them or backed out while `Prepare` ran; a job
+  tolerates ten of those.
 - `run.Cancel()` stops a job: at once if it's waiting or its machine is
   offline, otherwise when the machine confirms. It ends as cancelled
   unless its attempt succeeded before the machine saw the request. A

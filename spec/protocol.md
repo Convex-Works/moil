@@ -545,7 +545,13 @@ service it is connected to. If the checks fail it immediately sends a
 `done` with outcome `failed` and code `busy` (also when the machine is
 paused) or `not_approved`. Those two
 codes mean the attempt never started, so services SHOULD NOT count it
-toward their retry limit.
+toward their retry limit. They SHOULD still bound how many such attempts
+a job may have, so that a machine that keeps bidding and refusing can't
+hold a job forever. A service that finds, before sending `assign`, that
+the machine that won the bid has since disconnected, or reported a state
+or approvals under which it would refuse, MAY give up the attempt without
+sending it, and count it as a refusal: `not_approved` if the machine
+withdrew its approval, otherwise `busy`.
 
 If the machine can read an `assign`'s `job_id` and `attempt` but not the
 rest of it (for example `params` beyond the limits of §10), it sends a
