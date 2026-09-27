@@ -39,10 +39,10 @@ type Job struct {
 	// attempt is assigned, instead of Inputs and Outputs. Use it for
 	// pre-signed URLs, which could expire while the job waits for a
 	// machine or between attempts. It runs on its own goroutine before the
-	// machine hears of the attempt, which holds the machine for the job.
-	// ctx ends if the job ends or the machine leaves, and the job then
-	// waits for a machine again. Server.Close waits for Prepare to
-	// return, so return soon after ctx ends.
+	// machine hears of the attempt, holding the machine for the job. ctx
+	// ends if the job ends or the machine leaves; the job then waits for a
+	// machine again. Server.Close waits for Prepare, so return soon after
+	// ctx ends.
 	//
 	// A *JobError with Retryable set puts the job back in the queue, as a
 	// failed attempt that counts toward MaxAttempts; any other error ends
@@ -78,13 +78,15 @@ type Assignment struct {
 }
 
 // A Download is where the runtime fetches an input from, with GET. URLs are
-// typically pre-signed; they must stay valid until the job runs.
+// typically pre-signed; they must stay valid until the job runs. Machines
+// take https URLs, and http ones only as Config.AllowInsecureHTTP says.
 type Download struct {
 	URL     string
 	Headers map[string]string
 }
 
-// An Upload is where the runtime sends an output to.
+// An Upload is where the runtime sends an output to, with the same rules
+// for URLs as a Download.
 type Upload struct {
 	URL string
 	// Method is "PUT" (the default when empty) or "POST".
