@@ -88,10 +88,10 @@ pub(crate) fn open_output(out_dir: &Path, name: &FileName) -> Result<std::fs::Fi
     }
 }
 
-/// Removes the directory tree at `path`, if there is one, even if the
-/// script made parts of it read-only. Never follows symlinks, so linked
+/// Removes the directory tree at `path`, if there is one, even if a script
+/// made parts of it read-only. Never follows symbolic links, so linked
 /// assets stay in the cache.
-pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
+pub fn remove_tree(path: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {

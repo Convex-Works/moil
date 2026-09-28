@@ -127,6 +127,7 @@ impl Harness {
                 loopback_http: true,
                 any_http: false,
             },
+            hand_off: None,
         }
     }
 

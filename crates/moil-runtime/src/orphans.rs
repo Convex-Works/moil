@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use moil_proto::JobId;
 use serde::{Deserialize, Serialize};
 
-use crate::sys::{self, SIGKILL};
+use crate::process::Process;
 use crate::workdir::remove_tree;
 
 /// Where records live, inside the jobs directory. Job IDs can't start with
@@ -27,26 +27,6 @@ struct Record {
     work_dir: PathBuf,
     supervisor: Process,
     group: Option<Process>,
-}
-
-/// A process, told apart from any later process with the same pid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Process {
-    pid: i32,
-    started: String,
-}
-
-impl Process {
-    fn of(pid: i32) -> Option<Self> {
-        Some(Self {
-            pid,
-            started: sys::start_token(pid)?,
-        })
-    }
-
-    fn is_running(&self) -> bool {
-        sys::start_token(self.pid).as_deref() == Some(&self.started)
-    }
 }
 
 /// A running attempt's footprint on disk: its record and its working
@@ -69,8 +49,8 @@ impl Registration {
         work_dir: PathBuf,
         keep_work_dir: bool,
     ) -> io::Result<Self> {
-        let supervisor = Process::of(std::process::id() as i32)
-            .ok_or_else(|| io::Error::other("couldn't identify this process"))?;
+        let supervisor =
+            Process::current().ok_or_else(|| io::Error::other("couldn't identify this process"))?;
         let dir = jobs_dir.join(RECORDS);
         std::fs::create_dir_all(&dir)?;
         let registration = Self {
@@ -88,15 +68,9 @@ impl Registration {
         Ok(registration)
     }
 
-    /// Records the script's process group, led by `pgid`.
-    pub fn set_group(&mut self, pgid: i32) -> io::Result<()> {
-        self.record.group = Some(Process {
-            pid: pgid,
-            // Empty if the leader has already exited, which matches no
-            // process: the group is then treated like one whose leader is
-            // gone.
-            started: sys::start_token(pgid).unwrap_or_default(),
-        });
+    /// Records the script's process group, which `leader` leads.
+    pub fn set_group(&mut self, leader: Process) -> io::Result<()> {
+        self.record.group = Some(leader);
         self.save()
     }
 
@@ -169,7 +143,7 @@ fn reap_one(path: &Path, jobs_dir: &Path, keep_work_dirs: bool) -> io::Result<bo
         return Ok(false);
     }
     if let Some(group) = &record.group {
-        kill_group(group)?;
+        group.kill_group()?;
     }
     // Only ever delete inside the jobs directory, whatever the record says.
     let inside = record
@@ -188,23 +162,10 @@ fn reap_one(path: &Path, jobs_dir: &Path, keep_work_dirs: bool) -> io::Result<bo
     Ok(true)
 }
 
-/// Kills what's left of the process group `group` led.
-fn kill_group(group: &Process) -> io::Result<()> {
-    match sys::start_token(group.pid) {
-        // The leader still runs: the group is certainly this attempt's.
-        Some(started) if started == group.started => sys::signal_group(group.pid, SIGKILL),
-        // The pid now belongs to an unrelated process: leave it alone.
-        Some(_) => Ok(()),
-        // The leader is gone. The OS doesn't reuse a group ID while any
-        // process is still in the group, so whatever is in it is left over
-        // from this attempt.
-        None => sys::signal_group(group.pid, SIGKILL),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys::{self, SIGKILL};
     use std::os::unix::process::CommandExt;
 
     /// A `sleep` leading its own process group, like a script would.
