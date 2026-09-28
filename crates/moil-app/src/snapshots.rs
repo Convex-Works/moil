@@ -1,4 +1,5 @@
-//! The agent's snapshots, taken by the event loop when it gets to them.
+//! The agent's snapshots, and the home's reports, taken by the event loop
+//! when it gets to them.
 //!
 //! A script reporting progress in a tight loop changes the snapshot far
 //! more often than the tray can be redrawn. Waking the event loop once per
@@ -12,20 +13,20 @@ use moil_agent::Snapshot;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
-/// The latest snapshot, for the event loop.
+/// The latest snapshot, or other watched value, for the event loop.
 #[derive(Debug)]
-pub struct Snapshots {
-    latest: watch::Receiver<Snapshot>,
+pub struct Snapshots<T = Snapshot> {
+    latest: watch::Receiver<T>,
     /// Whether the event loop was woken and hasn't taken the snapshot yet.
     woken: Arc<AtomicBool>,
 }
 
-impl Snapshots {
+impl<T: Clone + Send + Sync + 'static> Snapshots<T> {
     /// Watches `snapshots` on `runtime`, calling `wake` when there is a new
     /// one to [`take`](Self::take), and not again until it has been taken.
     /// `wake` returns false once there's no one left to wake.
     pub fn watch(
-        snapshots: watch::Receiver<Snapshot>,
+        snapshots: watch::Receiver<T>,
         runtime: &Handle,
         wake: impl Fn() -> bool + Send + 'static,
     ) -> Self {
@@ -46,7 +47,7 @@ impl Snapshots {
     }
 
     /// The latest snapshot. A change after this wakes the event loop again.
-    pub fn take(&mut self) -> Snapshot {
+    pub fn take(&mut self) -> T {
         self.woken.store(false, Ordering::SeqCst);
         self.latest.borrow_and_update().clone()
     }
@@ -63,7 +64,7 @@ mod tests {
         let (agent, snapshots) = watch::channel(Snapshot::default());
         let wakes = Arc::new(AtomicUsize::new(0));
         let counted = wakes.clone();
-        let mut snapshots = Snapshots::watch(snapshots, &Handle::current(), move || {
+        let mut snapshots: Snapshots = Snapshots::watch(snapshots, &Handle::current(), move || {
             counted.fetch_add(1, Ordering::SeqCst);
             true
         });

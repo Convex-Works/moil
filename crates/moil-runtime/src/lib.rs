@@ -434,7 +434,7 @@ impl Executor for Runtime {
 }
 
 /// Finds the uv binary: `$MOIL_UV`, then next to the current executable (as
-/// in the macOS app bundle), then on `PATH`.
+/// in the macOS app bundle, also when a link leads there), then on `PATH`.
 pub fn find_uv() -> Option<PathBuf> {
     uv::locate(
         std::env::var_os("MOIL_UV"),

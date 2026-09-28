@@ -102,8 +102,8 @@ impl UnpairWindow {
                     }
                 }
                 p.hint {
-                    "To forget " (name) " altogether, delete its folder in moil's home once it's \
-                     unpaired."
+                    "To forget " (name) " altogether once it's unpaired, choose Open moil Folder \
+                     in the menu and delete " code { "services/" (self.service.as_str()) } "."
                 }
                 @if let Some(error) = &self.error {
                     div.callout.bad { (page::icon::error()) div { p.message { (visible(error)) } } }
@@ -161,6 +161,10 @@ mod tests {
         assert!(page.contains(r#"<a href="https://klisi.example.com/moil">"#));
         assert!(page.contains("forgets its token."));
         assert!(page.contains("The 2 bundles you approved for it stay approved"));
+        assert!(
+            page.contains("choose Open moil Folder in the menu and delete <code>services/klisi.example.com</code>"),
+            "where to forget it altogether"
+        );
     }
 
     #[test]

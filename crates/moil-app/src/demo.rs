@@ -5,22 +5,27 @@
 //! 0.3.0 to replace the approved 0.2.0 (so the review shows a diff), and
 //! lab, which keeps failing to connect. Jobs for klisi come and go through
 //! every phase, and one in three runs out of GPU memory; stopping one
-//! takes a moment, as a real script's would. Pairing with any address
+//! takes a moment, as a real script's would. klisi has a hook for
+//! transcribe; lab has one for minimal that isn't executable, which is a
+//! problem with the home until lab is unpaired. Pairing with any address
 //! succeeds after a few seconds with the code WDJB-MJHT, unless its host
 //! starts with `deny`.
 //!
 //! The transcribe bundles are real: their lockfiles come from
 //! `uv lock --script`, and their assets' hashes from Hugging Face.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use moil_agent::control::VERSION;
+use moil_agent::report::{AgentInfo, HookReport, Host, Problem, ServiceReport, Status};
 use moil_agent::services::parse_base_url;
 use moil_agent::{
-    Approval, BundleStatus, Connection, Error, JobOutcome, JobReport, JobStatus, Review, Service,
-    ServiceId, ServiceStatus, Snapshot,
+    Approval, BundleStatus, Connection, Error, Home, JobOutcome, JobReport, JobStatus, Review,
+    Service, ServiceId, ServiceStatus, Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::{BundleHash, BundleInfo, ErrorCode, JobId, Phase, UrlPolicy};
@@ -29,6 +34,12 @@ use tokio::time::sleep;
 use url::Url;
 
 use crate::backend::{Backend, Pairing, PairingCode, Result};
+
+/// The demo's home: a folder of its own, apart from the real home, which
+/// holds only the demo's log.
+pub fn home() -> PathBuf {
+    std::env::temp_dir().join("moil-demo")
+}
 
 /// transcribe 0.2.0, the version the demo's owner approved weeks ago.
 pub fn transcribe_0_2() -> Bundle {
@@ -104,6 +115,9 @@ struct State {
     /// The bundle the running job runs.
     running: Mutex<Option<BundleHash>>,
     bundles: Vec<Bundle>,
+    home: PathBuf,
+    /// The owner's hooks, by service. The demo never runs them.
+    hooks: Vec<(ServiceId, HookReport)>,
 }
 
 impl Demo {
@@ -167,12 +181,29 @@ impl Demo {
             }),
         };
         let (klisi_id, lab_id) = (klisi.id.clone(), lab.id.clone());
+        let root = home();
+        let hook = |service: &ServiceId, bundle: &str, runnable| {
+            let home = Home::new(&root);
+            let hook = HookReport {
+                bundle: bundle.into(),
+                path: home.hook(service, bundle),
+                log: home.hook_log(service, bundle),
+                runnable,
+            };
+            (service.clone(), hook)
+        };
+        let hooks = vec![
+            hook(&klisi_id, "transcribe", true),
+            hook(&lab_id, "minimal", false),
+        ];
         let state = Arc::new(State {
             snapshot: watch::Sender::new(snapshot),
             paired: Mutex::new(vec![klisi, lab]),
             stop: watch::Sender::new(false),
             running: Mutex::new(None),
             bundles: vec![v2, v3, minimal],
+            home: root,
+            hooks,
         });
         tokio::spawn(state.clone().run_jobs(klisi_id));
         tokio::spawn(state.clone().keep_reconnecting(lab_id));
@@ -439,6 +470,55 @@ impl State {
         self.update(|s| s.services.retain(|s| s.id != *id));
     }
 
+    /// What `moil status` would report of the paired services and their
+    /// hooks. The app takes the rest from the snapshot.
+    fn status(&self) -> Status {
+        let paired = self.paired.lock().expect("the demo's state").clone();
+        let hooks = |id: &ServiceId| -> Vec<HookReport> {
+            let hooks = self.hooks.iter().filter(|(service, _)| service == id);
+            hooks.map(|(_, hook)| hook.clone()).collect()
+        };
+        let services: Vec<ServiceReport> = paired
+            .iter()
+            .map(|service| ServiceReport {
+                id: service.id.clone(),
+                name: service.name.clone(),
+                base_url: service.base_url.clone(),
+                paired: true,
+                connection: None,
+                approvals: service.approvals.clone(),
+                offered: None,
+                hooks: hooks(&service.id),
+            })
+            .collect();
+        let problems = services
+            .iter()
+            .flat_map(|service| &service.hooks)
+            .filter(|hook| !hook.runnable)
+            .map(|hook| Problem {
+                path: hook
+                    .path
+                    .strip_prefix(&self.home)
+                    .unwrap_or(&hook.path)
+                    .to_owned(),
+                message: "moil can't run this hook: it isn't executable. Run chmod +x on it."
+                    .into(),
+            })
+            .collect();
+        Status {
+            home: self.home.clone(),
+            agent: Some(AgentInfo {
+                host: Host::App,
+                version: VERSION.to_owned(),
+            }),
+            paused: self.snapshot.borrow().paused,
+            job: None,
+            last_job: None,
+            services,
+            problems,
+        }
+    }
+
     fn change_service(&self, id: &ServiceId, change: impl FnOnce(&mut Service)) -> Result<()> {
         let mut paired = self.paired.lock().expect("the demo's state");
         let service = paired
@@ -476,6 +556,14 @@ fn status(service: &Service, connection: Connection, bundles: &[&Bundle]) -> Ser
 impl Backend for Demo {
     fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.0.snapshot.subscribe()
+    }
+
+    fn home(&self) -> PathBuf {
+        self.0.home.clone()
+    }
+
+    fn status(&self) -> BoxFuture<'_, Result<Status>> {
+        async move { Ok(self.0.status()) }.boxed()
     }
 
     fn pair(&self, base_url: String) -> BoxFuture<'_, Result<Pairing>> {
@@ -739,6 +827,36 @@ mod tests {
 
         demo.revoke(klisi, transcribe_0_3().hash()).await.unwrap();
         assert_eq!(snapshot(&demo).pending_reviews().count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn labs_hook_is_a_problem_until_lab_is_unpaired() {
+        let demo = Demo::start();
+        let status = demo.status().await.unwrap();
+        let hooks: Vec<_> = status
+            .services
+            .iter()
+            .flat_map(|s| {
+                s.hooks
+                    .iter()
+                    .map(|h| (s.name.as_str(), &*h.bundle, h.runnable))
+            })
+            .collect();
+        assert_eq!(
+            hooks,
+            [("klisi", "transcribe", true), ("lab", "minimal", false)]
+        );
+        let problems: Vec<_> = status.problems.iter().map(|p| &p.path).collect();
+        assert_eq!(
+            problems,
+            [&PathBuf::from("services/lab.example.org/hooks/minimal")]
+        );
+        assert!(status.services[0].hooks[0].path.starts_with(home()));
+
+        demo.unpair("lab.example.org".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(demo.status().await.unwrap().problems.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

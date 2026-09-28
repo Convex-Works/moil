@@ -255,6 +255,9 @@ pub(crate) fn locate(
     if let Some(explicit) = explicit.filter(|p| !p.is_empty()) {
         return Some(explicit.into());
     }
+    // Where the executable really is: `moil` often runs through a link,
+    // such as the one the app puts on the PATH.
+    let exe = exe.map(|exe| exe.canonicalize().unwrap_or(exe));
     let beside_exe = exe
         .as_deref()
         .and_then(Path::parent)
@@ -315,6 +318,21 @@ mod tests {
             Some(installed)
         );
         assert_eq!(locate(None, exe.map(|_| empty.join("moil")), None), None);
+    }
+
+    #[test]
+    fn uv_is_found_beside_the_executable_a_link_leads_to() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("Moil.app/Contents/MacOS");
+        let bundled = fake_uv(&app);
+        std::fs::write(app.join("moil"), "").unwrap();
+        let on_path = root.path().join("home/.local/bin");
+        std::fs::create_dir_all(&on_path).unwrap();
+        std::os::unix::fs::symlink(app.join("moil"), on_path.join("moil")).unwrap();
+        assert_eq!(
+            locate(None, Some(on_path.join("moil")), None),
+            Some(bundled.canonicalize().unwrap())
+        );
     }
 
     #[test]

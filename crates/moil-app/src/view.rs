@@ -1,10 +1,12 @@
 //! What the tray shows, as plain data: [`TrayView::new`] turns the agent's
-//! [`Snapshot`] into the menu, the icon's state and the title beside it.
-//! The `tray` module makes it real; everything here is pure.
+//! [`Snapshot`] and the home's report into the menu, the icon's state and
+//! the title beside it. The `tray` module makes it real; everything here is
+//! pure.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime};
 
+use moil_agent::report::{HookReport, Problem};
 use moil_agent::{
     Connection, JobOutcome, JobReport, JobStatus, ServiceId, ServiceStatus, Snapshot,
 };
@@ -12,6 +14,10 @@ use moil_proto::{BundleHash, Phase};
 use url::Url;
 
 use crate::format;
+use crate::reports::HomeReport;
+
+/// The most problems the menu names; `moil status` has them all.
+const MAX_PROBLEMS: usize = 8;
 
 /// Everything the tray shows.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,13 +47,16 @@ pub struct ViewContext<'a> {
     /// Reviews the owner put off with "Not now". They stay in the menu but
     /// no longer ask for attention.
     pub deferred: &'a HashSet<(ServiceId, BundleHash)>,
+    /// The home's hooks and problems, which the snapshot doesn't have.
+    pub home: &'a HomeReport,
 }
 
 /// The icon: what the machine is doing, and whether the owner is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IconState {
     pub activity: Activity,
-    /// A bundle waits for review, or a service needs pairing again.
+    /// A bundle waits for review, a service needs pairing again, or
+    /// something in the home needs fixing.
     pub attention: bool,
 }
 
@@ -111,6 +120,8 @@ pub enum Action {
     },
     Unpair(ServiceId),
     ToggleOpenAtLogin,
+    /// Open the home in Finder.
+    OpenHome,
     /// Show the log file in Finder.
     ShowLog,
     Quit,
@@ -213,7 +224,7 @@ impl TrayView {
     pub fn new(snapshot: &Snapshot, cx: &ViewContext<'_>) -> Self {
         let status = status(snapshot);
         Self {
-            icon: IconState::new(snapshot, cx.deferred),
+            icon: IconState::new(snapshot, cx),
             title: snapshot
                 .job
                 .as_ref()
@@ -228,22 +239,23 @@ impl TrayView {
 }
 
 impl IconState {
-    pub fn new(snapshot: &Snapshot, deferred: &HashSet<(ServiceId, BundleHash)>) -> Self {
+    pub fn new(snapshot: &Snapshot, cx: &ViewContext<'_>) -> Self {
         let activity = match (&snapshot.job, snapshot.paused) {
             (Some(_), _) => Activity::Running,
             (None, true) => Activity::Paused,
             (None, false) => Activity::Idle,
         };
-        let review_waiting = snapshot
-            .pending_reviews()
-            .any(|(service, bundle)| !deferred.contains(&(service.id.clone(), bundle.info.hash)));
+        let review_waiting = snapshot.pending_reviews().any(|(service, bundle)| {
+            !cx.deferred
+                .contains(&(service.id.clone(), bundle.info.hash))
+        });
         let service_lost = snapshot
             .services
             .iter()
             .any(|s| matches!(s.connection, Connection::Unpaired | Connection::Replaced));
         Self {
             activity,
-            attention: review_waiting || service_lost,
+            attention: review_waiting || service_lost || !cx.home.problems.is_empty(),
         }
     }
 }
@@ -345,6 +357,16 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
     if let Some(report) = &snapshot.last_job {
         entries.push(Text(last_job(snapshot, report, cx.clock)));
     }
+    let problems = &cx.home.problems;
+    if !problems.is_empty() {
+        entries.push(Submenu {
+            label: Label::new(format!(
+                "{} in moil's home",
+                format::count(problems.len(), "problem")
+            )),
+            entries: problems_menu(problems),
+        });
+    }
 
     entries.push(Separator);
     if snapshot.services.is_empty() {
@@ -357,7 +379,7 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         entries.push(Submenu {
             label: Label::new(format::one_line(&service.name, 32))
                 .with_detail(host(&service.base_url)),
-            entries: service_menu(service, cx.now),
+            entries: service_menu(service, cx.home.hooks(&service.id), cx.now),
         });
         entries.push(Text(Label::quiet(connection(&service.connection, cx.now))));
         for bundle in service.bundles.iter().filter(|b| !b.approved) {
@@ -400,6 +422,10 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         enabled: cx.open_at_login.is_some(),
         action: Action::ToggleOpenAtLogin,
     });
+    entries.push(Entry::item(
+        Label::new("Open moil Folder"),
+        Action::OpenHome,
+    ));
     if cx.has_log {
         entries.push(Entry::item(
             Label::new("Show Log in Finder"),
@@ -410,8 +436,30 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
     MenuModel { entries }
 }
 
-/// A service's submenu: where it is, its bundles, and unpairing.
-fn service_menu(service: &ServiceStatus, now: Instant) -> Vec<Entry> {
+/// What's wrong with the home, in brief: the files concerned, and where to
+/// read what to do about them.
+fn problems_menu(problems: &[Problem]) -> Vec<Entry> {
+    use Entry::*;
+    let mut entries: Vec<Entry> = problems
+        .iter()
+        .take(MAX_PROBLEMS)
+        .map(|p| Text(Label::new(format::one_line(&p.path.to_string_lossy(), 80))))
+        .collect();
+    if problems.len() > MAX_PROBLEMS {
+        let more = problems.len() - MAX_PROBLEMS;
+        entries.push(Text(Label::quiet(format!("and {more} more"))));
+    }
+    entries.push(Separator);
+    entries.push(Text(Label::quiet("Run “moil status” for details")));
+    entries.push(Entry::item(
+        Label::new("Open moil Folder"),
+        Action::OpenHome,
+    ));
+    entries
+}
+
+/// A service's submenu: where it is, its bundles, its hooks, and unpairing.
+fn service_menu(service: &ServiceStatus, hooks: &[HookReport], now: Instant) -> Vec<Entry> {
     use Entry::*;
     let mut entries = vec![
         Text(Label::quiet(format::one_line(
@@ -444,6 +492,17 @@ fn service_menu(service: &ServiceStatus, now: Instant) -> Vec<Entry> {
                 hash: bundle.info.hash,
             },
         ));
+    }
+    if !hooks.is_empty() {
+        entries.push(Separator);
+    }
+    for hook in hooks {
+        let label = format!("Hook for {}", format::one_line(&hook.bundle, 32));
+        entries.push(Text(if hook.runnable {
+            Label::quiet(label)
+        } else {
+            Label::new(label).with_detail("moil can't run it")
+        }));
     }
     entries.push(Separator);
     entries.push(Entry::item(
@@ -585,6 +644,23 @@ mod tests {
         }
     }
 
+    fn hook(bundle: &str, runnable: bool) -> HookReport {
+        let service = "/Users/ada/.moil/services/klisi.example.com";
+        HookReport {
+            bundle: bundle.into(),
+            path: format!("{service}/hooks/{bundle}").into(),
+            log: format!("{service}/logs/{bundle}.log").into(),
+            runnable,
+        }
+    }
+
+    fn problem(path: &str) -> Problem {
+        Problem {
+            path: path.into(),
+            message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
+        }
+    }
+
     fn out_of_memory() -> JobOutcome {
         JobOutcome::Failed {
             code: ErrorCode::ScriptError,
@@ -599,6 +675,7 @@ mod tests {
         open_at_login: Option<bool>,
         has_log: bool,
         quitting: bool,
+        home: HomeReport,
     }
 
     impl Fixture {
@@ -610,6 +687,7 @@ mod tests {
                 open_at_login: Some(true),
                 has_log: true,
                 quitting: false,
+                home: HomeReport::default(),
             }
         }
 
@@ -623,6 +701,7 @@ mod tests {
                     has_log: self.has_log,
                     quitting: self.quitting,
                     deferred: &self.deferred,
+                    home: &self.home,
                 },
             )
         }
@@ -703,10 +782,88 @@ mod tests {
                 "[Pair with a Service…]",
                 "---",
                 "[✓ Open at Login]",
+                "[Open moil Folder]",
                 "[Show Log in Finder]",
                 "[Quit moil]",
             ]
         );
+    }
+
+    #[test]
+    fn hooks_show_under_their_service_and_problems_in_brief() {
+        let mut fx = Fixture::new();
+        let klisi_id: ServiceId = "klisi.example.com".parse().unwrap();
+        fx.home.hooks.insert(
+            klisi_id,
+            vec![hook("summarize", false), hook("transcribe", true)],
+        );
+        fx.home.problems = vec![
+            problem("services/klisi.example.com/hooks/summarize"),
+            problem("services/stray.txt"),
+        ];
+        let snapshot = Snapshot {
+            services: vec![klisi(), lab(fx.now)],
+            last_job: Some(report(
+                JobOutcome::Succeeded,
+                fx.clock,
+                Duration::from_secs(300),
+            )),
+            ..Snapshot::default()
+        };
+        let lines = lines(&fx.view(&snapshot).menu);
+        let first_service = lines.iter().position(|l| l.starts_with("klisi")).unwrap();
+        assert_eq!(
+            lines[..first_service],
+            [
+                "Idle — waiting for jobs",
+                "Last: “Design review” finished 5 minutes ago",
+                "2 problems in moil's home ▸",
+                "  services/klisi.example.com/hooks/summarize",
+                "  services/stray.txt",
+                "  ---",
+                "  Run “moil status” for details",
+                "  [Open moil Folder]",
+                "---",
+            ]
+        );
+        assert_eq!(
+            lines[first_service..first_service + 11],
+            [
+                "klisi — klisi.example.com ▸",
+                "  https://klisi.example.com/moil",
+                "  Connected",
+                "  ---",
+                "  [transcribe 0.2.0 — approved]",
+                "  [Review transcribe 0.3.0…]",
+                "  ---",
+                "  Hook for summarize — moil can't run it",
+                "  Hook for transcribe",
+                "  ---",
+                "  [Unpair klisi…]",
+            ]
+        );
+        let lab_menu: Vec<_> = lines
+            .iter()
+            .skip_while(|l| !l.starts_with("lab"))
+            .take_while(|l| !l.contains("Unpair lab"))
+            .collect();
+        assert!(
+            !lab_menu.iter().any(|l| l.contains("Hook")),
+            "{lab_menu:#?}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_of_problems_is_cut_short() {
+        let mut fx = Fixture::new();
+        fx.home.problems = (0..12)
+            .map(|i| problem(&format!("services/s{i}/service.json")))
+            .collect();
+        let lines = lines(&fx.view(&Snapshot::default()).menu);
+        assert_eq!(lines[1], "12 problems in moil's home ▸");
+        assert_eq!(lines[9], "  services/s7/service.json");
+        assert_eq!(lines[10], "  and 4 more");
+        assert_eq!(lines[12], "  Run “moil status” for details");
     }
 
     #[test]
@@ -740,6 +897,7 @@ mod tests {
             menu.action("Unpair klisi…"),
             Some(&Action::Unpair("klisi.example.com".parse().unwrap()))
         );
+        assert_eq!(menu.action("Open moil Folder"), Some(&Action::OpenHome));
         assert_eq!(menu.action("Show Log in Finder"), Some(&Action::ShowLog));
         assert_eq!(menu.action("Quit moil"), Some(&Action::Quit));
     }
@@ -980,6 +1138,10 @@ mod tests {
             assert!(attention(&fx, vec![service]));
         }
 
+        fx.home.problems = vec![problem("services/stray.txt")];
+        assert!(attention(&fx, vec![reviewed.clone()]), "a problem to fix");
+        fx.home.problems.clear();
+
         fx.deferred
             .insert(("klisi.example.com".parse().unwrap(), hash('b')));
         assert!(!attention(&fx, vec![klisi()]), "put off with Not now");
@@ -1156,7 +1318,13 @@ mod tests {
 
     #[test]
     fn service_text_cannot_disguise_the_menu() {
-        let fx = Fixture::new();
+        let mut fx = Fixture::new();
+        // Hooks and folders can come from git.
+        fx.home.hooks.insert(
+            "klisi.example.com".parse().unwrap(),
+            vec![hook("tr\u{202e}anscribe\nOK", true)],
+        );
+        fx.home.problems = vec![problem("services/\u{2066}evil\u{2069}\nOK")];
         let mut service = klisi();
         service.name = "kli\u{202e}si\nOK".into();
         service.bundles[1].info.name = format!("{}x", "long".repeat(20));
@@ -1175,6 +1343,14 @@ mod tests {
         );
         assert!(
             lines.contains(&format!("[Review {}… 0.3.0…]", "long".repeat(8))),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"  Hook for transcribe OK".to_owned()),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"  services/evil OK".to_owned()),
             "{lines:#?}"
         );
     }

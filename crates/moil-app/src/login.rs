@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 
 use auto_launch::AutoLaunch;
 
+/// Why Open at Login can't be told or changed from here.
+const ONLY_INSTALLED: &str = "Open at Login works only for the installed app.";
+
 /// Whether the app opens when the owner logs in.
 pub trait LoginItem {
     /// `None` when it can't be changed from here.
@@ -53,16 +56,29 @@ impl LoginItem for SystemLoginItem {
     }
 
     fn set_enabled(&self, enabled: bool) -> Result<(), String> {
-        let item = self
-            .0
-            .as_ref()
-            .ok_or("Open at Login works only for the installed app.")?;
+        let item = self.0.as_ref().ok_or(ONLY_INSTALLED)?;
         let result = if enabled {
             item.enable()
         } else {
             item.disable()
         };
         result.map_err(|e| format!("Couldn't change Open at Login: {e}"))
+    }
+}
+
+/// Answers `moil login-item` (spec/machine.md §3.2) from the item the menu
+/// shows: whether the app opens at login, once turned on or off if `set`
+/// says to, or why that can't be told or changed.
+pub fn answer(item: &dyn LoginItem, set: Option<bool>) -> Result<bool, String> {
+    let enabled = item.enabled();
+    match set {
+        Some(set) if enabled != Some(set) => {
+            item.set_enabled(set)?;
+            // As the system now has it, which may still need the owner's
+            // approval in System Settings.
+            item.enabled().ok_or_else(|| ONLY_INSTALLED.to_owned())
+        }
+        _ => enabled.ok_or_else(|| ONLY_INSTALLED.to_owned()),
     }
 }
 
@@ -175,6 +191,32 @@ mod tests {
         system.enabled.set(false);
         assert_eq!(item.enabled(), Some(false));
         assert_eq!(system.asked.get(), 3);
+    }
+
+    #[test]
+    fn the_command_sees_and_changes_what_the_menu_does() {
+        let system = Counting::default();
+        let item = Cached::new(&system, Duration::from_secs(60));
+        assert_eq!(answer(&item, None), Ok(false));
+        assert_eq!(answer(&item, Some(true)), Ok(true));
+        assert!(system.enabled.get());
+        assert_eq!(item.enabled(), Some(true), "the menu shows it at once");
+        let asked = system.asked.get();
+        assert_eq!(answer(&item, Some(true)), Ok(true), "already on");
+        assert_eq!(system.asked.get(), asked, "nothing to ask the system");
+        assert_eq!(answer(&item, Some(false)), Ok(false));
+        assert!(!system.enabled.get());
+    }
+
+    #[test]
+    fn the_command_says_why_it_cant() {
+        let loose = SystemLoginItem(None);
+        for set in [None, Some(true), Some(false)] {
+            assert_eq!(
+                answer(&loose, set),
+                Err("Open at Login works only for the installed app.".into())
+            );
+        }
     }
 
     #[test]

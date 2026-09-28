@@ -1,16 +1,22 @@
-//! Every page the app shows, written to files for a look in a browser or
-//! with `tools/snapshot.swift`:
+//! Every page the app shows, and its tray menu, written to files for a look
+//! in a browser or with `tools/snapshot.swift`:
 //!
 //! ```sh
 //! MOIL_APP_GALLERY=/tmp/gallery cargo test -p moil-app gallery -- --ignored
 //! ```
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use moil_agent::{Approval, BundleStatus, Connection, Pairing, Review, Service, ServiceStatus};
+use maud::{Markup, html};
+use moil_agent::report::{HookReport, Problem};
+use moil_agent::{
+    Approval, BundleStatus, Connection, JobOutcome, JobReport, JobStatus, Pairing, Review, Service,
+    ServiceStatus, Snapshot,
+};
 use moil_bundle::Bundle;
-use moil_proto::BundleInfo;
+use moil_proto::{BundleInfo, ErrorCode, JobId, Phase};
 
 use crate::backend::PairingCode;
 use crate::demo;
@@ -18,9 +24,10 @@ use crate::icon;
 use crate::ipc::{PairMessage, ReviewMessage};
 use crate::page;
 use crate::pair::PairWindow;
+use crate::reports::HomeReport;
 use crate::review::ReviewWindow;
 use crate::unpair::UnpairWindow;
-use crate::view::{Activity, IconState};
+use crate::view::{Activity, Entry, IconState, Label, MenuModel, TrayView, ViewContext};
 
 /// The tray icon in every state, magnified and at menu-bar size, on light
 /// and dark bars.
@@ -61,6 +68,184 @@ fn icons() -> String {
     }
     format!("<!DOCTYPE html><html><body style=\"margin:8px\">{cells}</body></html>")
 }
+
+/// The tray's menu while a job runs, with a review waiting, a service
+/// offline, hooks and a problem: the main menu, then each submenu beside
+/// it, roughly as macOS draws them.
+fn menu() -> String {
+    let (v2, v3) = (demo::transcribe_0_2(), demo::transcribe_0_3());
+    let info = |bundle: &Bundle, approved| BundleStatus {
+        info: BundleInfo {
+            hash: bundle.hash(),
+            name: bundle.manifest().name.clone(),
+            version: bundle.manifest().version.clone(),
+            description: None,
+        },
+        approved,
+    };
+    let now = Instant::now();
+    let clock = SystemTime::now();
+    let klisi = ServiceStatus {
+        id: "klisi.example.com".parse().unwrap(),
+        name: "klisi".into(),
+        base_url: "https://klisi.example.com/moil".parse().unwrap(),
+        connection: Connection::Connected,
+        bundles: vec![info(&v2, true), info(&v3, false)],
+        insecure: false,
+    };
+    let lab = ServiceStatus {
+        id: "lab.example.org".parse().unwrap(),
+        name: "lab".into(),
+        base_url: "https://lab.example.org/moil".parse().unwrap(),
+        connection: Connection::Disconnected {
+            error: "connection refused".into(),
+            retry_at: now + Duration::from_secs(12),
+        },
+        bundles: Vec::new(),
+        insecure: false,
+    };
+    let snapshot = Snapshot {
+        paused: false,
+        job: Some(JobStatus {
+            service: klisi.id.clone(),
+            job_id: JobId::new("j_4100").unwrap(),
+            attempt: 1,
+            title: Some("Weekly sync".into()),
+            bundle_name: "transcribe".into(),
+            phase: Phase::Running,
+            fraction: Some(0.42),
+            message: Some("diarizing".into()),
+            started_at: now,
+            stopping: false,
+        }),
+        last_job: Some(JobReport {
+            service: klisi.id.clone(),
+            job_id: JobId::new("j_4099").unwrap(),
+            attempt: 1,
+            title: Some("Design review".into()),
+            bundle_name: "transcribe".into(),
+            outcome: JobOutcome::Failed {
+                code: ErrorCode::ScriptError,
+                message: "CUDA out of memory".into(),
+            },
+            ended_at: clock - Duration::from_secs(300),
+        }),
+        services: vec![klisi.clone(), lab],
+    };
+    let root = Path::new("/Users/ada/.moil/services/klisi.example.com");
+    let hook = |bundle: &str, runnable| HookReport {
+        bundle: bundle.into(),
+        path: root.join("hooks").join(bundle),
+        log: root.join("logs").join(format!("{bundle}.log")),
+        runnable,
+    };
+    let home = HomeReport {
+        hooks: [(
+            klisi.id,
+            vec![hook("summarize", false), hook("transcribe", true)],
+        )]
+        .into(),
+        problems: vec![Problem {
+            path: "services/klisi.example.com/hooks/summarize".into(),
+            message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
+        }],
+    };
+    let view = TrayView::new(
+        &snapshot,
+        &ViewContext {
+            now,
+            clock,
+            open_at_login: Some(true),
+            has_log: true,
+            quitting: false,
+            deferred: &HashSet::new(),
+            home: &home,
+        },
+    );
+    menu_page(&view.menu)
+}
+
+fn menu_page(model: &MenuModel) -> String {
+    fn label(label: &Label) -> Markup {
+        html! {
+            (label.text)
+            @if let Some(detail) = &label.detail {
+                span.detail {
+                    @if !label.text.is_empty() { " — " }
+                    (detail)
+                }
+            }
+        }
+    }
+    fn menu(entries: &[Entry]) -> Markup {
+        html! {
+            div.menu {
+                @for entry in entries {
+                    @match entry {
+                        Entry::Text(text) => div.row.text { (label(text)) },
+                        Entry::Item { label: text, enabled, .. } => {
+                            div.row.disabled[!enabled] { (label(text)) }
+                        },
+                        Entry::Check { label: text, checked, enabled, .. } => {
+                            div.row.disabled[!enabled] {
+                                span.check { @if *checked { "✓" } } (label(text))
+                            }
+                        },
+                        Entry::Submenu { label: text, .. } => {
+                            div.row { (label(text)) span.arrow { "›" } }
+                        },
+                        Entry::Separator => hr;,
+                    }
+                }
+            }
+        }
+    }
+    let submenus = model.entries.iter().filter_map(|entry| match entry {
+        Entry::Submenu { label, entries } => Some((label.to_string(), entries)),
+        _ => None,
+    });
+    let page = html! {
+        (maud::DOCTYPE)
+        html {
+            head {
+                meta charset="utf-8";
+                style { (maud::PreEscaped(MENU_STYLE)) }
+            }
+            body {
+                figure { figcaption { "Menu" } (menu(&model.entries)) }
+                @for (caption, entries) in submenus {
+                    figure { figcaption { (caption) } (menu(entries)) }
+                }
+            }
+        }
+    };
+    page.into_string()
+}
+
+const MENU_STYLE: &str = "
+    body { margin: 16px; font: 13px -apple-system, system-ui; background: #b7c4d4;
+           display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+    figure { margin: 0; }
+    figcaption { font-size: 11px; color: #333; margin-bottom: 4px; }
+    .menu { background: rgba(246, 246, 246, 0.96); border-radius: 6px; padding: 5px;
+            box-shadow: 0 0 0 0.5px rgba(0,0,0,.25), 0 8px 24px rgba(0,0,0,.2);
+            min-width: 200px; }
+    .row { padding: 2px 10px 2px 22px; white-space: nowrap; line-height: 18px;
+           position: relative; color: #1d1d1f; border-radius: 4px; }
+    .row:not(.text):not(.disabled):hover { background: #0a64d6; color: white; }
+    .disabled, .detail { color: #9a9a9a; }
+    .check { position: absolute; left: 7px; }
+    .arrow { position: absolute; right: 8px; }
+    hr { border: 0; border-top: 1px solid rgba(0,0,0,.1); margin: 5px 10px; }
+    @media (prefers-color-scheme: dark) {
+        body { background: #2b3440; }
+        figcaption { color: #ccc; }
+        .menu { background: rgba(40, 40, 40, 0.96); }
+        .row, .text { color: #eee; }
+        .disabled, .detail { color: #8a8a8a; }
+        hr { border-top-color: rgba(255,255,255,.12); }
+    }
+";
 
 fn klisi(approved: &[&Bundle]) -> Service {
     let now = SystemTime::now();
@@ -254,6 +439,7 @@ fn gallery() {
         insecure: false,
     };
     write("unpair", UnpairWindow::new(&status).render());
+    write("menu", menu());
     write("icons", icons());
     write(
         "notice",
