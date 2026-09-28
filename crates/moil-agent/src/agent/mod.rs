@@ -13,7 +13,6 @@ mod connection;
 mod coordinator;
 mod watcher;
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -27,9 +26,10 @@ use url::Url;
 use crate::hooks::{HookOptions, Hooks};
 use crate::report::Problem;
 use crate::{Error, Machine, PairingSession, Review, Service, ServiceId};
-use coordinator::{Command, Coordinator, Input, Outputs};
-pub(crate) use watcher::HomeState;
-use watcher::{Reading, Refresh, Watcher};
+use coordinator::{Command, Coordinator, Input};
+pub use watcher::HomeState;
+pub(crate) use watcher::read_home;
+use watcher::{Refresh, Watcher};
 
 /// Starts agents.
 #[derive(Debug)]
@@ -65,7 +65,7 @@ impl Agent {
         });
         // Taken first, so that a change made while reading is noticed.
         let fingerprint = watcher::fingerprint(home);
-        let reading = Reading::take(&machine);
+        let reading = read_home(&machine);
         let (refreshes, refresh_receiver) = mpsc::unbounded_channel();
         let stop = CancellationToken::new();
         let watcher = tokio::spawn(
@@ -80,19 +80,12 @@ impl Agent {
             .run(),
         );
         let (snapshot, snapshot_receiver) = watch::channel(Snapshot::default());
-        let (published, published_receiver) = watch::channel(Published::default());
-        let (changes, changes_receiver) = watch::channel(());
-        let outputs = Outputs {
-            snapshot,
-            published,
-            changes,
-        };
         let coordinator = Coordinator::new(
             machine.clone(),
             executor,
             options,
             inputs.clone(),
-            outputs,
+            snapshot,
             hooks,
             (stop, watcher),
         )
@@ -102,8 +95,6 @@ impl Agent {
             machine,
             inputs,
             snapshot: snapshot_receiver,
-            published: published_receiver,
-            changes: changes_receiver,
             refreshes,
         }
     }
@@ -158,19 +149,7 @@ pub struct AgentHandle {
     machine: Machine,
     inputs: mpsc::UnboundedSender<Input>,
     snapshot: watch::Receiver<Snapshot>,
-    published: watch::Receiver<Published>,
-    changes: watch::Receiver<()>,
     refreshes: mpsc::UnboundedSender<Refresh>,
-}
-
-/// What the agent publishes after each round, for
-/// [`status`](crate::status): its snapshot, the home as it goes by it, and
-/// the services it found no token for, all as of the same moment.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct Published {
-    pub snapshot: Snapshot,
-    pub home: Arc<HomeState>,
-    pub tokenless: BTreeSet<ServiceId>,
 }
 
 impl AgentHandle {
@@ -183,29 +162,12 @@ impl AgentHandle {
         self.snapshot.borrow().clone()
     }
 
-    /// Watches the agent's state; there's a new [`Snapshot`] whenever
-    /// anything it holds changes. What else `moil status` shows, such as
-    /// hooks and problems, [`changes`](Self::changes) tells of.
+    /// Watches the agent's state: there's a new [`Snapshot`] whenever
+    /// anything it holds changes, the home as the agent goes by it
+    /// included, whether through this handle, a command, a service or
+    /// another program. `changed()` fails once the agent has stopped.
     pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.snapshot.clone()
-    }
-
-    /// Tells when anything [`status`](crate::status) shows may have
-    /// changed: the snapshot, or the home as the agent goes by it (its
-    /// services, approvals and pairings, settings, hooks and problems),
-    /// whether through this handle, a command, a service or another
-    /// program. Each change is marked once the status shows it; changes
-    /// made before this was called aren't. `changed()` fails once the agent
-    /// has stopped.
-    pub fn changes(&self) -> watch::Receiver<()> {
-        let mut changes = self.changes.clone();
-        changes.mark_unchanged();
-        changes
-    }
-
-    /// What the agent published last.
-    pub(crate) fn published(&self) -> Published {
-        self.published.borrow().clone()
     }
 
     /// Like [`Machine::pair`]; once the pairing completes, the agent
@@ -279,35 +241,25 @@ impl AgentHandle {
         }
     }
 
-    /// Stops or resumes taking new jobs. A running job carries on.
-    pub fn set_paused(&self, paused: bool) {
-        self.send(Command::SetPaused(paused));
+    /// Stops or resumes taking new jobs once `settings.json` says so; a
+    /// running job carries on. Returns once the snapshot shows it. If the
+    /// file can't say so, say because it isn't valid, fails with why, and
+    /// nothing changes, as without an agent (spec/machine.md §3.2).
+    pub async fn set_paused(&self, paused: bool) -> Result<(), Error> {
+        let (reply, saved) = oneshot::channel();
+        self.send(Command::SetPaused(paused, reply));
+        let shut_down = std::io::Error::other("moil is shutting down");
+        saved.await.unwrap_or(Err(shut_down.into()))
     }
 
-    /// Stops the running job, if any; the snapshot shows it
-    /// [`stopping`](JobStatus::stopping) until it has. The service may give
-    /// it to another machine.
-    pub fn stop_job(&self) {
-        self.send(Command::StopJob(None));
-    }
-
-    /// Like [`stop_job`](Self::stop_job), and says which job it stopped,
-    /// once the snapshot shows it stopping: `None` if no job was running.
-    pub async fn stop_running_job(&self) -> Option<JobStatus> {
+    /// Stops the running job, if any, and says which it was once the
+    /// snapshot shows it [`stopping`](JobStatus::stopping): `None` if no
+    /// job was running. It stays the running job until it has stopped. Its
+    /// service may give it to another machine.
+    pub async fn stop_job(&self) -> Option<JobStatus> {
         let (reply, stopped) = oneshot::channel();
-        self.send(Command::StopJob(Some(reply)));
+        self.send(Command::StopJob(reply));
         stopped.await.ok().flatten()
-    }
-
-    /// Waits until the agent has carried out everything asked of it
-    /// before, such as [`set_paused`](Self::set_paused), and its snapshot
-    /// shows it.
-    pub async fn settled(&self) {
-        let (done, settled) = oneshot::channel();
-        // Fails only once the agent has shut down, when nothing is left to
-        // carry out.
-        let _ = self.inputs.send(Input::Reply(done));
-        let _ = settled.await;
     }
 
     /// Stops the running job, reports it, closes every connection, and
@@ -337,16 +289,21 @@ impl AgentHandle {
     }
 }
 
-/// What the agent is doing, for display.
+/// What the agent is doing, and the home as it goes by it, for display.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub paused: bool,
+    /// The paired services, and their connections.
     pub services: Vec<ServiceStatus>,
     /// The running attempt, if any.
     pub job: Option<JobStatus>,
     /// The attempt that ran here last, since the agent started, once it
     /// has ended. Attempts refused without running don't count.
     pub last_job: Option<JobReport>,
+    /// The home as the agent last read it, keeping what it read before
+    /// from files it can't use (spec/machine.md §1.3): every service it
+    /// knows, the hooks, and what's wrong with it.
+    pub home: Arc<HomeState>,
 }
 
 impl Snapshot {
@@ -387,7 +344,8 @@ pub enum Connection {
         error: String,
         retry_at: Instant,
     },
-    /// The service removed this machine (close code 4401). Pair again.
+    /// The service removed this machine (close code 4401), or moil has no
+    /// token for it. Pair again.
     Unpaired,
     /// Another connection with this machine's token replaced this one
     /// (close code 4409).

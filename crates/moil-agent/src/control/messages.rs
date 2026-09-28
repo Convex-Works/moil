@@ -10,8 +10,9 @@ use moil_proto::BundleHash;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::Service;
 use crate::report::{AgentInfo, ListedBundle, ServiceRef};
+use crate::status::Clock;
+use crate::{Error, Machine, PairingSession, Service};
 
 /// The first line a client sends.
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,6 +128,37 @@ pub struct PairingCode {
     pub machine_name: String,
     #[serde(with = "crate::rfc3339")]
     pub expires_at: SystemTime,
+}
+
+impl PairingCode {
+    /// Starts pairing as `moil pair` does, whether or not an agent runs:
+    /// calls `machine` `name` from now on, for every service, if given
+    /// (spec/machine.md §1.1), then starts the pairing with `pair`. Returns
+    /// it, with what the owner needs to confirm it.
+    pub async fn start(
+        machine: &Machine,
+        name: Option<String>,
+        pair: impl AsyncFnOnce() -> Result<PairingSession, Error>,
+    ) -> Result<(PairingSession, Self), Error> {
+        if let Some(name) = name {
+            machine
+                .blocking(|machine| machine.update_settings(|s| s.machine_name = Some(name)))
+                .await?;
+        }
+        let session = pair().await?;
+        // The computer's name may take detecting.
+        let machine_name = machine.blocking(|machine| Ok(machine.info().name)).await?;
+        let code = Self {
+            user_code: session.user_code.clone(),
+            verification_uri: session.verification_uri.clone(),
+            verification_uri_complete: session.verification_uri_complete.clone(),
+            service_name: session.service_name.clone(),
+            base_url: session.base_url().clone(),
+            machine_name,
+            expires_at: Clock::now().wall(session.expires_at),
+        };
+        Ok((session, code))
+    }
 }
 
 /// The bundles a service offers, and those approved for it that it no

@@ -154,7 +154,8 @@ another URL, pair with the new one.
 An approval counts only while `bundles/<name>/<hash>/` holds the bundle's
 three files, the files hash to `hash` (protocol §5.2), and the manifest's
 name and version are the approval's. moil ignores an approval that
-doesn't, and reports it as a problem (§3.3). moil writes bundle files
+doesn't, and reports it as a problem (§3.3), as it does anything under
+`bundles/` that no approval names. moil writes bundle files
 read-only, and runs a bundle only from a copy it has verified against the
 approval, checked again before every run (protocol §5.5). Editing an
 approved bundle's files therefore can't change what runs: its jobs are
@@ -385,7 +386,9 @@ context carries no token, and no URL other than the service's base URL.
 `moil home` prints `Home: <path>`. The other commands' `Label: value`
 lines are as they are today: `Code:`, `URL:` and `Paired:` for `pair`,
 `Approved:`, `Revoked:`, `Unpaired:`, and `Paused:` (`true` or `false`)
-for `pause` and `resume`, which answer once `settings.json` says so.
+for `pause` and `resume`, which answer once `settings.json` says so. When
+it can't say so, say because it isn't valid, they fail and change
+nothing, whether or not an agent runs.
 `stop` prints `Stopping:` with the job's ID and attempt, or nothing if no
 job runs; `stop --json` then prints `{}`, as `quit --json` does. `login-item` prints `Open at login:`
 (`true` or `false`).

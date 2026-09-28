@@ -274,11 +274,11 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     conn.send(offer("j2", unapproved.hash()));
     assert_eq!(conn.recv().await, decline("j2", DeclineReason::NotApproved));
 
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     assert_eq!(conn.recv().await, state(MachineState::Paused));
     conn.send(offer("j5", hash));
     assert_eq!(conn.recv().await, decline("j5", DeclineReason::Paused));
-    setup.agent.set_paused(false);
+    setup.agent.set_paused(false).await.unwrap();
     assert_eq!(conn.recv().await, state(MachineState::Idle));
 
     conn.send(assign("j6", 1, hash, 30_000));
@@ -404,14 +404,14 @@ async fn a_keychain_that_keeps_moil_waiting_doesnt_hold_up_the_agent() {
     keychain.slow_down(Duration::from_secs(1));
     let agent = Agent::start_with(machine, executor, fast());
     let started = Instant::now();
-    agent.set_paused(true);
+    agent.set_paused(true).await.unwrap();
     snapshot_where(&agent, "the pause to show", |s| s.paused).await;
     let id = agent.snapshot().services[0].id.clone();
     let unpairing = tokio::spawn({
         let agent = agent.clone();
         async move { agent.unpair(&id).await }
     });
-    agent.set_paused(false);
+    agent.set_paused(false).await.unwrap();
     snapshot_where(&agent, "the resumption to show", |s| !s.paused).await;
     let took = started.elapsed();
     assert!(
@@ -728,7 +728,7 @@ async fn the_owner_stopping_a_job_makes_it_retryable_elsewhere() {
     assert_eq!(conn.recv().await, state(MachineState::Busy));
     let mut run = setup.runs.next().await;
 
-    setup.agent.stop_job();
+    setup.agent.stop_job().await;
     assert_eq!(run.stopped().await, StopReason::Interrupted);
     let (seq, error) = failure(conn.recv().await);
     assert_eq!(
@@ -752,7 +752,7 @@ async fn a_stopping_job_shows_as_stopping_until_it_ends() {
 
         let (reason, outcome) = match cause {
             "the owner" => {
-                setup.agent.stop_job();
+                setup.agent.stop_job().await;
                 (StopReason::Interrupted, interrupted())
             }
             "the service" => {
@@ -1193,7 +1193,7 @@ async fn pausing_is_told_to_every_service_and_remembered() {
     let mut klisi = connect(&setup.services[0].0, &setup.bundle).await;
     let mut notes = connect(&setup.services[1].0, &setup.bundle).await;
 
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     assert_eq!(klisi.recv().await, state(MachineState::Paused));
     assert_eq!(notes.recv().await, state(MachineState::Paused));
     assert!(setup.agent.snapshot().paused);
@@ -1201,20 +1201,14 @@ async fn pausing_is_told_to_every_service_and_remembered() {
         let text = std::fs::read_to_string(setup.dir.path().join("settings.json")).ok()?;
         serde_json::from_str(&text).ok()
     };
-    until("the pause to be saved", || {
-        saved().is_some_and(|s| s.paused)
-    })
-    .await;
+    assert!(saved().is_some_and(|s| s.paused), "saved once it answers");
     klisi.send(offer("j1", setup.hash()));
     assert_eq!(klisi.recv().await, decline("j1", DeclineReason::Paused));
 
-    setup.agent.set_paused(false);
+    setup.agent.set_paused(false).await.unwrap();
     assert_eq!(klisi.recv().await, state(MachineState::Idle));
     assert_eq!(notes.recv().await, state(MachineState::Idle));
-    until("the resumption to be saved", || {
-        saved().is_some_and(|s| !s.paused)
-    })
-    .await;
+    assert!(saved().is_some_and(|s| !s.paused));
     assert!(!setup.agent.machine().settings().paused);
 }
 
@@ -1226,7 +1220,7 @@ async fn a_running_job_carries_on_when_the_machine_is_paused() {
     assert_eq!(conn.recv().await, state(MachineState::Busy));
     let run = setup.runs.next().await;
 
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     run.emit(log("working"));
     assert_eq!(conn.recv().await, event("j1", 1, 1, log("working")));
     run.finish(succeeded());

@@ -1,7 +1,6 @@
 //! Times as the home's files and the command line's JSON write them: RFC
 //! 3339 strings in UTC, to the second, such as `2026-09-27T22:41:07Z`
-//! (spec/machine.md §1). Use as `#[serde(with = "crate::rfc3339")]`, or
-//! `crate::rfc3339::option` for an `Option<SystemTime>`.
+//! (spec/machine.md §1). Use as `#[serde(with = "crate::rfc3339")]`.
 
 use std::borrow::Cow;
 use std::time::SystemTime;
@@ -37,31 +36,6 @@ pub fn serialize<S: Serializer>(time: &SystemTime, serializer: S) -> Result<S::O
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SystemTime, D::Error> {
     let text = Cow::<'de, str>::deserialize(deserializer)?;
     parse(&text).map_err(serde::de::Error::custom)
-}
-
-/// For optional times, skipped when absent: pair with
-/// `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-pub mod option {
-    use super::*;
-
-    pub fn serialize<S: Serializer>(
-        time: &Option<SystemTime>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match time {
-            Some(time) => super::serialize(time, serializer),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<SystemTime>, D::Error> {
-        match Option::<Cow<'de, str>>::deserialize(deserializer)? {
-            Some(text) => parse(&text).map(Some).map_err(serde::de::Error::custom),
-            None => Ok(None),
-        }
-    }
 }
 
 #[cfg(test)]

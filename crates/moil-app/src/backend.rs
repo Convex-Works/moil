@@ -8,12 +8,12 @@ use std::time::Instant;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use moil_agent::control::{self, HostControls};
+use moil_agent::control::HostControls;
 use moil_agent::host::{HostConfig, Hosted};
-use moil_agent::report::{AgentInfo, Host, Status};
+use moil_agent::report::Host;
 use moil_agent::{
     AgentOptions, Error, Home, Machine, MachineConfig, Review, Service, ServiceId, Snapshot,
-    default_secrets, status,
+    default_secrets,
 };
 use moil_proto::BundleHash;
 use moil_runtime::{Runtime, find_uv};
@@ -25,19 +25,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// [`AgentHandle`](moil_agent::AgentHandle)'s; futures own their arguments
 /// so they can run on any task.
 pub trait Backend: Send + Sync + 'static {
-    /// Watches the agent's state; the receiver holds the current snapshot.
+    /// Watches the agent's state, the home as it goes by it included; the
+    /// receiver holds the current snapshot.
     fn subscribe(&self) -> watch::Receiver<Snapshot>;
-
-    /// Marked whenever what [`status`](Self::status) reports may have
-    /// changed: the snapshot, or the home as the agent goes by it.
-    fn changes(&self) -> watch::Receiver<()>;
 
     /// The home the agent runs on, as an absolute path.
     fn home(&self) -> PathBuf;
-
-    /// What `moil status` reports (spec/machine.md §3.3), of which the app
-    /// shows each service's hooks and the home's problems.
-    fn status(&self) -> BoxFuture<'_, Result<Status>>;
 
     /// Starts pairing with the service at `base_url`: checks it is a moil
     /// service and asks it for a code for the owner to confirm.
@@ -59,11 +52,12 @@ pub trait Backend: Send + Sync + 'static {
     fn unpair(&self, service: ServiceId) -> BoxFuture<'_, Result<()>>;
 
     /// Stops or resumes taking new jobs. A running job carries on.
-    fn set_paused(&self, paused: bool);
+    /// Resolves once `settings.json` says so too, or with why it can't.
+    fn set_paused(&self, paused: bool) -> BoxFuture<'_, Result<()>>;
 
     /// Stops the running job, if any; its service may give it to another
-    /// machine.
-    fn stop_job(&self);
+    /// machine. Resolves once the snapshot shows it stopping.
+    fn stop_job(&self) -> BoxFuture<'_, ()>;
 
     /// Stops the running job, reports it, and closes every connection,
     /// then stops listening for commands.
@@ -99,30 +93,14 @@ pub struct PairingCode {
     pub expires_at: Instant,
 }
 
-/// The app, as commands see what runs the agent.
-fn app_info() -> AgentInfo {
-    AgentInfo {
-        host: Host::App,
-        version: control::VERSION.to_owned(),
-    }
-}
-
 impl Backend for Hosted {
     fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.agent().subscribe()
     }
 
-    fn changes(&self) -> watch::Receiver<()> {
-        self.agent().changes()
-    }
-
     fn home(&self) -> PathBuf {
         let root = self.agent().machine().home().root();
         std::path::absolute(root).unwrap_or_else(|_| root.to_owned())
-    }
-
-    fn status(&self) -> BoxFuture<'_, Result<Status>> {
-        async move { status::from_agent(self.agent(), &app_info()).await }.boxed()
     }
 
     fn pair(&self, base_url: String) -> BoxFuture<'_, Result<Pairing>> {
@@ -159,12 +137,12 @@ impl Backend for Hosted {
         async move { self.agent().unpair(&service).await }.boxed()
     }
 
-    fn set_paused(&self, paused: bool) {
-        self.agent().set_paused(paused);
+    fn set_paused(&self, paused: bool) -> BoxFuture<'_, Result<()>> {
+        self.agent().set_paused(paused).boxed()
     }
 
-    fn stop_job(&self) {
-        self.agent().stop_job();
+    fn stop_job(&self) -> BoxFuture<'_, ()> {
+        self.agent().stop_job().map(drop).boxed()
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {

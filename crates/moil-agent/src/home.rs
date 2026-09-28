@@ -285,24 +285,14 @@ impl Home {
     }
 
     /// The problem to report when `settings.json` can't be used, as
-    /// [`load_settings`](Self::load_settings) says: `kept` when a running
-    /// agent goes on with the settings it read before.
-    pub(crate) fn settings_problem(error: &Error, kept: bool) -> Problem {
-        let message = match (error, kept) {
-            (Error::Invalid { reason, .. }, false) => format!(
+    /// [`load_settings`](Self::load_settings) says.
+    pub(crate) fn settings_problem(error: &Error) -> Problem {
+        let message = match error {
+            Error::Invalid { reason, .. } => format!(
                 "This file isn't valid ({reason}), and moil won't start until it is. Fix it, or \
                  remove it to go back to the defaults."
             ),
-            (Error::Invalid { reason, .. }, true) => format!(
-                "This file isn't valid ({reason}), so moil goes on with the settings it read \
-                 before, and won't start again until it is. Fix it, or remove it to go back to \
-                 the defaults."
-            ),
-            (error, false) => format!("moil can't read this file ({error})."),
-            (error, true) => format!(
-                "moil can't read this file ({error}), so it goes on with the settings it read \
-                 before."
-            ),
+            error => format!("moil can't read this file ({error})."),
         };
         Problem {
             path: "settings.json".into(),

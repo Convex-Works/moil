@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use moil_agent::report::{AgentInfo, HookReport, Host, Problem, Status};
+use moil_agent::report::{AgentInfo, ConnectionReport, HookReport, Host, Problem, Status};
 use moil_agent::{Agent, AgentHandle, Connection, Home, Machine, Service, status};
 use moil_bundle::Bundle;
 use moil_proto::{
@@ -133,12 +133,15 @@ impl Setup {
         }
     }
 
-    async fn status(&self) -> Status {
-        let info = AgentInfo {
-            host: Host::Agent,
-            version: "test".into(),
-        };
-        status::from_agent(&self.agent, &info).await.unwrap()
+    fn status(&self) -> Status {
+        status::from_agent(&self.agent, &agent_info())
+    }
+}
+
+fn agent_info() -> AgentInfo {
+    AgentInfo {
+        host: Host::Agent,
+        version: "test".into(),
     }
 }
 
@@ -295,7 +298,7 @@ async fn no_hook_runs_after_an_attempt_that_didnt_succeed() {
     )));
     done(&mut conn).await;
     let mut run = setup.run(&mut conn, "stopped").await;
-    setup.agent.stop_job();
+    setup.agent.stop_job().await;
     assert_eq!(run.stopped().await, StopReason::Interrupted);
     assert_eq!(done(&mut conn).await, interrupted());
     let run = setup.run(&mut conn, "succeeded").await;
@@ -440,7 +443,7 @@ async fn a_pairing_deleted_on_disk_disconnects_and_deletes_the_token() {
     .await;
     // The folder stays, with its approvals, and the service isn't told:
     // it lists the machine until the owner removes it there.
-    let status = setup.status().await;
+    let status = setup.status();
     let [service] = &status.services[..] else {
         panic!("{status:?}");
     };
@@ -464,7 +467,7 @@ async fn a_service_folder_deleted_on_disk_is_disconnected_and_forgotten() {
         tokens(setup.dir.path()).is_empty() && !folder.join("pairing.json").exists()
     })
     .await;
-    let status = setup.status().await;
+    let status = setup.status();
     assert_eq!(status.services, []);
 }
 
@@ -531,12 +534,12 @@ async fn pausing_in_settings_json_takes_effect() {
         setup.agent.machine().settings().machine_name.is_some()
     })
     .await;
-    setup.agent.set_paused(false);
-    assert_eq!(conn.recv().await, state(MachineState::Idle));
+    setup.agent.set_paused(false).await.unwrap();
     let saved =
         || -> Value { serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap() };
-    until("the resumption to be saved", || saved()["paused"] == false).await;
+    assert_eq!(saved()["paused"], false, "saved once it answers");
     assert_eq!(saved()["machine_name"], "Ada's test box");
+    assert_eq!(conn.recv().await, state(MachineState::Idle));
 
     // The agent's own write isn't applied again, once read back.
     edit_json(&settings, |file| file["machine_name"] = "build box".into());
@@ -570,22 +573,11 @@ async fn a_file_that_turns_invalid_keeps_what_was_read_from_it_and_is_a_problem(
             && problem_with(status, "settings.json").is_some()
     })
     .await;
-    let status = setup.status().await;
+    let status = setup.status();
     let problem = problem_with(&status, &service_json).unwrap();
-    assert!(
-        problem.message.contains("approvls")
-            && problem
-                .message
-                .contains("goes on with what it read from it before"),
-        "{problem:?}"
-    );
+    assert!(problem.message.contains("approvls"), "{problem:?}");
     let problem = problem_with(&status, "settings.json").unwrap();
-    assert!(
-        problem
-            .message
-            .contains("goes on with the settings it read before"),
-        "{problem:?}"
-    );
+    assert!(problem.message.contains("isn't valid"), "{problem:?}");
     // The service is as it was: connected, with its approval.
     assert_eq!(status.services[0].approvals, setup.paired.approvals);
     conn.send(offer("j1", setup.hash()));
@@ -601,7 +593,7 @@ async fn a_file_that_turns_invalid_keeps_what_was_read_from_it_and_is_a_problem(
     fixed["approvals"] = json!([]);
     fs::write(&file, fixed.to_string()).unwrap();
     assert_eq!(conn.recv().await, approved(&[]));
-    let status = setup.status().await;
+    let status = setup.status();
     assert!(problem_with(&status, &service_json).is_none(), "{status:?}");
 }
 
@@ -646,7 +638,7 @@ async fn status_shows_the_hooks_and_what_is_wrong_with_the_home() {
 
     // The same, whether or not an agent runs.
     let reader = Machine::open_read_only(config(setup.dir.path())).unwrap();
-    let from_home = status::from_home(&reader).unwrap();
+    let from_home = status::from_home(&reader);
     assert_eq!(from_home.services[0].hooks, hooks);
     assert_eq!(from_home.problems, problems);
 }
@@ -659,7 +651,7 @@ async fn a_damaged_settings_json_is_a_problem_in_status_not_a_failure() {
     fs::write(home.settings_file(), "{\"pause\": true}").unwrap();
 
     let reader = Machine::open_read_only(config(dir.path())).unwrap();
-    let status = status::from_home(&reader).unwrap();
+    let status = status::from_home(&reader);
     assert!(!status.paused, "the defaults");
     let [problem] = &status.problems[..] else {
         panic!("{status:?}");
@@ -673,7 +665,7 @@ async fn a_damaged_settings_json_is_a_problem_in_status_not_a_failure() {
 }
 
 #[tokio::test]
-async fn a_service_whose_token_is_gone_isnt_paired() {
+async fn a_service_whose_token_is_gone_is_paired_but_shows_unpaired() {
     let setup = Setup::new().await;
     let secrets = setup.home().secrets_file();
     within("the agent to shut down", setup.agent.shutdown()).await;
@@ -687,16 +679,15 @@ async fn a_service_whose_token_is_gone_isnt_paired() {
             .is_some_and(|s| s.connection == Connection::Unpaired)
     })
     .await;
-    let info = AgentInfo {
-        host: Host::Agent,
-        version: "test".into(),
-    };
-    let status = status::from_agent(&agent, &info).await.unwrap();
-    assert!(!status.services[0].paired, "{status:?}");
-    // Without an agent, only the files are looked at.
+    // Paired is the files' word, the same with or without an agent; the
+    // missing token shows as the connection.
+    let status = status::from_agent(&agent, &agent_info());
+    let service = &status.services[0];
+    assert!(service.paired, "{status:?}");
+    assert_eq!(service.connection, Some(ConnectionReport::Unpaired));
     within("the agent to shut down", agent.shutdown()).await;
     let reader = Machine::open_read_only(config(setup.dir.path())).unwrap();
-    assert!(status::from_home(&reader).unwrap().services[0].paired);
+    assert!(status::from_home(&reader).services[0].paired);
 }
 
 /// Waits until the agent's status satisfies `condition`, and returns it.
@@ -705,14 +696,15 @@ async fn until_status(
     what: &str,
     mut condition: impl FnMut(&Status) -> bool,
 ) -> Status {
-    let mut changes = setup.agent.changes();
+    let mut snapshots = setup.agent.subscribe();
     within(what, async {
         loop {
-            let status = setup.status().await;
+            snapshots.borrow_and_update();
+            let status = setup.status();
             if condition(&status) {
                 return status;
             }
-            changes.changed().await.expect("the agent is running");
+            snapshots.changed().await.expect("the agent is running");
         }
     })
     .await

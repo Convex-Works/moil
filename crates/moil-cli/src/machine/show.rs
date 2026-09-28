@@ -2,10 +2,10 @@
 //! what the agent is doing, as text or as the JSON of spec/machine.md §3.3.
 
 use std::io::{self, Write};
+use std::path::Path;
 
 use moil_agent::display::reveal;
-use moil_agent::hooks::HookScan;
-use moil_agent::report::{ConnectionReport, Host, ServiceReport, Status};
+use moil_agent::report::{ConnectionReport, HookListing, Host, ServiceReport, Status};
 use moil_agent::rfc3339;
 
 use super::output::{print_json, table, word};
@@ -114,7 +114,9 @@ fn write_service(service: &ServiceReport, out: &mut impl Write) -> io::Result<()
                 rfc3339::format(*retry_at)
             ),
             ConnectionReport::Unpaired => {
-                "unpaired: the service removed this machine; pair again".into()
+                "unpaired: the service removed this machine, or moil has no token for it; pair \
+                 again"
+                    .into()
             }
             ConnectionReport::Replaced => {
                 "replaced: another connection with this machine's token took over".into()
@@ -177,20 +179,36 @@ pub fn services(services: &[ServiceReport], json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn hooks(scan: &HookScan, json: bool) -> anyhow::Result<()> {
+/// The hooks `status` shows, under each service, and what's wrong with
+/// them.
+pub fn hooks(status: &Status, json: bool) -> anyhow::Result<()> {
+    let hooks: Vec<HookListing> = status
+        .services
+        .iter()
+        .flat_map(|s| {
+            s.hooks.iter().map(move |hook| HookListing {
+                service: s.id.clone(),
+                hook: hook.clone(),
+            })
+        })
+        .collect();
     if json {
-        print_json(&scan.hooks);
+        print_json(&hooks);
         return Ok(());
     }
     let mut out = io::stdout().lock();
-    for listing in &scan.hooks {
+    for listing in &hooks {
         let hook = &listing.hook;
         writeln!(out, "Hook: {} {}", listing.service, hook.bundle)?;
         writeln!(out, "  Path: {}", hook.path.display())?;
         writeln!(out, "  Log: {}", hook.log.display())?;
         writeln!(out, "  Runnable: {}", hook.runnable)?;
     }
-    for problem in &scan.problems {
+    let in_hooks = |path: &Path| {
+        let hooks = |id: &str| Path::new("services").join(id).join("hooks");
+        (status.services.iter()).any(|s| path.starts_with(hooks(s.id.as_str())))
+    };
+    for problem in status.problems.iter().filter(|p| in_hooks(&p.path)) {
         writeln!(
             out,
             "Problem: {}: {}",
@@ -198,7 +216,7 @@ pub fn hooks(scan: &HookScan, json: bool) -> anyhow::Result<()> {
             reveal(&problem.message)
         )?;
     }
-    if scan.hooks.is_empty() {
+    if hooks.is_empty() {
         eprintln!(
             "No hooks yet. A hook is an executable at services/<service>/hooks/<bundle>; \
              `moil hooks --help` explains them."

@@ -1,6 +1,5 @@
 //! What the tray shows, as plain data: [`TrayView::new`] turns the agent's
-//! [`Snapshot`] and the home's report into the menu, the icon's state and
-//! the title beside it. The `tray` module makes it real; everything here is
+//! [`Snapshot`] into the menu, the icon's state and the title beside it. The `tray` module makes it real; everything here is
 //! pure.
 
 use std::collections::HashSet;
@@ -14,7 +13,6 @@ use moil_proto::{BundleHash, Phase};
 use url::Url;
 
 use crate::format;
-use crate::reports::HomeReport;
 
 /// The most problems the menu names; `moil status` has them all.
 const MAX_PROBLEMS: usize = 8;
@@ -47,8 +45,6 @@ pub struct ViewContext<'a> {
     /// Reviews the owner put off with "Not now". They stay in the menu but
     /// no longer ask for attention.
     pub deferred: &'a HashSet<(ServiceId, BundleHash)>,
-    /// The home's hooks and problems, which the snapshot doesn't have.
-    pub home: &'a HomeReport,
 }
 
 /// The icon: what the machine is doing, and whether the owner is needed.
@@ -255,7 +251,7 @@ impl IconState {
             .any(|s| matches!(s.connection, Connection::Unpaired | Connection::Replaced));
         Self {
             activity,
-            attention: review_waiting || service_lost || !cx.home.problems.is_empty(),
+            attention: review_waiting || service_lost || !snapshot.home.problems.is_empty(),
         }
     }
 }
@@ -357,7 +353,7 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
     if let Some(report) = &snapshot.last_job {
         entries.push(Text(last_job(snapshot, report, cx.clock)));
     }
-    let problems = &cx.home.problems;
+    let problems = &snapshot.home.problems;
     if !problems.is_empty() {
         entries.push(Submenu {
             label: Label::new(format!(
@@ -379,7 +375,7 @@ fn menu(snapshot: &Snapshot, cx: &ViewContext<'_>, status: Label) -> MenuModel {
         entries.push(Submenu {
             label: Label::new(format::one_line(&service.name, 32))
                 .with_detail(host(&service.base_url)),
-            entries: service_menu(service, cx.home.hooks(&service.id), cx.now),
+            entries: service_menu(service, &snapshot.home.service_hooks(&service.id), cx.now),
         });
         entries.push(Text(Label::quiet(connection(&service.connection, cx.now))));
         for bundle in service.bundles.iter().filter(|b| !b.approved) {
@@ -567,7 +563,10 @@ fn host(url: &Url) -> String {
 
 #[cfg(test)]
 mod tests {
-    use moil_agent::BundleStatus;
+    use std::sync::Arc;
+
+    use moil_agent::report::HookListing;
+    use moil_agent::{BundleStatus, HomeState};
     use moil_proto::{BundleInfo, ErrorCode, JobId};
 
     use super::*;
@@ -644,13 +643,17 @@ mod tests {
         }
     }
 
-    fn hook(bundle: &str, runnable: bool) -> HookReport {
+    /// A hook of klisi's.
+    fn hook(bundle: &str, runnable: bool) -> HookListing {
         let service = "/Users/ada/.moil/services/klisi.example.com";
-        HookReport {
-            bundle: bundle.into(),
-            path: format!("{service}/hooks/{bundle}").into(),
-            log: format!("{service}/logs/{bundle}.log").into(),
-            runnable,
+        HookListing {
+            service: "klisi.example.com".parse().unwrap(),
+            hook: HookReport {
+                bundle: bundle.into(),
+                path: format!("{service}/hooks/{bundle}").into(),
+                log: format!("{service}/logs/{bundle}.log").into(),
+                runnable,
+            },
         }
     }
 
@@ -675,7 +678,8 @@ mod tests {
         open_at_login: Option<bool>,
         has_log: bool,
         quitting: bool,
-        home: HomeReport,
+        /// The home as the agent goes by it, in every snapshot viewed.
+        home: HomeState,
     }
 
     impl Fixture {
@@ -687,13 +691,17 @@ mod tests {
                 open_at_login: Some(true),
                 has_log: true,
                 quitting: false,
-                home: HomeReport::default(),
+                home: HomeState::default(),
             }
         }
 
         fn view(&self, snapshot: &Snapshot) -> TrayView {
+            let snapshot = Snapshot {
+                home: Arc::new(self.home.clone()),
+                ..snapshot.clone()
+            };
             TrayView::new(
-                snapshot,
+                &snapshot,
                 &ViewContext {
                     now: self.now,
                     clock: self.clock,
@@ -701,7 +709,6 @@ mod tests {
                     has_log: self.has_log,
                     quitting: self.quitting,
                     deferred: &self.deferred,
-                    home: &self.home,
                 },
             )
         }
@@ -748,6 +755,7 @@ mod tests {
             services: vec![klisi(), lab(fx.now)],
             job: Some(job(Phase::Running, Some(0.42))),
             last_job: Some(report(out_of_memory(), fx.clock, Duration::from_secs(300))),
+            ..Snapshot::default()
         };
         assert_eq!(
             lines(&fx.view(&snapshot).menu),
@@ -792,11 +800,7 @@ mod tests {
     #[test]
     fn hooks_show_under_their_service_and_problems_in_brief() {
         let mut fx = Fixture::new();
-        let klisi_id: ServiceId = "klisi.example.com".parse().unwrap();
-        fx.home.hooks.insert(
-            klisi_id,
-            vec![hook("summarize", false), hook("transcribe", true)],
-        );
+        fx.home.hooks = vec![hook("summarize", false), hook("transcribe", true)];
         fx.home.problems = vec![
             problem("services/klisi.example.com/hooks/summarize"),
             problem("services/stray.txt"),
@@ -874,6 +878,7 @@ mod tests {
             services: vec![klisi()],
             job: None,
             last_job: None,
+            ..Snapshot::default()
         };
         let menu = fx.view(&snapshot).menu;
         assert_eq!(
@@ -921,6 +926,7 @@ mod tests {
                     services: vec![klisi()],
                     job,
                     last_job: None,
+                    ..Snapshot::default()
                 })
                 .menu,
             )[0]
@@ -962,6 +968,7 @@ mod tests {
             services: vec![klisi()],
             job: Some(job(Phase::Running, Some(0.5))),
             last_job: None,
+            ..Snapshot::default()
         });
         assert!(lines(&paused.menu).contains(&"Paused: no new jobs after this one".to_owned()));
         assert_eq!(
@@ -980,6 +987,7 @@ mod tests {
                 services: vec![],
                 job,
                 last_job: None,
+                ..Snapshot::default()
             })
             .title
         };
@@ -1119,6 +1127,7 @@ mod tests {
                 services,
                 job: None,
                 last_job: None,
+                ..Snapshot::default()
             })
             .icon
             .attention
@@ -1151,6 +1160,7 @@ mod tests {
                 services: vec![klisi()],
                 job: None,
                 last_job: None,
+                ..Snapshot::default()
             })
             .menu;
         assert!(
@@ -1168,6 +1178,7 @@ mod tests {
                 services: vec![],
                 job,
                 last_job: None,
+                ..Snapshot::default()
             })
             .icon
             .activity
@@ -1191,6 +1202,7 @@ mod tests {
                 services: vec![service],
                 job: None,
                 last_job: None,
+                ..Snapshot::default()
             })
             .menu;
         assert!(lines(&menu).contains(&"Removed this Mac; pair again to use it".to_owned()));
@@ -1231,6 +1243,7 @@ mod tests {
             services: vec![klisi()],
             job: Some(job(Phase::Running, Some(0.3))),
             last_job: None,
+            ..Snapshot::default()
         });
         assert_eq!(lines(&view.menu), ["Stopping the job and quitting…"]);
     }
@@ -1244,6 +1257,7 @@ mod tests {
                 services,
                 job: Some(job(Phase::Running, Some(fraction))),
                 last_job: None,
+                ..Snapshot::default()
             })
             .menu
         };
@@ -1269,6 +1283,7 @@ mod tests {
             services: vec![klisi(), lab(fx.now)],
             job: None,
             last_job: None,
+            ..Snapshot::default()
         });
         assert_eq!(view.refresh_at, Some(fx.now + Duration::from_millis(400)));
         assert!(
@@ -1277,6 +1292,7 @@ mod tests {
                 services: vec![klisi()],
                 job: None,
                 last_job: None,
+                ..Snapshot::default()
             })
             .refresh_at
             .is_none()
@@ -1292,6 +1308,7 @@ mod tests {
             services: vec![due],
             job: None,
             last_job: None,
+            ..Snapshot::default()
         });
         assert_eq!(view.refresh_at, None);
         assert!(lines(&view.menu).contains(&"Offline: timed out. Retrying now".to_owned()));
@@ -1320,10 +1337,7 @@ mod tests {
     fn service_text_cannot_disguise_the_menu() {
         let mut fx = Fixture::new();
         // Hooks and folders can come from git.
-        fx.home.hooks.insert(
-            "klisi.example.com".parse().unwrap(),
-            vec![hook("tr\u{202e}anscribe\nOK", true)],
-        );
+        fx.home.hooks = vec![hook("tr\u{202e}anscribe\nOK", true)];
         fx.home.problems = vec![problem("services/\u{2066}evil\u{2069}\nOK")];
         let mut service = klisi();
         service.name = "kli\u{202e}si\nOK".into();
@@ -1334,6 +1348,7 @@ mod tests {
                 services: vec![service],
                 job: None,
                 last_job: None,
+                ..Snapshot::default()
             })
             .menu;
         let lines = lines(&menu);

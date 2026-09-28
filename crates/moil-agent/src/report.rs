@@ -119,9 +119,9 @@ pub struct ServiceReport {
     pub base_url: Url,
     /// Whether this machine is paired with the service (spec/machine.md
     /// §1.2): its `pairing.json` names the base URL in its `service.json`,
-    /// and, while an agent runs, the agent hasn't found its token missing
-    /// as it connected. Without an agent the token isn't looked for, since
-    /// reading the keychain may ask the owner first.
+    /// with or without an agent. Only an agent looks for the token, since
+    /// reading the keychain may ask the owner first, and it tells a missing
+    /// one by the connection.
     pub paired: bool,
     /// While an agent runs and the service is paired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,7 +148,8 @@ pub enum ConnectionReport {
         #[serde(with = "crate::rfc3339")]
         retry_at: SystemTime,
     },
-    /// The service removed this machine: pair again.
+    /// The service removed this machine, or moil has no token for it: pair
+    /// again.
     Unpaired,
     /// Another connection with this machine's token took over.
     Replaced,

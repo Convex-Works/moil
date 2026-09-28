@@ -5,21 +5,12 @@
 use std::process::{Command as Process, Stdio};
 
 use anyhow::bail;
+use moil_agent::control::PairingCode;
 use moil_agent::display::reveal;
 use moil_agent::report::ServiceRef;
-use url::Url;
 
 use super::Context;
 use super::output::Labels;
-
-/// What the owner needs to confirm a pairing.
-struct Started {
-    user_code: String,
-    verification_uri_complete: String,
-    service_name: String,
-    base_url: Url,
-    machine_name: String,
-}
 
 pub async fn run(
     ctx: &Context,
@@ -33,36 +24,13 @@ pub async fn run(
         .change(
             async |client| {
                 let pairing = client.pair(&target, name.as_deref()).await?;
-                let code = &pairing.code;
-                started(
-                    &Started {
-                        user_code: code.user_code.clone(),
-                        verification_uri_complete: code.verification_uri_complete.clone(),
-                        service_name: code.service_name.clone(),
-                        base_url: code.base_url.clone(),
-                        machine_name: code.machine_name.clone(),
-                    },
-                    no_browser,
-                    json,
-                );
+                started(&pairing.code, no_browser, json);
                 Ok(pairing.confirmed().await?)
             },
             async |machine| {
-                if let Some(name) = name.clone() {
-                    machine.update_settings(|s| s.machine_name = Some(name))?;
-                }
-                let session = machine.pair(&target).await?;
-                started(
-                    &Started {
-                        user_code: session.user_code.clone(),
-                        verification_uri_complete: session.verification_uri_complete.clone(),
-                        service_name: session.service_name.clone(),
-                        base_url: session.base_url().clone(),
-                        machine_name: machine.info().name,
-                    },
-                    no_browser,
-                    json,
-                );
+                let pair = async || machine.pair(&target).await;
+                let (session, code) = PairingCode::start(&machine, name.clone(), pair).await?;
+                started(&code, no_browser, json);
                 Ok(ServiceRef::from(&session.wait().await?))
             },
         )
@@ -99,7 +67,7 @@ fn target(ctx: &Context, service: &str) -> anyhow::Result<String> {
 }
 
 /// Shows the code to confirm and where, and opens the page.
-fn started(started: &Started, no_browser: bool, json: bool) {
+fn started(started: &PairingCode, no_browser: bool, json: bool) {
     let service_name = reveal(&started.service_name);
     eprintln!(
         "Pairing with {service_name} at {} as {:?}.",

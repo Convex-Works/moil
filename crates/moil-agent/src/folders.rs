@@ -8,8 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use moil_bundle::{Bundle, BundleError, LoadError};
-use moil_proto::BundleHash;
 use moil_proto::ids::is_bundle_name;
+use serde::de::DeserializeOwned;
 
 use crate::fs::{read_strict_json, with_path};
 use crate::report::Problem;
@@ -17,7 +17,7 @@ use crate::services::{Approval, Pairing, Service, ServiceFile, ServiceId};
 use crate::{Error, Home};
 
 /// What the home's `services/` folder holds.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Scan {
     /// Every service the home knows, by ID.
     pub services: Vec<Service>,
@@ -29,22 +29,28 @@ pub(crate) struct Scan {
     pub pairing_files: BTreeSet<ServiceId>,
     /// The files moil couldn't use, although they're there.
     pub unusable: Vec<Unusable>,
-    /// What's wrong, the unusable files included, as said when moil has
-    /// read nothing from them before to go on with.
+    /// What's wrong, the unusable files included.
     pub problems: Vec<Problem>,
+}
+
+/// Something in the home that is there, but that moil can't use: it can't
+/// be read, or it isn't valid. A running agent goes on with what it read
+/// from it before (spec/machine.md §1.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unusable {
+    /// `services/`, which can't be listed.
+    Services,
+    /// A service's `service.json`.
+    ServiceFile(ServiceId),
+    /// A service's `pairing.json`.
+    PairingFile(ServiceId),
 }
 
 /// Reads every service folder. Fails only if `services/` can't be listed;
 /// what's wrong inside it is a problem.
 pub(crate) fn scan(home: &Home) -> Result<Scan, Error> {
     let dir = home.services_dir();
-    let mut scan = Scan {
-        services: Vec::new(),
-        bundles: BTreeMap::new(),
-        pairing_files: BTreeSet::new(),
-        unusable: Vec::new(),
-        problems: Vec::new(),
-    };
+    let mut scan = Scan::default();
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(scan),
@@ -122,20 +128,9 @@ pub(crate) fn read(home: &Home, id: &ServiceId) -> Folder {
         unusable: Vec::new(),
         problems: Vec::new(),
     };
-    let unusable = |file, why| Unusable {
-        id: id.clone(),
-        file,
-        why,
-    };
     let relative = Path::new("services").join(id.as_str());
-    let file = match read_strict_json::<ServiceFile>(&home.service_file(id)) {
-        Ok(Some(file)) => match file.check() {
-            Ok(()) => Some(file),
-            Err(reason) => {
-                folder.add(unusable(FolderFile::Service, Why::Invalid(reason)));
-                None
-            }
-        },
+    let file = match read_valid(&home.service_file(id), ServiceFile::check) {
+        Ok(Some(file)) => file,
         Ok(None) => {
             if home.service_dir(id).is_dir() {
                 folder.problems.push(Problem {
@@ -145,22 +140,16 @@ pub(crate) fn read(home: &Home, id: &ServiceId) -> Folder {
                         .into(),
                 });
             }
-            None
+            return folder;
         }
-        Err(Error::Invalid { reason, .. }) => {
-            folder.add(unusable(FolderFile::Service, Why::Invalid(reason)));
-            None
+        Err(what) => {
+            folder.unusable.push(Unusable::ServiceFile(id.clone()));
+            folder.problems.push(Problem {
+                path: relative.join("service.json"),
+                message: format!("{what}. Fix it, or remove the folder."),
+            });
+            return folder;
         }
-        Err(e) => {
-            folder.add(unusable(
-                FolderFile::Service,
-                Why::Unreadable(e.to_string()),
-            ));
-            None
-        }
-    };
-    let Some(file) = file else {
-        return folder;
     };
 
     let mut approvals = Vec::new();
@@ -189,27 +178,16 @@ pub(crate) fn read(home: &Home, id: &ServiceId) -> Folder {
         .problems
         .extend(stray_bundle_problems(home, id, &file.approvals));
 
-    let pairing = match read_strict_json::<Pairing>(&home.pairing_file(id)) {
-        Ok(Some(pairing)) => match pairing.check() {
-            Ok(()) => Some(pairing),
-            Err(reason) => {
-                folder.add(unusable(FolderFile::Pairing, Why::Invalid(reason)));
-                None
-            }
-        },
-        Ok(None) => None,
-        Err(Error::Invalid { reason, .. }) => {
-            folder.add(unusable(FolderFile::Pairing, Why::Invalid(reason)));
-            None
-        }
-        Err(e) => {
-            folder.add(unusable(
-                FolderFile::Pairing,
-                Why::Unreadable(e.to_string()),
-            ));
-            None
-        }
-    };
+    let pairing = read_valid(&home.pairing_file(id), Pairing::check).unwrap_or_else(|what| {
+        folder.unusable.push(Unusable::PairingFile(id.clone()));
+        folder.problems.push(Problem {
+            path: relative.join("pairing.json"),
+            message: format!(
+                "{what}. Pair with the service again with `moil pair {id}` to write it anew."
+            ),
+        });
+        None
+    });
     // The token was issued for the base URL the machine paired with, and
     // is never sent anywhere else.
     let pairing = pairing.filter(|pairing| {
@@ -238,77 +216,18 @@ pub(crate) fn read(home: &Home, id: &ServiceId) -> Folder {
     folder
 }
 
-impl Folder {
-    fn add(&mut self, unusable: Unusable) {
-        self.problems.push(unusable.problem(false));
-        self.unusable.push(unusable);
-    }
-}
-
-/// A file of a service's folder that is there, but that moil can't use:
-/// it can't be read, or it isn't valid. A running agent goes on with what
-/// it read from it before (spec/machine.md §1.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Unusable {
-    pub id: ServiceId,
-    pub file: FolderFile,
-    why: Why,
-}
-
-/// Which of a service folder's files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FolderFile {
-    /// `service.json`.
-    Service,
-    /// `pairing.json`.
-    Pairing,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Why {
-    Invalid(String),
-    Unreadable(String),
-}
-
-impl Unusable {
-    /// The file, relative to the home, as problems name it.
-    pub fn path(&self) -> PathBuf {
-        let name = match self.file {
-            FolderFile::Service => "service.json",
-            FolderFile::Pairing => "pairing.json",
-        };
-        Path::new("services").join(self.id.as_str()).join(name)
-    }
-
-    /// The problem to report: `kept` when moil goes on with what it read
-    /// from the file before.
-    pub fn problem(&self, kept: bool) -> Problem {
-        let id = &self.id;
-        let what = match &self.why {
-            Why::Invalid(reason) => format!("This file isn't valid ({reason})"),
-            Why::Unreadable(error) => format!("moil can't read this file ({error})"),
-        };
-        let message = match (self.file, kept) {
-            (FolderFile::Service, false) => {
-                format!("{what}, so moil ignores the service. Fix it, or remove the folder.")
-            }
-            (FolderFile::Service, true) => format!(
-                "{what}, so moil goes on with what it read from it before. Fix it, or remove \
-                 the folder."
-            ),
-            (FolderFile::Pairing, false) => format!(
-                "{what}, so this machine isn't paired with the service. Pair with it again with \
-                 `moil pair {id}`."
-            ),
-            (FolderFile::Pairing, true) => format!(
-                "{what}, so moil goes on with the pairing it read from it before. Pair with the \
-                 service again with `moil pair {id}` to write it anew."
-            ),
-        };
-        Problem {
-            path: self.path(),
-            message,
-        }
+/// The file at `path`, if it's there and valid by serde and `check`, or
+/// why moil can't use it, as a sentence to go on.
+fn read_valid<T: DeserializeOwned>(
+    path: &Path,
+    check: impl FnOnce(&T) -> Result<(), String>,
+) -> Result<Option<T>, String> {
+    let invalid = |reason| format!("This file isn't valid ({reason})");
+    match read_strict_json::<T>(path) {
+        Ok(Some(value)) => check(&value).map(|()| Some(value)).map_err(invalid),
+        Ok(None) => Ok(None),
+        Err(Error::Invalid { reason, .. }) => Err(invalid(reason)),
+        Err(e) => Err(format!("moil can't read this file ({e})")),
     }
 }
 
@@ -414,8 +333,9 @@ pub(crate) fn check(
 }
 
 /// What's wrong under a service's `bundles/`, besides the approvals that
-/// don't count, which [`read`] reports: anything that isn't a folder
-/// `<name>/<hash>/` holding that bundle.
+/// don't count, which [`read`] reports: anything but the folders
+/// `<name>/<hash>/` that its approvals name. What's in those is for
+/// [`check`] to say.
 fn stray_bundle_problems(home: &Home, id: &ServiceId, approvals: &[Approval]) -> Vec<Problem> {
     let approved: HashSet<(&str, String)> = approvals
         .iter()
@@ -440,18 +360,10 @@ fn stray_bundle_problems(home: &Home, id: &ServiceId, approvals: &[Approval]) ->
             continue;
         }
         for hash in visible_entries(&path) {
-            if approved.contains(&(name.as_str(), hash.clone())) {
-                continue;
-            }
-            let bundle_dir = path.join(&hash);
-            let intact = hash.parse::<BundleHash>().is_ok_and(|hash| {
-                Bundle::from_dir(&bundle_dir)
-                    .is_ok_and(|b| b.hash() == hash && b.manifest().name == name)
-            });
-            if !intact {
+            if !approved.contains(&(name.as_str(), hash.clone())) {
                 problems.push(not_a_bundle(
                     relative.join(&name).join(&hash),
-                    "this folder doesn't hold the bundle it's named for",
+                    "no approval in service.json names this folder",
                 ));
             }
         }

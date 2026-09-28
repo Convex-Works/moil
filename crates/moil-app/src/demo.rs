@@ -7,7 +7,7 @@
 //! every phase, and one in three runs out of GPU memory; stopping one
 //! takes a moment, as a real script's would. klisi has a hook for
 //! transcribe; lab has one for minimal that isn't executable, which is a
-//! problem with the home until lab is unpaired. Pairing with any address
+//! problem with the home. Pairing with any address
 //! succeeds after a few seconds with the code WDJB-MJHT, unless its host
 //! starts with `deny`.
 //!
@@ -20,12 +20,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use moil_agent::control::VERSION;
-use moil_agent::report::{AgentInfo, HookReport, Host, Problem, ServiceReport, Status};
+use moil_agent::report::{HookListing, HookReport, Problem};
 use moil_agent::services::parse_base_url;
 use moil_agent::{
-    Approval, BundleStatus, Connection, Error, Home, JobOutcome, JobReport, JobStatus, Review,
-    Service, ServiceId, ServiceStatus, Snapshot,
+    Approval, BundleStatus, Connection, Error, Home, HomeState, JobOutcome, JobReport, JobStatus,
+    Review, Service, ServiceId, ServiceStatus, Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::{BundleHash, BundleInfo, ErrorCode, JobId, Phase, UrlPolicy};
@@ -108,8 +107,6 @@ pub struct Demo(Arc<State>);
 #[derive(Debug)]
 struct State {
     snapshot: watch::Sender<Snapshot>,
-    /// Marked whenever what `status` shows may have changed.
-    changes: watch::Sender<()>,
     /// What the demo's owner paired with and approved.
     paired: Mutex<Vec<Service>>,
     /// Set to stop the running job.
@@ -118,8 +115,6 @@ struct State {
     running: Mutex<Option<BundleHash>>,
     bundles: Vec<Bundle>,
     home: PathBuf,
-    /// The owner's hooks, by service. The demo never runs them.
-    hooks: Vec<(ServiceId, HookReport)>,
 }
 
 impl Demo {
@@ -158,6 +153,29 @@ impl Demo {
                 paired_at: days_ago(9),
             }),
         };
+        let root = home();
+        let hook = |service: &Service, bundle: &str, runnable| {
+            let home = Home::new(&root);
+            HookListing {
+                service: service.id.clone(),
+                hook: HookReport {
+                    bundle: bundle.into(),
+                    path: home.hook(&service.id, bundle),
+                    log: home.hook_log(&service.id, bundle),
+                    runnable,
+                },
+            }
+        };
+        // The owner's hooks, which the demo never runs.
+        let mut home_state = HomeState::default();
+        home_state.hooks = vec![
+            hook(&klisi, "transcribe", true),
+            hook(&lab, "minimal", false),
+        ];
+        home_state.problems = vec![Problem {
+            path: format!("services/{}/hooks/minimal", lab.id).into(),
+            message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
+        }];
         let snapshot = Snapshot {
             paused: false,
             services: vec![
@@ -181,32 +199,16 @@ impl Demo {
                 outcome: JobOutcome::Succeeded,
                 ended_at: now - Duration::from_secs(2 * 3600),
             }),
+            home: Arc::new(home_state),
         };
         let (klisi_id, lab_id) = (klisi.id.clone(), lab.id.clone());
-        let root = home();
-        let hook = |service: &ServiceId, bundle: &str, runnable| {
-            let home = Home::new(&root);
-            let hook = HookReport {
-                bundle: bundle.into(),
-                path: home.hook(service, bundle),
-                log: home.hook_log(service, bundle),
-                runnable,
-            };
-            (service.clone(), hook)
-        };
-        let hooks = vec![
-            hook(&klisi_id, "transcribe", true),
-            hook(&lab_id, "minimal", false),
-        ];
         let state = Arc::new(State {
             snapshot: watch::Sender::new(snapshot),
-            changes: watch::Sender::new(()),
             paired: Mutex::new(vec![klisi, lab]),
             stop: watch::Sender::new(false),
             running: Mutex::new(None),
             bundles: vec![v2, v3, minimal],
             home: root,
-            hooks,
         });
         tokio::spawn(state.clone().run_jobs(klisi_id));
         tokio::spawn(state.clone().keep_reconnecting(lab_id));
@@ -217,7 +219,6 @@ impl Demo {
 impl State {
     fn update(&self, change: impl FnOnce(&mut Snapshot)) {
         self.snapshot.send_modify(change);
-        self.changes.send_replace(());
     }
 
     fn update_job(&self, change: impl FnOnce(&mut JobStatus)) {
@@ -474,55 +475,6 @@ impl State {
         self.update(|s| s.services.retain(|s| s.id != *id));
     }
 
-    /// What `moil status` would report of the paired services and their
-    /// hooks. The app takes the rest from the snapshot.
-    fn status(&self) -> Status {
-        let paired = self.paired.lock().expect("the demo's state").clone();
-        let hooks = |id: &ServiceId| -> Vec<HookReport> {
-            let hooks = self.hooks.iter().filter(|(service, _)| service == id);
-            hooks.map(|(_, hook)| hook.clone()).collect()
-        };
-        let services: Vec<ServiceReport> = paired
-            .iter()
-            .map(|service| ServiceReport {
-                id: service.id.clone(),
-                name: service.name.clone(),
-                base_url: service.base_url.clone(),
-                paired: true,
-                connection: None,
-                approvals: service.approvals.clone(),
-                offered: None,
-                hooks: hooks(&service.id),
-            })
-            .collect();
-        let problems = services
-            .iter()
-            .flat_map(|service| &service.hooks)
-            .filter(|hook| !hook.runnable)
-            .map(|hook| Problem {
-                path: hook
-                    .path
-                    .strip_prefix(&self.home)
-                    .unwrap_or(&hook.path)
-                    .to_owned(),
-                message: "moil can't run this hook: it isn't executable. Run chmod +x on it."
-                    .into(),
-            })
-            .collect();
-        Status {
-            home: self.home.clone(),
-            agent: Some(AgentInfo {
-                host: Host::App,
-                version: VERSION.to_owned(),
-            }),
-            paused: self.snapshot.borrow().paused,
-            job: None,
-            last_job: None,
-            services,
-            problems,
-        }
-    }
-
     fn change_service(&self, id: &ServiceId, change: impl FnOnce(&mut Service)) -> Result<()> {
         let mut paired = self.paired.lock().expect("the demo's state");
         let service = paired
@@ -562,16 +514,8 @@ impl Backend for Demo {
         self.0.snapshot.subscribe()
     }
 
-    fn changes(&self) -> watch::Receiver<()> {
-        self.0.changes.subscribe()
-    }
-
     fn home(&self) -> PathBuf {
         self.0.home.clone()
-    }
-
-    fn status(&self) -> BoxFuture<'_, Result<Status>> {
-        async move { Ok(self.0.status()) }.boxed()
     }
 
     fn pair(&self, base_url: String) -> BoxFuture<'_, Result<Pairing>> {
@@ -640,17 +584,19 @@ impl Backend for Demo {
         .boxed()
     }
 
-    fn set_paused(&self, paused: bool) {
+    fn set_paused(&self, paused: bool) -> BoxFuture<'_, Result<()>> {
         self.0.update(|s| s.paused = paused);
+        async { Ok(()) }.boxed()
     }
 
-    fn stop_job(&self) {
+    fn stop_job(&self) -> BoxFuture<'_, ()> {
         self.0.stop_job();
+        async {}.boxed()
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         async move {
-            self.stop_job();
+            self.0.stop_job();
             sleep(pace::SHUTDOWN).await;
         }
         .boxed()
@@ -761,7 +707,7 @@ mod tests {
         let demo = Demo::start();
         let mut snapshots = demo.subscribe();
         snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
-        demo.stop_job();
+        demo.stop_job().await;
         assert!(snapshot(&demo).job.unwrap().stopping, "at once");
         sleep(pace::STOPPING / 2).await;
         assert!(snapshot(&demo).job.is_some(), "the script takes a moment");
@@ -772,11 +718,11 @@ mod tests {
         );
         drop(ended); // before changing the snapshot
 
-        demo.set_paused(true);
+        demo.set_paused(true).await.unwrap();
         sleep(Duration::from_secs(600)).await;
         assert!(snapshot(&demo).job.is_none(), "no job while paused");
 
-        demo.set_paused(false);
+        demo.set_paused(false).await.unwrap();
         snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
     }
 
@@ -838,33 +784,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn labs_hook_is_a_problem_until_lab_is_unpaired() {
+    async fn labs_hook_is_a_problem_that_unpairing_leaves() {
         let demo = Demo::start();
-        let status = demo.status().await.unwrap();
-        let hooks: Vec<_> = status
-            .services
+        let before = snapshot(&demo).home;
+        let hooks: Vec<_> = before
+            .hooks
             .iter()
-            .flat_map(|s| {
-                s.hooks
-                    .iter()
-                    .map(|h| (s.name.as_str(), &*h.bundle, h.runnable))
-            })
+            .map(|l| (l.service.as_str(), &*l.hook.bundle, l.hook.runnable))
             .collect();
         assert_eq!(
             hooks,
-            [("klisi", "transcribe", true), ("lab", "minimal", false)]
+            [
+                ("klisi.example.com", "transcribe", true),
+                ("lab.example.org", "minimal", false)
+            ]
         );
-        let problems: Vec<_> = status.problems.iter().map(|p| &p.path).collect();
+        let problems: Vec<_> = before.problems.iter().map(|p| &p.path).collect();
         assert_eq!(
             problems,
             [&PathBuf::from("services/lab.example.org/hooks/minimal")]
         );
-        assert!(status.services[0].hooks[0].path.starts_with(home()));
+        assert!(before.hooks[0].hook.path.starts_with(home()));
 
+        // As with the agent, lab's folder stays, and its hook with it.
         demo.unpair("lab.example.org".parse().unwrap())
             .await
             .unwrap();
-        assert!(demo.status().await.unwrap().problems.is_empty());
+        let after = snapshot(&demo);
+        assert_eq!(after.services.len(), 1);
+        assert_eq!(after.home, before);
     }
 
     #[tokio::test(start_paused = true)]

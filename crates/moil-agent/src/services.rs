@@ -212,8 +212,9 @@ pub struct Service {
     /// Those that don't are left out, and reported as problems.
     pub approvals: Vec<Approval>,
     /// This machine's pairing with the service, if its `pairing.json` names
-    /// [`base_url`](Self::base_url). The service is paired if moil also
-    /// holds its token: see [`Machine::is_paired`](crate::Machine::is_paired).
+    /// [`base_url`](Self::base_url): then the service is paired
+    /// (spec/machine.md §1.2). Whether moil holds its token only an agent
+    /// finds out, as it connects.
     pub pairing: Option<Pairing>,
 }
 

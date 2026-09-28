@@ -38,8 +38,8 @@ pub mod services;
 pub mod status;
 
 pub use agent::{
-    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobOutcome, JobReport, JobStatus,
-    ServiceStatus, Snapshot,
+    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, HomeState, JobOutcome, JobReport,
+    JobStatus, ServiceStatus, Snapshot,
 };
 pub use error::Error;
 pub use home::{Home, Settings};

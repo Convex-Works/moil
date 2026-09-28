@@ -13,6 +13,15 @@ pub enum Error {
     NotPaired(crate::ServiceId),
     #[error("{query:?} matches more than one service: {matches}")]
     AmbiguousService { query: String, matches: String },
+    /// A service whose base URL changed after the owner reviewed its
+    /// bundle, which was then for the service at the old one.
+    #[error("the URL of {0} changed after you reviewed the bundle; review it again")]
+    ServiceMoved(crate::ServiceId),
+    #[error("{hash} isn't approved for {service}")]
+    NotApproved {
+        service: crate::ServiceId,
+        hash: moil_proto::BundleHash,
+    },
     /// An address that can't be a service's, as a sentence for the owner.
     #[error("{0}")]
     InvalidAddress(String),

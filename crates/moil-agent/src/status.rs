@@ -4,128 +4,94 @@
 //! in one place.
 //!
 //! Without an agent, the report is what the home's files say now. With
-//! one, it is what the agent goes by: the home as it last read it, which
-//! keeps what it read before from files that can't be used
-//! (spec/machine.md §1.3), and its snapshot, as of the same moment.
+//! one, it is its snapshot, which holds the home as the agent last read it,
+//! keeping what it read before from files that can't be used
+//! (spec/machine.md §1.3).
 
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::agent::read_home;
 use crate::report::{
-    AgentInfo, ConnectionReport, EndedJob, ErrorReport, HookListing, OfferedBundle, Outcome,
-    Problem, RunningJob, ServiceReport, Status,
+    AgentInfo, ConnectionReport, EndedJob, ErrorReport, OfferedBundle, Outcome, RunningJob,
+    ServiceReport, Status,
 };
 use crate::{
-    AgentHandle, Connection, Error, Home, JobOutcome, JobReport, JobStatus, ReadOnlyMachine,
-    Service, ServiceId, ServiceStatus, Snapshot,
+    AgentHandle, Connection, Home, HomeState, JobOutcome, JobReport, JobStatus, ReadOnlyMachine,
+    Snapshot,
 };
 
 /// The status of a home no agent runs on: what its files say. Settings
 /// that can't be used read as the defaults, and are among the problems.
-/// A service is `paired` if its `pairing.json` names the base URL in its
-/// `service.json`: the token isn't looked for, since reading the keychain
-/// may ask the owner first.
-pub fn from_home(machine: &ReadOnlyMachine) -> Result<Status, Error> {
-    let survey = machine.survey();
-    Ok(build(Parts {
-        home: machine.home(),
-        services: survey.services.iter().collect(),
-        paused: survey.settings.paused,
-        hooks: &survey.hooks,
-        problems: survey.problems,
-        tokenless: None,
-        agent: None,
-    }))
+pub fn from_home(machine: &ReadOnlyMachine) -> Status {
+    let reading = read_home(&machine.0);
+    build(
+        machine.home(),
+        &reading.home,
+        machine.settings().paused,
+        None,
+    )
 }
 
 /// The status of the home `agent` runs on, as `info` describes the process
-/// running it. A service is `paired` if its `pairing.json` names the base
-/// URL in its `service.json`, unless the agent found no token for it when
-/// it connected.
-pub async fn from_agent(agent: &AgentHandle, info: &AgentInfo) -> Result<Status, Error> {
-    let published = agent.published();
-    let home = &published.home;
-    Ok(build(Parts {
-        home: agent.machine().home(),
-        services: home.services.values().collect(),
-        paused: published.snapshot.paused,
-        hooks: &home.hooks,
-        problems: home.problems.clone(),
-        tokenless: Some(&published.tokenless),
-        agent: Some((info, &published.snapshot)),
-    }))
+/// running it.
+pub fn from_agent(agent: &AgentHandle, info: &AgentInfo) -> Status {
+    let snapshot = agent.snapshot();
+    let home = agent.machine().home();
+    build(
+        home,
+        &snapshot.home,
+        snapshot.paused,
+        Some((info, &snapshot)),
+    )
 }
 
-/// What a status is made of.
-struct Parts<'a> {
-    home: &'a Home,
-    services: Vec<&'a Service>,
+/// The status of `home`, which reads as `state`, and the agent running on
+/// it, if one does.
+fn build(
+    home: &Home,
+    state: &HomeState,
     paused: bool,
-    hooks: &'a [HookListing],
-    problems: Vec<Problem>,
-    /// The services the agent found no token for, if one runs.
-    tokenless: Option<&'a BTreeSet<ServiceId>>,
-    agent: Option<(&'a AgentInfo, &'a Snapshot)>,
-}
-
-fn build(parts: Parts<'_>) -> Status {
+    agent: Option<(&AgentInfo, &Snapshot)>,
+) -> Status {
     let clock = Clock::now();
-    let home = parts.home;
-    let snapshot = parts.agent.map(|(_, snapshot)| snapshot);
+    let snapshot = agent.map(|(_, snapshot)| snapshot);
     Status {
         home: std::path::absolute(home.root()).unwrap_or_else(|_| home.root().to_owned()),
-        agent: parts.agent.map(|(info, _)| info.clone()),
-        paused: parts.paused,
+        agent: agent.map(|(info, _)| info.clone()),
+        paused,
         job: snapshot
             .and_then(|s| s.job.as_ref())
             .map(|job| running_job(job, &clock)),
         last_job: snapshot.and_then(|s| s.last_job.as_ref()).map(ended_job),
-        services: parts
+        services: state
             .services
-            .iter()
+            .values()
             .map(|service| {
                 let status = snapshot.and_then(|s| s.service(&service.id));
-                let tokenless = parts.tokenless.is_some_and(|t| t.contains(&service.id));
-                let mut report = service_report(service, status, &clock);
-                report.paired &= !tokenless;
-                report.hooks = parts
-                    .hooks
-                    .iter()
-                    .filter(|listing| listing.service == service.id)
-                    .map(|listing| listing.hook.clone())
-                    .collect();
-                report
+                ServiceReport {
+                    id: service.id.clone(),
+                    name: service.name.clone(),
+                    base_url: service.base_url.clone(),
+                    paired: service.pairing.is_some(),
+                    connection: status.map(|s| connection_report(&s.connection, &clock)),
+                    approvals: service.approvals.clone(),
+                    offered: status.map(|s| {
+                        s.bundles
+                            .iter()
+                            .map(|b| OfferedBundle {
+                                hash: b.info.hash,
+                                name: b.info.name.clone(),
+                                version: b.info.version.clone(),
+                                description: b.info.description.clone(),
+                                approved: b.approved,
+                            })
+                            .collect()
+                    }),
+                    hooks: state.service_hooks(&service.id),
+                }
             })
             .collect(),
-        problems: parts.problems,
-    }
-}
-
-fn service_report(
-    service: &Service,
-    status: Option<&ServiceStatus>,
-    clock: &Clock,
-) -> ServiceReport {
-    ServiceReport {
-        id: service.id.clone(),
-        name: service.name.clone(),
-        base_url: service.base_url.clone(),
-        paired: service.pairing.is_some(),
-        connection: status.map(|s| connection_report(&s.connection, clock)),
-        approvals: service.approvals.clone(),
-        offered: status.map(|s| {
-            s.bundles
-                .iter()
-                .map(|b| OfferedBundle {
-                    hash: b.info.hash,
-                    name: b.info.name.clone(),
-                    version: b.info.version.clone(),
-                    description: b.info.description.clone(),
-                    approved: b.approved,
-                })
-                .collect()
-        }),
-        hooks: Vec::new(),
+        problems: state.problems.clone(),
     }
 }
 
