@@ -16,7 +16,6 @@ mod gallery;
 mod icon;
 mod ipc;
 mod links;
-mod log;
 mod login;
 mod page;
 mod pair;
@@ -75,12 +74,15 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let log_dir = if options.demo {
-        Some(log::demo_dir())
+    let log_file = if options.demo {
+        // Apart from the real app's.
+        Some(std::env::temp_dir().join("moil-demo").join("moil.log"))
     } else {
-        log::default_dir()
+        moil_agent::Home::default_root()
+            .ok()
+            .map(|root| moil_agent::Home::new(root).log_file())
     };
-    let log_file = log::init(log_dir.as_deref());
+    let log_file = moil_agent::log::init(log_file.as_deref());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

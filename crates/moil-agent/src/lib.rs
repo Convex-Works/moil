@@ -25,6 +25,8 @@ mod fs;
 mod hardware;
 pub mod home;
 pub mod hooks;
+pub mod host;
+pub mod log;
 pub mod machine;
 mod net;
 pub mod pairing;
