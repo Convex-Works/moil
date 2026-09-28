@@ -2,10 +2,10 @@
 //!
 //! Every running attempt has a record on disk naming its working directory,
 //! the process supervising it and, once the script starts, its process
-//! group. Processes are named by pid and start time, so a pid the OS has
-//! since handed to an unrelated process is never mistaken for them. When an
-//! attempt ends, its record goes; a record whose supervisor is gone belongs
-//! to a crashed run, and [`reap`] kills what's left of it.
+//! group. Processes are named by pid, start time and boot, so a pid the OS
+//! has since handed to an unrelated process is never mistaken for them.
+//! When an attempt ends, its record goes; a record whose supervisor is gone
+//! belongs to a crashed run, and [`reap`] kills what's left of it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -193,7 +193,67 @@ mod tests {
         Process {
             pid: child.id() as i32,
             started,
+            boot: sys::boot_id(),
         }
+    }
+
+    /// A process group whose leader is gone and whose one member, a
+    /// `sleep`, lives on; and the group's ID.
+    fn leaderless_group() -> (i32, i32) {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $$ $!"])
+            .process_group(0)
+            .output()
+            .unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        let [group, member] = text
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect::<Vec<i32>>()[..]
+        else {
+            panic!("{text:?}");
+        };
+        (group, member)
+    }
+
+    fn pid_is_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Waits a few seconds at most for `pid` to be gone, and says whether
+    /// it went.
+    fn gone(pid: i32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_is_alive(pid) {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// An orphaned record naming the group `pid` led, written in `boot`.
+    fn orphaned_group(jobs_dir: &Path, pid: i32, boot: Option<String>) -> PathBuf {
+        let work_dir = jobs_dir.join("j.1");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        write_record(
+            jobs_dir,
+            "j.1",
+            &Record {
+                job_id: "j".into(),
+                attempt: 1,
+                work_dir: work_dir.clone(),
+                supervisor: dead_supervisor(),
+                group: Some(Process {
+                    pid,
+                    started: "0.000001".into(),
+                    boot,
+                }),
+            },
+        );
+        work_dir
     }
 
     fn is_alive(child: &mut std::process::Child) -> bool {
@@ -220,6 +280,7 @@ mod tests {
                 group: Some(Process {
                     pid,
                     started: "0.000001".into(),
+                    boot: sys::boot_id(),
                 }),
             },
         );
@@ -229,6 +290,36 @@ mod tests {
         assert!(!work_dir.exists());
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
+    }
+
+    #[test]
+    fn a_leaderless_group_left_over_from_a_crash_is_killed() {
+        let jobs = tempfile::tempdir().unwrap();
+        let (group, member) = leaderless_group();
+        let work_dir = orphaned_group(jobs.path(), group, sys::boot_id());
+
+        assert_eq!(reap(jobs.path(), false).unwrap(), 1);
+        assert!(gone(member), "the group's member lives on");
+        assert!(!work_dir.exists());
+    }
+
+    /// After a restart, the group ID a record names can be an unrelated
+    /// group's, even one whose leader is gone.
+    #[test]
+    fn a_record_from_another_boot_or_without_one_kills_nothing() {
+        for boot in [Some("another boot".to_owned()), None] {
+            let jobs = tempfile::tempdir().unwrap();
+            let (group, member) = leaderless_group();
+            let work_dir = orphaned_group(jobs.path(), group, boot.clone());
+
+            assert_eq!(reap(jobs.path(), false).unwrap(), 1);
+            assert!(
+                pid_is_alive(member),
+                "an unrelated group was killed ({boot:?})"
+            );
+            assert!(!work_dir.exists());
+            sys::signal_group(group, SIGKILL).unwrap();
+        }
     }
 
     #[test]

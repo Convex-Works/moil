@@ -10,7 +10,8 @@ use moil_proto::BundleHash;
 use serde::{Deserialize, Serialize};
 
 use crate::fs::{
-    PUBLIC, create_private, read_strict_json, replace_symlink, with_path, write_atomic, write_json,
+    PUBLIC, create_private, read_small, read_strict_json, replace_symlink, with_path, write_atomic,
+    write_json,
 };
 use crate::report::Problem;
 use crate::{Error, ServiceId};
@@ -77,8 +78,9 @@ pub const GITIGNORE: &str = "\
 # What belongs to this machine alone:
 /.machine/
 /settings.json
-pairing.json
-logs/
+/logs/
+/services/*/logs/
+/services/*/pairing.json
 ";
 
 /// The `.gitignore` moil writes in a service's folder when there is none,
@@ -307,7 +309,8 @@ impl Home {
     /// each service folder, where there are none.
     pub(crate) fn write_guides(&self) -> Result<(), Error> {
         let readme = self.readme_file();
-        if fs::read(&readme).ok().as_deref() != Some(README_TEXT.as_bytes()) {
+        let current = read_small(&readme).ok().flatten();
+        if current.as_deref() != Some(README_TEXT.as_bytes()) {
             write_atomic(&readme, README_TEXT.as_bytes(), PUBLIC)
                 .map_err(|e| with_path(e, &readme))?;
         }

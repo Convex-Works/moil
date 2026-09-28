@@ -4,10 +4,11 @@
 
 use std::process::{Command as Process, Stdio};
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use moil_agent::control::PairingCode;
 use moil_agent::display::reveal;
 use moil_agent::report::ServiceRef;
+use url::Url;
 
 use super::Context;
 use super::output::Labels;
@@ -24,13 +25,13 @@ pub async fn run(
         .change(
             async |client| {
                 let pairing = client.pair(&target, name.as_deref()).await?;
-                started(&pairing.code, no_browser, json);
+                started(&pairing.code, no_browser, json)?;
                 Ok(pairing.confirmed().await?)
             },
             async |machine| {
                 let pair = async || machine.pair(&target).await;
                 let (session, code) = PairingCode::start(&machine, name.clone(), pair).await?;
-                started(&code, no_browser, json);
+                started(&code, no_browser, json)?;
                 Ok(ServiceRef::from(&session.wait().await?))
             },
         )
@@ -66,8 +67,15 @@ fn target(ctx: &Context, service: &str) -> anyhow::Result<String> {
     }
 }
 
+/// The confirmation page, which the agent checked is on the service's
+/// origin and passes on as it parsed it, to show and open exactly that.
+fn page(checked: &str) -> anyhow::Result<Url> {
+    Url::parse(checked).with_context(|| format!("the confirmation page {checked:?} isn't a URL"))
+}
+
 /// Shows the code to confirm and where, and opens the page.
-fn started(started: &PairingCode, no_browser: bool, json: bool) {
+fn started(started: &PairingCode, no_browser: bool, json: bool) -> anyhow::Result<()> {
+    let page = page(&started.verification_uri_complete)?;
     let service_name = reveal(&started.service_name);
     eprintln!(
         "Pairing with {service_name} at {} as {:?}.",
@@ -78,15 +86,16 @@ fn started(started: &PairingCode, no_browser: bool, json: bool) {
     }
     Labels::new()
         .with("Code", started.user_code.as_str())
-        .with("URL", started.verification_uri_complete.as_str())
+        .with("URL", page.as_str())
         .print(json);
-    if !no_browser && open_browser(&started.verification_uri_complete).is_err() {
+    if !no_browser && open_browser(&page).is_err() {
         eprintln!("Couldn't open a browser; open the URL above yourself.");
     }
     eprintln!("Check that {service_name} shows the same code, then confirm it there. Waiting…");
+    Ok(())
 }
 
-fn open_browser(url: &str) -> std::io::Result<()> {
+fn open_browser(url: &Url) -> std::io::Result<()> {
     let mut command = if cfg!(target_os = "macos") {
         Process::new("open")
     } else if cfg!(windows) {
@@ -97,7 +106,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         Process::new("xdg-open")
     };
     command
-        .arg(url)
+        .arg(url.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -425,7 +424,8 @@ func (f *follower) rest() []string {
 	return rest
 }
 
-// tokens returns the machine tokens the machine keeps.
+// tokens returns the machine tokens the machine keeps, each of which it
+// keeps with the base URL it was issued for.
 func (m *machine) tokens() []string {
 	m.t.Helper()
 	data, err := os.ReadFile(filepath.Join(m.home, ".machine", "secrets.json"))
@@ -436,7 +436,18 @@ func (m *machine) tokens() []string {
 	if err := json.Unmarshal(data, &secrets); err != nil || len(secrets) == 0 {
 		m.t.Fatalf("the machine keeps no tokens: %v, %s", err, data)
 	}
-	return slices.Collect(maps.Values(secrets))
+	var tokens []string
+	for _, stored := range secrets {
+		var issued struct {
+			BaseURL string `json:"base_url"`
+			Token   string `json:"token"`
+		}
+		if err := json.Unmarshal([]byte(stored), &issued); err != nil || issued.Token == "" || issued.BaseURL == "" {
+			m.t.Fatalf("the machine keeps a token without the URL it was issued for: %v", err)
+		}
+		tokens = append(tokens, issued.Token)
+	}
+	return tokens
 }
 
 // Start runs `moil agent` and waits until it's connected to the service.

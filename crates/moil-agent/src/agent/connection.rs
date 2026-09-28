@@ -71,10 +71,10 @@ pub(super) enum LinkEvent {
         error: String,
         retry_at: Instant,
     },
-    /// The service removed this machine (4401). The task has ended.
+    /// The machine has to pair with the service again: the service
+    /// removed it (401 or 4401), or moil holds no token issued for the
+    /// service's base URL. The task has logged which, and ended.
     Unpaired,
-    /// moil has no token for the service. The task has ended.
-    NoToken,
     /// Another connection with this machine's token took over (4409). The
     /// task has ended.
     Replaced,
@@ -170,8 +170,11 @@ struct Channel {
 enum End {
     /// The agent closed it.
     Stopped,
-    Unpaired,
-    NoToken,
+    /// The service removed this machine.
+    Removed,
+    /// moil holds no token it may send to the service, for the reason
+    /// given.
+    NoToken(String),
     Replaced,
     /// Anything else; worth trying again.
     Lost(String),
@@ -191,8 +194,14 @@ impl Channel {
             };
             let error = match end {
                 End::Stopped => return,
-                End::Unpaired => return self.report(LinkEvent::Unpaired),
-                End::NoToken => return self.report(LinkEvent::NoToken),
+                End::Removed => {
+                    tracing::warn!("{} removed this machine; pair it again", self.name);
+                    return self.report(LinkEvent::Unpaired);
+                }
+                End::NoToken(why) => {
+                    tracing::warn!("{why}, so it doesn't connect to it; pair with it again");
+                    return self.report(LinkEvent::Unpaired);
+                }
                 End::Replaced => return self.report(LinkEvent::Replaced),
                 End::Lost(error) => error,
             };
@@ -208,7 +217,9 @@ impl Channel {
         }
     }
 
-    /// Opens the WebSocket with the machine's token (spec §6).
+    /// Opens the WebSocket with the machine's token (spec §6), at the base
+    /// URL the token was issued for, which must be the one the service's
+    /// folder names (spec/machine.md §1.2).
     async fn open(&self) -> Result<Socket, End> {
         let lost = |e: Error| End::Lost(e.to_string());
         self.machine.check_url(&self.base_url).map_err(lost)?;
@@ -218,13 +229,22 @@ impl Channel {
         let token = tokio::select! {
             () = self.stop.cancelled() => return Err(End::Stopped),
             token = token => match token {
-                Ok(Some(token)) => token,
-                Ok(None) => return Err(End::NoToken),
+                Ok(Some(token)) if token.base_url == self.base_url => token,
+                Ok(Some(token)) => {
+                    return Err(End::NoToken(format!(
+                        "moil's token for {} was issued for {}, not {}",
+                        self.service, token.base_url, self.base_url
+                    )));
+                }
+                Ok(None) => {
+                    return Err(End::NoToken(format!("moil has no token for {}", self.service)));
+                }
                 Err(e) => return Err(lost(e)),
             },
         };
+        let base_url = &token.base_url;
 
-        let mut url = Url::parse(&net::endpoint(&self.base_url, "v1/connect"))
+        let mut url = Url::parse(&net::endpoint(base_url, "v1/connect"))
             .expect("a base URL stays a URL when a path is added");
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
         url.set_scheme(scheme)
@@ -234,7 +254,7 @@ impl Channel {
             .into_client_request()
             .map_err(|e| End::Lost(net::describe(&e)))?;
         let headers = request.headers_mut();
-        let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", token.token))
             .map_err(|_| End::Lost("the machine token isn't valid in a header".into()))?;
         headers.insert(header::AUTHORIZATION, bearer);
         if let Ok(agent) = HeaderValue::from_str(&format!("moil/{}", self.machine.app_version())) {
@@ -260,7 +280,7 @@ impl Channel {
             Ok(Err(tungstenite::Error::Http(response)))
                 if response.status() == StatusCode::UNAUTHORIZED =>
             {
-                Err(End::Unpaired)
+                Err(End::Removed)
             }
             Ok(Err(tungstenite::Error::Http(response))) => Err(End::Lost(format!(
                 "{} answered {} instead of opening the channel",
@@ -486,7 +506,7 @@ fn closed(frame: Option<CloseFrame>) -> End {
         return End::Lost("the service closed the connection".into());
     };
     match u16::from(frame.code) {
-        close_code::UNAUTHORIZED => End::Unpaired,
+        close_code::UNAUTHORIZED => End::Removed,
         close_code::REPLACED => End::Replaced,
         code if frame.reason.is_empty() => {
             End::Lost(format!("the service closed the connection ({code})"))

@@ -60,7 +60,10 @@ trailing newline, and replaces a file atomically, so a reader never sees
 half of one. Times are RFC 3339 strings in UTC, such as
 `2026-09-27T22:41:07Z`. JSON files are strict, like manifests (protocol
 §5.3): a file with unknown fields or duplicate keys is invalid, so that a
-typo is reported rather than ignored.
+typo is reported rather than ignored. moil reads `settings.json`, each
+`service.json` and `pairing.json`, and approved bundles' files only if
+they are regular files rather than symbolic links, and a JSON file only up
+to 1 MiB: a `git pull` can put anything at these paths.
 
 The owner, an editor or git MAY change `settings.json`, each
 `service.json`, anything under `hooks/`, and the `.gitignore` files once
@@ -163,8 +166,10 @@ refused until the files match again.
 
 The `.gitignore` in a service's folder keeps `pairing.json` and `logs/`
 out of git, so the folder can be a repository of its own. The one at the
-root of the home keeps out `.machine/`, `settings.json`, `pairing.json`
-and `logs/`, so the whole home can be one instead.
+root of the home keeps out `.machine/`, `settings.json` and `logs/`, and
+each service's `pairing.json` and `logs/`, so the whole home can be one
+instead. Both name only those paths, so a bundle or hook named `logs` is
+kept like any other.
 
 Whoever can change a service's folder can approve bundles for it and add
 hooks. A folder kept in git extends that power to whoever can push to its

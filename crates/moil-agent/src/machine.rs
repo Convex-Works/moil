@@ -13,6 +13,7 @@ use moil_proto::BundleHash;
 use moil_proto::control::{BundleInfo, MachineInfo};
 use moil_proto::http::{BundleResponse, BundlesResponse, InfoResponse, PairRequest, PairResponse};
 use moil_proto::ids::is_bundle_name;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::folders;
@@ -117,12 +118,32 @@ impl ReadOnlyMachine {
     }
 }
 
-/// A paired service and the token that proves this machine to it.
+/// A paired service and the token that proves this machine to it, which
+/// was issued for the service's base URL.
 struct Credentials {
     service: Service,
-    /// The base URL the token was issued for: the only one it goes to.
-    base_url: Url,
-    token: String,
+    token: Token,
+}
+
+/// A machine token and the base URL it was issued for, kept together in
+/// the secret store. Whatever sends the token sends it to that URL and
+/// nowhere else, whatever the home's files say: `pairing.json` and
+/// `service.json` are plain files, which a `git pull` can change
+/// (spec/machine.md §1.2).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Token {
+    pub base_url: Url,
+    pub token: String,
+}
+
+impl fmt::Debug for Token {
+    /// Leaves out the token itself.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Token")
+            .field("base_url", &self.base_url.as_str())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The most GPUs `hello` lists (spec §10).
@@ -455,10 +476,15 @@ impl Machine {
             .await
             .map_err(|e| net::unreachable(base_url.as_str(), &e))?;
         let started = Instant::now();
-        let pairing: PairResponse = net::read_json(&info.name, response).await?;
+        let mut pairing: PairResponse = net::read_json(&info.name, response).await?;
         services::check_name(&pairing.service.name).map_err(not_a_service)?;
-        check_confirmation_page(&base_url, &pairing.verification_uri)?;
-        check_confirmation_page(&base_url, &pairing.verification_uri_complete)?;
+        // The pages as they were checked are the ones shown and opened.
+        for page in [
+            &mut pairing.verification_uri,
+            &mut pairing.verification_uri_complete,
+        ] {
+            *page = check_confirmation_page(&base_url, page)?.into();
+        }
         Ok(PairingSession::new(
             self.clone(),
             base_url,
@@ -467,19 +493,20 @@ impl Machine {
         ))
     }
 
-    /// Records a confirmed pairing: stores the token and `pairing.json`.
-    /// Pairing with a base URL that a folder's `service.json` names adopts
-    /// that folder, paired or not, keeping its approvals and hooks; else
-    /// the service gets a new folder, under an ID no folder uses. Returns
-    /// the service, and the token the new one replaced with the base URL it
-    /// was issued for, so that the caller can let that service forget it.
+    /// Records a confirmed pairing: stores the token with `base_url`, and
+    /// `pairing.json`. Pairing with a base URL that a folder's
+    /// `service.json` names adopts that folder, paired or not, keeping its
+    /// approvals and hooks; else the service gets a new folder, under an ID
+    /// no folder uses. Returns the service, and the token the new one
+    /// replaced, so that the caller can let the service it was issued for
+    /// forget it.
     pub(crate) fn record_pairing(
         &self,
         base_url: &Url,
         name: String,
         machine_id: String,
         token: &str,
-    ) -> Result<(Service, Option<(Url, String)>), Error> {
+    ) -> Result<(Service, Option<Token>), Error> {
         let _services = self.lock_services();
         let home = &self.inner.home;
         // A folder this machine is paired through comes first, then the
@@ -514,17 +541,12 @@ impl Machine {
             self.save_service_file(&id, &file)?;
         }
 
-        // The token this one replaces goes back only to where it was
-        // issued, if that's known.
-        let paired_with = read_strict_json::<Pairing>(&home.pairing_file(&id))
-            .ok()
-            .flatten()
-            .map(|pairing| pairing.base_url);
-        let replaced = match (self.token(&id)?, paired_with) {
-            (Some(old), Some(url)) if old != token || url != *base_url => Some((url, old)),
-            _ => None,
+        let issued = Token {
+            base_url: base_url.clone(),
+            token: token.to_owned(),
         };
-        self.inner.secrets.set(&self.token_key(&id), token)?;
+        let replaced = self.token(&id)?.filter(|old| *old != issued);
+        self.save_token(&id, &issued)?;
         let pairing = Pairing {
             base_url: base_url.clone(),
             machine_id,
@@ -536,27 +558,30 @@ impl Machine {
 
     /// Unpairs from a service (spec/machine.md §3.2): tells it to remove
     /// this machine (`DELETE /v1/machine`, best effort, and only at the
-    /// base URL the machine paired with), then deletes the token and
+    /// base URL the token was issued for), then deletes the token and
     /// `pairing.json`. The folder stays, with its approvals and hooks.
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
         let found = id.clone();
-        let (pairing, token) = self
+        let token = self
             .blocking(move |machine| {
                 let home = &machine.inner.home;
-                let pairing_file = home.pairing_file(&found);
-                let pairing = read_strict_json::<Pairing>(&pairing_file).ok().flatten();
                 let token = machine.token(&found)?;
-                if !pairing_file.exists() && token.is_none() {
+                if !home.pairing_file(&found).exists() && token.is_none() {
                     return Err(match home.service_dir(&found).is_dir() {
                         true => Error::NotPaired(found),
                         false => Error::UnknownService(found.to_string()),
                     });
                 }
-                Ok((pairing, token))
+                Ok(token)
             })
             .await?;
-        if let (Some(pairing), Some(token)) = (pairing, token) {
-            self.forget_token_on(&pairing.base_url, &token).await;
+        if let Some(token) = token
+            && let Err(e) = self.forget_token_on(&token).await
+        {
+            tracing::warn!(
+                "couldn't tell {} to forget this machine: {e}",
+                token.base_url
+            );
         }
         let id = id.clone();
         self.blocking(move |machine| machine.forget(&id)).await
@@ -607,23 +632,26 @@ impl Machine {
         Ok(())
     }
 
-    /// Asks the service to remove the machine that `token` belongs to. Best
-    /// effort: failures are only logged.
-    pub(crate) async fn forget_token_on(&self, base_url: &Url, token: &str) {
-        let request = self
+    /// Asks the service that issued `token` to remove the machine it
+    /// belongs to (`DELETE /v1/machine`), at the base URL it was issued
+    /// for, if the owner's settings allow reaching it.
+    pub(crate) async fn forget_token_on(&self, token: &Token) -> Result<(), Error> {
+        let base_url = &token.base_url;
+        self.check_url(base_url)?;
+        let response = self
             .net()
             .http
             .delete(net::endpoint(base_url, "v1/machine"))
-            .bearer_auth(token)
+            .bearer_auth(&token.token)
             .timeout(UNPAIR_TIMEOUT)
-            .send();
-        match request.await {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) => tracing::warn!(
-                "{base_url} answered {} when asked to forget this machine",
-                response.status()
-            ),
-            Err(e) => tracing::warn!("couldn't tell {base_url} to forget this machine: {e}"),
+            .send()
+            .await
+            .map_err(|e| net::unreachable(base_url.as_str(), &e))?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            status => Err(Error::Http(format!(
+                "{base_url} answered {status} when asked to forget this machine"
+            ))),
         }
     }
 
@@ -759,13 +787,41 @@ impl Machine {
         self.service(id)
     }
 
-    /// The machine token for a service, if it has one.
-    pub(crate) fn token(&self, id: &ServiceId) -> Result<Option<String>, Error> {
-        self.inner.secrets.get(&self.token_key(id))
+    /// The machine token kept for service `id`, with the base URL it was
+    /// issued for, whatever URL the service's files name now.
+    pub(crate) fn token(&self, id: &ServiceId) -> Result<Option<Token>, Error> {
+        let Some(stored) = self.inner.secrets.get(&self.token_key(id))? else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&stored) {
+            Ok(token) => Ok(Some(token)),
+            // Such as a token kept without its URL: nothing says where it
+            // may go.
+            Err(_) => {
+                tracing::warn!(
+                    "moil's token for {id} doesn't say which URL it was issued for, so moil \
+                     sends it nowhere; pair with the service again"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The token for `service`, if moil holds one issued for its base URL.
+    fn token_for(&self, service: &Service) -> Result<Option<Token>, Error> {
+        Ok(self
+            .token(&service.id)?
+            .filter(|token| token.base_url == service.base_url))
+    }
+
+    fn save_token(&self, id: &ServiceId, token: &Token) -> Result<(), Error> {
+        let stored = serde_json::to_string(token).expect("a token serializes");
+        self.inner.secrets.set(&self.token_key(id), &stored)
     }
 
     /// Where a service's token is kept. One key per service ID, so pairing
-    /// the same service again replaces the token.
+    /// the same service again replaces the token, and the URL it was
+    /// issued for with it.
     fn token_key(&self, id: &ServiceId) -> String {
         format!("{id}@{}", self.inner.token_scope)
     }
@@ -796,39 +852,34 @@ impl Machine {
         }
     }
 
-    /// Service `id`, if this machine is paired with it, and its token.
+    /// Service `id`, if this machine is paired with it (spec/machine.md
+    /// §1.2), and its token.
     async fn credentials(&self, id: &ServiceId) -> Result<Credentials, Error> {
         let id = id.clone();
         self.blocking(move |machine| {
             let service = machine.service(&id)?;
             let not_paired = || Error::NotPaired(id.clone());
-            let base_url = service
-                .pairing
-                .as_ref()
-                .ok_or_else(not_paired)?
-                .base_url
-                .clone();
-            let token = machine.token(&id)?.ok_or_else(not_paired)?;
-            Ok(Credentials {
-                service,
-                base_url,
-                token,
-            })
+            if service.pairing.is_none() {
+                return Err(not_paired());
+            }
+            let token = machine.token_for(&service)?.ok_or_else(not_paired)?;
+            Ok(Credentials { service, token })
         })
         .await
     }
 
-    /// `GET`s a machine-authenticated endpoint of a service.
+    /// `GET`s a machine-authenticated endpoint of a service, at the base
+    /// URL its token was issued for.
     async fn get(&self, to: &Credentials, path: &str) -> Result<reqwest::Response, Error> {
-        self.check_url(&to.base_url)?;
-        let url = net::endpoint(&to.base_url, path);
+        let base_url = &to.token.base_url;
+        self.check_url(base_url)?;
         self.net()
             .http
-            .get(&url)
-            .bearer_auth(&to.token)
+            .get(net::endpoint(base_url, path))
+            .bearer_auth(&to.token.token)
             .send()
             .await
-            .map_err(|e| net::unreachable(to.base_url.as_str(), &e))
+            .map_err(|e| net::unreachable(base_url.as_str(), &e))
     }
 
     /// A service's `service.json` as it is, approvals that don't count
@@ -942,5 +993,30 @@ mod tests {
         assert_eq!(info.name, format!("Ada's {}", "very ".repeat(20))[..64]);
         assert_eq!(info.gpus, (0..64).map(gpu).collect::<Vec<_>>());
         assert_eq!(machine.app_version().chars().count(), 64);
+    }
+
+    #[tokio::test]
+    async fn a_token_goes_over_plain_http_only_when_the_owner_allows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Machine::open(MachineConfig {
+            home: Home::new(dir.path()),
+            secrets: Arc::new(MemorySecrets::default()),
+            app_version: "0.1.0".into(),
+        })
+        .unwrap();
+        let token = Token {
+            base_url: "http://moil.invalid/moil".parse().unwrap(),
+            token: "moil_token_1".into(),
+        };
+        let err = machine.forget_token_on(&token).await.unwrap_err();
+        assert!(matches!(err, Error::InsecureUrl(_)), "{err}");
+
+        // With the owner's permission the machine goes on and tries to
+        // reach it.
+        machine
+            .update_settings(|s| s.allow_insecure_http = true)
+            .unwrap();
+        let err = machine.forget_token_on(&token).await.unwrap_err();
+        assert!(!matches!(err, Error::InsecureUrl(_)), "{err}");
     }
 }

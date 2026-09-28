@@ -215,6 +215,10 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
             false,
         ),
         ("services/klisi.example.com/hooks/transcribe", false),
+        // A bundle's name may be one of those the file names.
+        ("services/klisi.example.com/bundles/logs/abc/job.py", false),
+        ("services/klisi.example.com/hooks/logs", false),
+        ("services/klisi.example.com/logs/logs.log", true),
     ] {
         assert_eq!(
             ignored(root, path),
@@ -228,6 +232,8 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
         ("logs/transcribe.log", true),
         ("service.json", false),
         ("hooks/transcribe", false),
+        ("bundles/logs/abc/job.py", false),
+        ("hooks/logs", false),
     ] {
         assert_eq!(
             ignored(&klisi, path),
@@ -439,8 +445,12 @@ async fn pairing_stores_the_service_and_its_token() {
     drop(machine);
     let machine = open_machine(dir.path());
     assert_eq!(machine.services().unwrap(), std::slice::from_ref(&paired));
-    let tokens = tokens(dir.path());
-    assert_eq!(tokens.values().collect::<Vec<_>>(), ["moil_token_1"]);
+    let tokens = issued_tokens(dir.path());
+    assert_eq!(
+        tokens.values().collect::<Vec<_>>(),
+        [&(service.base_url.clone(), "moil_token_1".to_owned())],
+        "the token is kept with the URL it was issued for"
+    );
     for file in std::fs::read_dir(&folder).unwrap() {
         let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
         assert!(!text.contains("moil_token_1"), "{text}");
@@ -618,6 +628,29 @@ async fn pairing_is_confirmed_only_on_the_services_own_origin() {
     }
     assert!(relay.polls().is_empty(), "no token was asked for");
     assert!(machine.services().unwrap().is_empty());
+}
+
+/// Browsers and the operating system parse URLs their own ways: the
+/// owner is sent to the page as moil parsed it to check its origin.
+#[tokio::test]
+async fn the_confirmation_page_checked_is_the_one_opened() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let origin = service.base_url.trim_end_matches("/moil");
+
+    // A backslash that a parser could read as a user name's end.
+    let page = format!("{origin}\\@evil.example/pair");
+    service.pairing_pages(&page, &format!(" {page}?code=WDJB MJHT"));
+    let session = machine.pair(&service.base_url).await.unwrap();
+    assert_eq!(
+        session.verification_uri,
+        format!("{origin}/@evil.example/pair")
+    );
+    assert_eq!(
+        session.verification_uri_complete,
+        format!("{origin}/@evil.example/pair?code=WDJB%20MJHT")
+    );
 }
 
 #[tokio::test]
@@ -1275,6 +1308,161 @@ async fn a_pairing_for_another_base_url_doesnt_count() {
             .all(|token| new.tokens().contains(token))
     );
     assert_eq!(problems(dir.path()), []);
+}
+
+/// Points both of a service's files at `url`, as a `git pull` could, or
+/// a folder cloned in place of one that was deleted: they are plain files.
+fn point_files_at(machine: &Machine, service: &Service, url: &str) {
+    let home = machine.home();
+    for file in [
+        home.service_file(&service.id),
+        home.pairing_file(&service.id),
+    ] {
+        edit_json(&file, |file| file["base_url"] = url.into());
+    }
+}
+
+/// The token goes only to the base URL it was issued for, whatever the
+/// home's files say (spec/machine.md §1.2).
+#[tokio::test]
+async fn files_naming_another_url_never_get_the_token_sent_there() {
+    let klisi = FakeService::start("klisi").await;
+    let elsewhere = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &klisi).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    klisi.host(&bundle);
+    elsewhere.host(&bundle);
+
+    point_files_at(&machine, &paired, &elsewhere.base_url);
+    let pointed = machine.service(&paired.id).unwrap();
+    assert!(pointed.pairing.is_some(), "the files agree with each other");
+    for err in [
+        machine.bundles(&paired.id).await.unwrap_err(),
+        machine.review(&paired.id, bundle.hash()).await.unwrap_err(),
+    ] {
+        assert!(matches!(err, Error::NotPaired(_)), "{err}");
+    }
+
+    // Unpairing tells the service that issued the token, and only it.
+    machine.unpair(&paired.id).await.unwrap();
+    assert_eq!(klisi.forgotten(), ["moil_token_1"]);
+    assert_eq!(elsewhere.presented(), [] as [String; 0]);
+    assert!(tokens(dir.path()).is_empty());
+}
+
+#[tokio::test]
+async fn pairing_again_tells_only_the_service_that_issued_the_old_token() {
+    let klisi = FakeService::start("klisi").await;
+    let elsewhere = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    pair(&machine, &klisi).await;
+    // So that the token kept, moil_token_2, is one `elsewhere` never issues.
+    let paired = pair(&machine, &klisi).await;
+    until("klisi to forget the first token", || {
+        klisi.forgotten() == ["moil_token_1"]
+    })
+    .await;
+
+    point_files_at(&machine, &paired, &elsewhere.base_url);
+    let adopted = pair(&machine, &elsewhere).await;
+    assert_eq!(adopted.id, paired.id);
+    until("klisi to forget the token it issued", || {
+        klisi.forgotten() == ["moil_token_1", "moil_token_2"]
+    })
+    .await;
+    assert!(!elsewhere.presented().contains(&"moil_token_2".to_owned()));
+    assert_eq!(elsewhere.forgotten(), [] as [String; 0]);
+    assert_eq!(
+        issued_tokens(dir.path()).into_values().collect::<Vec<_>>(),
+        [(elsewhere.base_url.clone(), "moil_token_1".to_owned())]
+    );
+}
+
+/// Runs `work` on a thread of its own, failing the test if it doesn't
+/// return within [`PATIENCE`] rather than hanging it.
+fn without_hanging<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(work()));
+    result
+        .recv_timeout(PATIENCE)
+        .unwrap_or_else(|_| panic!("{what} hung"))
+}
+
+fn mkfifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+/// What someone who can push to a service folder's repository could
+/// commit in place of its files: each is a problem, and reading the home
+/// neither hangs nor reads anything else.
+#[tokio::test]
+async fn links_and_fifos_in_a_service_folder_are_problems_not_hangs() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    approve(&machine, &service, &paired, &bundle).await;
+    let bundle_dir = approved_dir(&machine, &paired, &bundle);
+    let folder = format!("services/{}", paired.id);
+    let problem = |path: String| {
+        let home = dir.path().to_owned();
+        let found = without_hanging("reading the home", move || problems(&home));
+        problem_at(&found, &path).message.clone()
+    };
+
+    let link_to_zeros = |path: &Path| std::os::unix::fs::symlink("/dev/zero", path).unwrap();
+    let replacements: [&dyn Fn(&Path); 2] = [&link_to_zeros, &mkfifo];
+    for make in replacements {
+        let job_py = bundle_dir.join("job.py");
+        std::fs::remove_file(&job_py).unwrap();
+        make(&job_py);
+        let message = problem(format!("{folder}/bundles/transcribe/{}", bundle.hash()));
+        assert!(message.contains("job.py isn't a regular file"), "{message}");
+        std::fs::remove_file(&job_py).unwrap();
+        std::fs::write(&job_py, bundle.script()).unwrap();
+    }
+    assert_eq!(problems(dir.path()), []);
+
+    let home = machine.home();
+    for (file, path) in [
+        (
+            home.pairing_file(&paired.id),
+            format!("{folder}/pairing.json"),
+        ),
+        (
+            home.service_file(&paired.id),
+            format!("{folder}/service.json"),
+        ),
+    ] {
+        let text = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        mkfifo(&file);
+        let message = problem(path);
+        assert!(message.contains("isn't a regular file"), "{message}");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, text).unwrap();
+    }
+}
+
+/// As a home kept in git could have it after a pull.
+#[test]
+fn a_readme_that_isnt_a_file_is_written_anew_without_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let readme = dir.path().join("README.md");
+    std::os::unix::fs::symlink("/dev/zero", &readme).unwrap();
+    let root = dir.path().to_owned();
+    drop(without_hanging("opening the home", move || {
+        open_machine(&root)
+    }));
+    assert!(!readme.symlink_metadata().unwrap().is_symlink());
+    assert_eq!(std::fs::read_to_string(&readme).unwrap(), README_TEXT);
 }
 
 #[tokio::test]

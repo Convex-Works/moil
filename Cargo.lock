@@ -2406,6 +2406,7 @@ dependencies = [
 name = "moil-bundle"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "moil-proto",
  "serde",
  "serde_json",

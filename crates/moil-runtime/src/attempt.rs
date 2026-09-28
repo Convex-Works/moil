@@ -22,6 +22,7 @@ use crate::process::Group;
 use crate::progress::{self, Meter};
 use crate::stderr::{self, Tail};
 use crate::stdout::{self, Report};
+use crate::sys::FileId;
 use crate::workdir::WorkDir;
 use crate::{EventSink, HandOff, Job, Runtime, StopSignal, hand_off, units, uv};
 
@@ -94,6 +95,9 @@ struct Ran {
 struct Uploaded {
     /// `out/`.
     outputs: PathBuf,
+    /// The files that were uploaded, by name, or why they can't be told
+    /// apart from others.
+    files: Result<BTreeMap<FileName, FileId>, String>,
     /// Removes the working directory when dropped.
     _registration: Registration,
 }
@@ -165,9 +169,17 @@ impl Attempt<'_> {
             .await?;
 
         self.phase(Phase::Uploading);
+        // For handing them off, which never changes the outcome.
+        let uploaded = accepted
+            .files
+            .iter()
+            .map(|(name, file)| Ok((name.clone(), FileId::of(file)?)))
+            .collect::<std::io::Result<_>>()
+            .map_err(|e| format!("couldn't tell which files the outputs are: {e}"));
         let files = limits.guard(self.upload(accepted.files)).await??;
         self.uploaded = Some(Uploaded {
             outputs: work.outputs(),
+            files: uploaded,
             _registration: registration,
         });
         Ok(JobResult {
@@ -358,8 +370,10 @@ impl Attempt<'_> {
         };
         // A kept working directory keeps its outputs too.
         let copy = self.runtime.config.keep_work_dirs;
-        let handed =
-            hand_off::hand_off(&uploaded.outputs, result.files.keys(), hand_off.dir(), copy);
+        let handed = uploaded.files.clone().and_then(|files| {
+            debug_assert!(result.files.keys().eq(files.keys()));
+            hand_off::hand_off(&uploaded.outputs, &files, hand_off.dir(), copy)
+        });
         if let Err(why) = &handed {
             tracing::warn!(
                 job_id = %self.job.id,

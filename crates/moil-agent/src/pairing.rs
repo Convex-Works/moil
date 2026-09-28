@@ -11,12 +11,14 @@ use crate::{Error, Machine, Service, net};
 /// Called with the service once a pairing completes.
 pub(crate) type OnPaired = Box<dyn FnOnce(&Service) + Send + Sync>;
 
-/// Fails unless `page`, a confirmation page from the service at
-/// `base_url`, is a web page on the service's own origin, with no user
-/// name or password to disguise it (spec §4). A service could otherwise
-/// relay another service's pairing, and the owner, confirming on that
-/// service's page, would pair the relay's machine with their account there.
-pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<(), Error> {
+/// `page`, a confirmation page from the service at `base_url`, as it was
+/// checked: a web page on the service's own origin, with no user name or
+/// password to disguise it (spec §4). A service could otherwise relay
+/// another service's pairing, and the owner, confirming on that service's
+/// page, would pair the relay's machine with their account there. Show
+/// and open the returned URL, never `page` itself, which another parser
+/// could read as another page.
+pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<Url, Error> {
     let refuse = |reason: &str| {
         Err(Error::NotAService {
             url: base_url.to_string(),
@@ -36,7 +38,7 @@ pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<(), 
     if !url.username().is_empty() || url.password().is_some() {
         return refuse("has a user name or password in it");
     }
-    Ok(())
+    Ok(url)
 }
 
 /// A pairing in progress: show [`PairingSession::user_code`] to the owner,
@@ -45,6 +47,9 @@ pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<(), 
 pub struct PairingSession {
     /// The code the owner should see on the service's confirmation page.
     pub user_code: String,
+    /// The service's confirmation page, and the same with the code filled
+    /// in, each as moil parsed it to check that it is on the service's own
+    /// origin: open exactly this.
     pub verification_uri: String,
     pub verification_uri_complete: String,
     /// The name the service gives itself.
@@ -208,11 +213,16 @@ impl PairingSession {
                 // Pairing again made the service a new machine record; the
                 // old one would otherwise linger there, offline forever.
                 // Nothing waits for the service to answer.
-                if let Some((paired_with, old_token)) = replaced {
+                if let Some(old) = replaced {
                     let machine = machine.clone();
-                    tokio::spawn(
-                        async move { machine.forget_token_on(&paired_with, &old_token).await },
-                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = machine.forget_token_on(&old).await {
+                            tracing::warn!(
+                                "couldn't tell {} to forget this machine's old token: {e}",
+                                old.base_url
+                            );
+                        }
+                    });
                 }
                 Ok(service)
             })
@@ -239,7 +249,7 @@ impl fmt::Debug for PairingSession {
 mod tests {
     use super::*;
 
-    fn check(base: &str, page: &str) -> Result<(), Error> {
+    fn check(base: &str, page: &str) -> Result<Url, Error> {
         check_confirmation_page(&Url::parse(base).unwrap(), page)
     }
 

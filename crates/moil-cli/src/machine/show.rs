@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use moil_agent::display::reveal;
-use moil_agent::report::{ConnectionReport, HookListing, Host, ServiceReport, Status};
+use moil_agent::report::{ConnectionReport, HookListing, Host, Problem, ServiceReport, Status};
 use moil_agent::rfc3339;
 
 use super::output::{print_json, table, word};
@@ -89,14 +89,21 @@ fn write_status(status: &Status, out: &mut impl Write) -> io::Result<()> {
         write_service(service, out)?;
     }
     for problem in &status.problems {
-        writeln!(
-            out,
-            "Problem: {}: {}",
-            problem.path.display(),
-            reveal(&problem.message)
-        )?;
+        write_problem(problem, out)?;
     }
     Ok(())
+}
+
+/// A problem, with hidden characters revealed in its path too: it names
+/// whatever someone put in the home, such as a file pushed to a service
+/// folder's repository.
+fn write_problem(problem: &Problem, out: &mut impl Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "Problem: {}: {}",
+        reveal(&problem.path.to_string_lossy()),
+        reveal(&problem.message)
+    )
 }
 
 fn write_service(service: &ServiceReport, out: &mut impl Write) -> io::Result<()> {
@@ -114,8 +121,8 @@ fn write_service(service: &ServiceReport, out: &mut impl Write) -> io::Result<()
                 rfc3339::format(*retry_at)
             ),
             ConnectionReport::Unpaired => {
-                "unpaired: the service removed this machine, or moil has no token for it; pair \
-                 again"
+                "unpaired: the service removed this machine, or moil has no token for it; \
+                 pair again"
                     .into()
             }
             ConnectionReport::Replaced => {
@@ -209,12 +216,7 @@ pub fn hooks(status: &Status, json: bool) -> anyhow::Result<()> {
         (status.services.iter()).any(|s| path.starts_with(hooks(s.id.as_str())))
     };
     for problem in status.problems.iter().filter(|p| in_hooks(&p.path)) {
-        writeln!(
-            out,
-            "Problem: {}: {}",
-            problem.path.display(),
-            reveal(&problem.message)
-        )?;
+        write_problem(problem, &mut out)?;
     }
     if hooks.is_empty() {
         eprintln!(

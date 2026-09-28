@@ -352,8 +352,8 @@ pub enum Connection {
         error: String,
         retry_at: Instant,
     },
-    /// The service removed this machine (close code 4401), or moil has no
-    /// token for it. Pair again.
+    /// The service removed this machine (close code 4401), or moil holds
+    /// no token issued for its base URL. Pair again.
     Unpaired,
     /// Another connection with this machine's token replaced this one
     /// (close code 4409).

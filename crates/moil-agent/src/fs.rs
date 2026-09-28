@@ -114,39 +114,101 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize, mode: u32) -> Resu
     Ok(write_atomic(path, &json, mode).map_err(|e| with_path(e, path))?)
 }
 
-/// Reads JSON from `path`, or `None` if there is no such file.
+/// The most moil reads of one of the home's JSON files, 1 MiB: far more
+/// than any of them holds.
+const MAX_JSON_BYTES: u64 = 1 << 20;
+
+/// Reads JSON from `path`, or `None` if there is no such file. It must be
+/// a regular file of at most 1 MiB, as [`read_small`] reads it.
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(with_path(e, path).into()),
+    let damaged = |reason| Error::Damaged {
+        path: path.to_owned(),
+        reason,
+    };
+    let bytes = match read_small(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(Unreadable::Io(e)) => return Err(e.into()),
+        Err(Unreadable::Refused(reason)) => return Err(damaged(reason)),
     };
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|e| Error::Damaged {
-            path: path.to_owned(),
-            reason: e.to_string(),
-        })
+        .map_err(|e| damaged(e.to_string()))
 }
 
 /// Reads a file the owner may edit (spec/machine.md §1), or `None` if there
 /// is no such file. Such files are strict, like manifests: a file that
 /// isn't one JSON object, or that has unknown fields (`T` denies them) or
 /// duplicate keys, fails with [`Error::Invalid`], saying why, so that a
-/// typo is reported rather than ignored.
+/// typo is reported rather than ignored. So does one that isn't a regular
+/// file of at most 1 MiB, as [`read_small`] reads it.
 pub(crate) fn read_strict_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(with_path(e, path).into()),
+    let invalid = |reason| Error::Invalid {
+        path: path.to_owned(),
+        reason,
     };
-    parse_strict(&bytes)
-        .map(Some)
-        .map_err(|reason| Error::Invalid {
-            path: path.to_owned(),
-            reason,
-        })
+    let bytes = match read_small(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(Unreadable::Io(e)) => return Err(e.into()),
+        Err(Unreadable::Refused(reason)) => return Err(invalid(reason)),
+    };
+    parse_strict(&bytes).map(Some).map_err(invalid)
 }
+
+/// Why [`read_small`] didn't read a file that is there.
+pub(crate) enum Unreadable {
+    /// Reading it failed; the error names the file.
+    Io(io::Error),
+    /// moil won't read it, for the reason given.
+    Refused(String),
+}
+
+/// The contents of `path`, or `None` if there is no such file. Only a
+/// regular file of at most 1 MiB is read, not through a symbolic link:
+/// git, or anyone who can push to a repository the home is kept in, can
+/// put anything at the home's paths, and mustn't make moil read a file
+/// through a link, a device or without end, or wait on a FIFO.
+pub(crate) fn read_small(path: &Path) -> Result<Option<Vec<u8>>, Unreadable> {
+    use std::io::Read;
+    let is_link = || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let failed = |e| Unreadable::Io(with_path(e, path));
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+    );
+    #[cfg(not(unix))]
+    if is_link() {
+        return Err(Unreadable::Refused(SYMBOLIC_LINK.into()));
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) if is_link() => return Err(Unreadable::Refused(SYMBOLIC_LINK.into())),
+        Err(e) => return Err(failed(e)),
+    };
+    let metadata = file.metadata().map_err(failed)?;
+    let too_large = || Unreadable::Refused("it is larger than 1 MiB".into());
+    if !metadata.is_file() {
+        return Err(Unreadable::Refused("it isn't a regular file".into()));
+    }
+    if metadata.len() > MAX_JSON_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(failed)?;
+    if bytes.len() as u64 > MAX_JSON_BYTES {
+        return Err(too_large());
+    }
+    Ok(Some(bytes))
+}
+
+const SYMBOLIC_LINK: &str = "it is a symbolic link, and moil reads only regular files here";
 
 /// `bytes` as a `T`, read as [`read_strict_json`] reads files, or why not.
 pub(crate) fn parse_strict<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
@@ -269,6 +331,60 @@ mod tests {
         let err = read_strict_json::<File>(&path).unwrap_err();
         assert!(matches!(err, Error::Invalid { .. }), "{err}");
         assert!(err.to_string().contains("settings.json"), "{err}");
+    }
+
+    /// What git could put at the path of one of the home's files: nothing
+    /// moil reads there hangs, reads another file, or reads without end.
+    #[cfg(unix)]
+    #[test]
+    fn only_small_regular_files_are_read() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere.json");
+        fs::write(&elsewhere, "{}").unwrap();
+        let path = dir.path().join("service.json");
+        let fifo = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a valid C string.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        };
+        type Make<'a> = &'a dyn Fn(&Path);
+        let cases: [(Make, &str); 5] = [
+            (
+                &|path| std::os::unix::fs::symlink("/dev/zero", path).unwrap(),
+                "symbolic link",
+            ),
+            (
+                &|path| std::os::unix::fs::symlink(&elsewhere, path).unwrap(),
+                "symbolic link",
+            ),
+            (&fifo, "isn't a regular file"),
+            (
+                &|path| fs::create_dir(path).unwrap(),
+                "isn't a regular file",
+            ),
+            (
+                &|path| {
+                    let file = fs::File::create(path).unwrap();
+                    file.set_len(MAX_JSON_BYTES + 1).unwrap();
+                },
+                "larger than 1 MiB",
+            ),
+        ];
+        for (make, why) in cases {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(&path);
+            make(&path);
+            match read_strict_json::<serde_json::Value>(&path) {
+                Err(Error::Invalid { reason, .. }) => assert!(reason.contains(why), "{reason}"),
+                other => panic!("{other:?}"),
+            }
+            match read_json::<serde_json::Value>(&path) {
+                Err(Error::Damaged { reason, .. }) => assert!(reason.contains(why), "{reason}"),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]
