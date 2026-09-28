@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -32,7 +33,8 @@ type service struct {
 	link *link
 	// probe is the probe bundle, which every service publishes.
 	probe *moil.Bundle
-	// record is where probe attempts record their process groups.
+	// record is where probe attempts, and the tests' hooks, record their
+	// process groups.
 	record string
 
 	mu      sync.Mutex
@@ -252,7 +254,8 @@ func (u *upload) Received() (last received, uploads int) {
 }
 
 // checkNothingOutlivedItsAgent fails the test if a process of a probe
-// attempt still runs once every machine has stopped, and kills it.
+// attempt or of a hook still runs once every machine has stopped, and
+// kills it.
 func (s *service) checkNothingOutlivedItsAgent() {
 	entries, err := os.ReadDir(s.record)
 	if err != nil {
@@ -260,10 +263,14 @@ func (s *service) checkNothingOutlivedItsAgent() {
 		return
 	}
 	for _, entry := range entries {
+		what := "attempt " + entry.Name()
+		if pid, ok := strings.CutPrefix(entry.Name(), "hook."); ok {
+			what = "the hook run " + pid
+		}
 		data, err := os.ReadFile(filepath.Join(s.record, entry.Name()))
-		pgid, _ := strconv.Atoi(string(data))
+		pgid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
 		if err != nil || pgid <= 1 {
-			s.t.Errorf("attempt %s recorded no process group: %q, %v", entry.Name(), data, err)
+			s.t.Errorf("%s recorded no process group: %q, %v", what, data, err)
 			continue
 		}
 		// Killed processes may take a moment to be reaped.
@@ -273,7 +280,7 @@ func (s *service) checkNothingOutlivedItsAgent() {
 		}
 		if groupRuns(pgid) {
 			if !s.t.Failed() {
-				s.t.Errorf("processes of attempt %s outlived the agent that ran them", entry.Name())
+				s.t.Errorf("processes of %s outlived the agent that ran them", what)
 			}
 			syscall.Kill(-pgid, syscall.SIGKILL)
 		}

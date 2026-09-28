@@ -84,6 +84,19 @@ func (l *link) Heard(token, s string) bool {
 	return false
 }
 
+// Sent reports whether the machine holding token ever sent s to the
+// service, over any of its connections.
+func (l *link) Sent(token, s string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, t := range l.traffic {
+		if bytes.Contains(t.sent, []byte(token)) && bytes.Contains(t.sent, []byte(s)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *link) close() {
 	l.ln.Close()
 	l.Cut()
