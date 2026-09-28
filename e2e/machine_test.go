@@ -95,20 +95,15 @@ func (m *machine) command(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// try runs a moil command to its end.
+// try runs a moil command to its end, with nothing on its stdin: moil
+// never asks without a terminal.
 func (m *machine) try(args ...string) (stdout, stderr string, err error) {
-	m.t.Helper()
-	return m.tryAnswering("", args...)
-}
-
-// tryAnswering runs a moil command to its end, with answers on its stdin.
-func (m *machine) tryAnswering(answers string, args ...string) (stdout, stderr string, err error) {
 	m.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), patience)
 	defer cancel()
 	var out, errOut bytes.Buffer
 	cmd := m.command(ctx, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(answers), &out, &errOut
+	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
 	m.log.print(m.name, "$ moil "+strings.Join(args, " "))
 	if stderr := strings.TrimSpace(errOut.String()); stderr != "" {

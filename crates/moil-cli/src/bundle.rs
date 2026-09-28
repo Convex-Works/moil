@@ -20,6 +20,10 @@ mod storage;
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Print a bundle's hash.
+    ///
+    /// The hash names the bundle's three files exactly: owners approve it,
+    /// and services send jobs for it.
+    #[command(after_help = "Examples:\n  moil hash\n  moil hash examples/bundles/echo")]
     Hash {
         /// The bundle's directory.
         #[arg(default_value = ".")]
@@ -27,12 +31,16 @@ pub enum Command {
     },
     /// Check that a bundle is valid and its lockfile current, and show what
     /// it holds.
+    #[command(after_help = "Examples:\n  moil check\n  moil check examples/bundles/echo")]
     Check {
         /// The bundle's directory.
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
     /// Create a bundle to start from: job.py, its lockfile and a manifest.
+    #[command(
+        after_help = "Examples:\n  moil init transcribe\n  moil init ~/bundles/notes --name meeting-notes"
+    )]
     Init {
         /// Where to create it.
         dir: PathBuf,
@@ -47,6 +55,9 @@ pub enum Command {
     /// in a temporary home, but bundles, their environments and assets stay
     /// cached (in $XDG_CACHE_HOME/moil, ~/Library/Caches/moil on macOS)
     /// between runs.
+    #[command(after_help = "Examples:\n  \
+        moil run examples/bundles/echo --params '{\"text\": \"hi\"}'\n  \
+        moil run examples/bundles/echo --input text.txt=README.md --output echo.txt --json")]
     Run(RunArgs),
 }
 

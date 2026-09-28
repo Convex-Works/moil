@@ -1,13 +1,14 @@
-//! `moil`: the command line.
+//! `moil`: the command line (spec/machine.md §3).
 //!
-//! Bundle authors use `hash`, `check`, `init` and `run`. Machine owners
-//! without the tray app (and the end-to-end tests) use `pair`, `review`,
-//! `approve` and `agent`.
+//! Machine owners, and the scripts and agents they let drive moil, use the
+//! owner's commands: each reaches the agent running on the home, in the
+//! app or as `moil agent`, or works on the home itself when none runs.
+//! Bundle authors use `init`, `check`, `hash` and `run`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use moil_agent::display::reveal;
 
 mod bundle;
@@ -20,8 +21,8 @@ mod machine;
     about = "Lend your machine to the services you use, one approved job at a time."
 )]
 struct Cli {
-    /// Where moil keeps its state.
-    #[arg(long, global = true, env = "MOIL_HOME")]
+    /// Where moil keeps its state [default: ~/.moil]
+    #[arg(long, global = true, env = "MOIL_HOME", value_name = "DIR")]
     home: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -31,9 +32,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(flatten)]
-    Bundle(bundle::Command),
-    #[command(flatten)]
     Machine(machine::Command),
+    #[command(flatten)]
+    Bundle(bundle::Command),
 }
 
 /// Options every command can see.
@@ -42,16 +43,23 @@ pub struct Globals {
     pub home: Option<PathBuf>,
 }
 
+/// The command failed, and said why on stderr (spec/machine.md §3.1).
+/// The command line being wrong exits with 2, as clap exits for it.
+const FAILED: u8 = 1;
+/// The command needs a running agent, and none runs.
+const NO_AGENT: u8 = 3;
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = grouped_help(Cli::command()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let globals = Globals { home: cli.home };
     let ran = tokio::runtime::Runtime::new()
         .map_err(anyhow::Error::from)
         .and_then(|runtime| {
             runtime.block_on(async {
                 match cli.command {
-                    Command::Bundle(command) => bundle::run(command, &globals).await,
                     Command::Machine(command) => machine::run(command, &globals).await,
+                    Command::Bundle(command) => bundle::run(command, &globals).await,
                 }
             })
         });
@@ -59,7 +67,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}", failure(&e));
-            ExitCode::FAILURE
+            let status = if e.is::<machine::NeedsAgent>() {
+                NO_AGENT
+            } else {
+                FAILED
+            };
+            ExitCode::from(status)
         }
     }
 }
@@ -68,6 +81,59 @@ fn main() -> ExitCode {
 /// what a service said, so hidden characters are revealed.
 fn failure(error: &anyhow::Error) -> String {
     format!("Error: {}", reveal(&format!("{error:#}")))
+}
+
+/// `command` with its help listing the owner's commands, then the bundle
+/// authors', each group under a heading of its own.
+fn grouped_help(command: clap::Command) -> clap::Command {
+    let names = |group: clap::Command| -> Vec<String> {
+        let names = group.get_subcommands().map(|c| c.get_name().to_owned());
+        names.collect()
+    };
+    let groups = [
+        (
+            "Your machine",
+            names(machine::Command::augment_subcommands(clap::Command::new(
+                "moil",
+            ))),
+        ),
+        (
+            "Bundle authoring",
+            names(bundle::Command::augment_subcommands(clap::Command::new(
+                "moil",
+            ))),
+        ),
+    ];
+    let styles = command.get_styles();
+    let (header, literal) = (styles.get_header(), styles.get_literal());
+    let width = groups
+        .iter()
+        .flat_map(|(_, names)| names.iter().map(String::len))
+        .max()
+        .unwrap_or(0);
+    let mut listing = String::new();
+    for (heading, names) in &groups {
+        listing.push_str(&format!("{header}{heading}:{header:#}\n"));
+        for name in names {
+            let about = command
+                .find_subcommand(name)
+                .and_then(|c| c.get_about())
+                .map(|about| about.to_string())
+                .unwrap_or_default();
+            let padding = " ".repeat(width - name.len());
+            listing.push_str(&format!("  {literal}{name}{literal:#}{padding}  {about}\n"));
+        }
+        listing.push('\n');
+    }
+    // The template language reads what is in braces as a tag.
+    let listing = listing.replace(['{', '}'], "");
+    let template = format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{listing}\
+         {header}Options:{header:#}\n{{options}}\n\n\
+         `moil <command> --help` explains a command, with examples, and \
+         `moil hooks --help` how to write a hook."
+    );
+    command.help_template(template)
 }
 
 #[cfg(test)]
@@ -84,5 +150,28 @@ mod tests {
             failure(&error),
             "Error: couldn't review the bundle: klisi answered 500: ␛[2J␛[Hbundle approved\\u{202e}"
         );
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        grouped_help(Cli::command()).debug_assert();
+    }
+
+    #[test]
+    fn the_help_lists_every_command_in_its_group() {
+        let help = grouped_help(Cli::command()).render_help().to_string();
+        let (owners, authors) = help
+            .split_once("Bundle authoring:")
+            .expect("a heading for bundle authoring");
+        let owners = owners.split_once("Your machine:").expect("a heading").1;
+        for command in Cli::command().get_subcommands() {
+            let name = command.get_name();
+            let line = format!("\n  {name} ");
+            let group = match ["init", "check", "hash", "run"].contains(&name) {
+                true => authors,
+                false => owners,
+            };
+            assert!(group.contains(&line), "{name} in\n{help}");
+        }
     }
 }
