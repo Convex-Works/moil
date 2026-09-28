@@ -5,8 +5,12 @@ use std::path::PathBuf;
 pub enum Error {
     #[error("moil is already running for {0}; quit it first")]
     AlreadyRunning(PathBuf),
-    #[error("no paired service matches {0:?}")]
+    #[error("no service matches {0:?}")]
     UnknownService(String),
+    /// A service the home knows, which this machine isn't paired with
+    /// (spec/machine.md §1.2).
+    #[error("this machine isn't paired with {0}; pair with it first")]
+    NotPaired(crate::ServiceId),
     #[error("{query:?} matches more than one service: {matches}")]
     AmbiguousService { query: String, matches: String },
     /// An address that can't be a service's, as a sentence for the owner.
@@ -43,6 +47,10 @@ pub enum Error {
     /// A state file that can't be read back, e.g. after someone edited it.
     #[error("{} is damaged ({reason}); repair or remove it", path.display())]
     Damaged { path: PathBuf, reason: String },
+    /// A file the owner may edit, such as `settings.json`, that isn't
+    /// valid (spec/machine.md §1).
+    #[error("{} isn't valid ({reason}); fix it or move it out of the way", path.display())]
+    Invalid { path: PathBuf, reason: String },
     /// A setting from the environment that moil can't use.
     #[error("{0}")]
     Config(String),

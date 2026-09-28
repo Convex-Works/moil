@@ -35,7 +35,7 @@ use super::connection::{self, LinkEvent, Outbox};
 use super::{
     AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
 };
-use crate::{Machine, PairedService, ServiceId};
+use crate::{Machine, ServiceId, services};
 
 /// Everything the coordinator reacts to.
 #[derive(Debug)]
@@ -65,13 +65,17 @@ pub(super) enum Input {
 #[derive(Debug)]
 pub(super) enum Command {
     /// A pairing completed: connect to the service, again if it was paired
-    /// before.
-    Paired(Box<PairedService>),
+    /// before, with verified copies of the bundles it approves.
+    Paired(Box<services::Service>, Vec<Bundle>),
     /// Close the service's channel and forget its attempts.
     Disconnect(ServiceId, oneshot::Sender<()>),
     /// The service's approvals changed: stop its running attempt if its
     /// bundle is no longer approved, and prepare the bundle if one was.
-    Approvals(Box<PairedService>, Option<Box<Bundle>>, oneshot::Sender<()>),
+    Approvals(
+        Box<services::Service>,
+        Option<Box<Bundle>>,
+        oneshot::Sender<()>,
+    ),
     SetPaused(bool),
     /// The owner stopped the running job.
     StopJob,
@@ -141,7 +145,7 @@ pub(super) struct Coordinator {
 
 /// A paired service and its channel.
 struct Service {
-    paired: PairedService,
+    paired: services::Service,
     connection: Connection,
     bundles: Vec<BundleInfo>,
     task: u64,
@@ -342,9 +346,14 @@ impl Coordinator {
             shutdown: None,
             replies: Vec::new(),
         };
+        // A service without its token is connected all the same, off the
+        // coordinator: finding none, its channel ends before reaching out.
         match coordinator.machine.services() {
-            Ok(services) => services.into_iter().for_each(|s| coordinator.connect(s)),
-            Err(e) => tracing::error!("couldn't read the paired services: {e}"),
+            Ok(services) => services
+                .into_iter()
+                .filter(|s| s.pairing.is_some())
+                .for_each(|s| coordinator.connect(s)),
+            Err(e) => tracing::error!("couldn't read the services: {e}"),
         }
         coordinator.publish();
         coordinator
@@ -386,29 +395,15 @@ impl Coordinator {
 
     /// Gets ready, off the coordinator, what answering services takes: the
     /// hardware `hello` describes, and verified copies of the approved
-    /// bundles. A copy that fails verification is left out, so the machine
-    /// declines its jobs.
+    /// bundles, from the services' folders. A copy that fails verification
+    /// is left out, so the machine declines its jobs.
     async fn warm_up(&self) -> HashMap<BundleHash, Bundle> {
-        let approved: BTreeSet<BundleHash> = self
-            .services
-            .values()
-            .flat_map(|s| s.paired.approved_hashes())
-            .collect();
+        let services: Vec<services::Service> =
+            self.services.values().map(|s| s.paired.clone()).collect();
         let loaded = self.machine.blocking(move |machine| {
             machine.info();
-            let store = machine.home().bundles();
-            let verified = approved.into_iter().filter_map(|hash| match store.get(&hash) {
-                Ok(Some(bundle)) => Some((hash, bundle)),
-                Ok(None) => {
-                    tracing::error!("the approved bundle {hash} isn't stored; approve it again to take its jobs");
-                    None
-                }
-                Err(e) => {
-                    tracing::error!("the stored copy of approved bundle {hash} failed verification ({e}); approve it again to take its jobs");
-                    None
-                }
-            });
-            Ok(verified.collect())
+            let verified = services.iter().flat_map(|s| machine.approved_bundles(s));
+            Ok(verified.map(|bundle| (bundle.hash(), bundle)).collect())
         });
         loaded.await.unwrap_or_else(|e| {
             tracing::error!("couldn't read the approved bundles: {e}");
@@ -437,12 +432,18 @@ impl Coordinator {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Paired(service) => {
+            Command::Paired(service, bundles) => {
                 tracing::info!("paired with {} ({})", service.name, service.base_url);
                 if let Some(old) = self.services.remove(&service.id) {
                     old.stop.cancel();
                 }
                 self.connect(*service);
+                // Such as those of a folder cloned from git.
+                for bundle in bundles {
+                    if self.bundles.insert(bundle.hash(), bundle.clone()).is_none() {
+                        self.prepare(bundle);
+                    }
+                }
             }
             Command::Disconnect(id, reply) => {
                 self.drop_attempts(&id);
@@ -1040,7 +1041,7 @@ impl Coordinator {
         let _ = tokio::time::timeout(CLOSE_WAIT, futures::future::join_all(closing)).await;
     }
 
-    fn connect(&mut self, paired: PairedService) {
+    fn connect(&mut self, paired: services::Service) {
         let task = self.next_task;
         self.next_task += 1;
         let stop = CancellationToken::new();
@@ -1126,14 +1127,14 @@ impl Coordinator {
 }
 
 /// Says so when `service` isn't told about every bundle approved for it.
-fn warn_unannounced(service: &PairedService) {
+fn warn_unannounced(service: &services::Service) {
     let older = service.unannounced_approvals();
     if older > 0 {
         tracing::warn!(
             "{} is told only of the {} bundles approved for it most recently; {older} older \
              approvals aren't announced, so it won't offer their jobs",
             service.name,
-            PairedService::MAX_ANNOUNCED
+            services::Service::MAX_ANNOUNCED
         );
     }
 }

@@ -1,4 +1,5 @@
-//! Paired services and what this machine's owner approved for each.
+//! The services a home knows, this machine's pairings with them, and what
+//! the owner approved for each (spec/machine.md §1.2).
 
 use std::fmt;
 use std::str::FromStr;
@@ -9,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::Error;
+use crate::report::ServiceRef;
 
-/// This machine's name for a paired service: derived from the service's
-/// host and port (`klisi.example.com`, `localhost-8787`), unique among the
-/// machine's services, and safe as a file name. An ID is 1 to 128
+/// The home's name for a service, which names its folder: derived from the
+/// service's host and port (`klisi.example.com`, `localhost-8787`) when
+/// the machine first pairs with it, unique among the home's services, and
+/// safe as a file name. An ID is 1 to 128
 /// lowercase ASCII letters, digits, dots and hyphens, starting and ending
 /// with a letter or digit, so it can't name a hidden file or leave a
 /// directory.
@@ -192,23 +195,27 @@ pub(crate) fn check_name(name: &str) -> Result<(), String> {
 /// The longest name a service may give itself, in characters (spec §10).
 const MAX_NAME_CHARS: usize = 64;
 
-/// A service this machine is paired with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairedService {
+/// A service the home knows: a folder `services/<id>/` whose
+/// `service.json` is valid (spec/machine.md §1.2), whether or not this
+/// machine is paired with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    /// The name of the service's folder.
     pub id: ServiceId,
     /// Where the service's moil endpoints live, e.g. `https://klisi.example.com/moil`.
     pub base_url: Url,
-    /// The name the service gave itself, e.g. `klisi`.
+    /// The name the service gave itself when pairing, e.g. `klisi`.
     pub name: String,
-    /// The service's ID for this machine.
-    pub machine_id: String,
-    #[serde(with = "crate::rfc3339")]
-    pub paired_at: SystemTime,
-    /// The bundles the owner approved for this service, oldest first.
+    /// The approvals that count (spec/machine.md §1.2), oldest first.
+    /// Those that don't are left out, and reported as problems.
     pub approvals: Vec<Approval>,
+    /// This machine's pairing with the service, if its `pairing.json` names
+    /// [`base_url`](Self::base_url). The service is paired if moil also
+    /// holds its token: see [`Machine::is_paired`](crate::Machine::is_paired).
+    pub pairing: Option<Pairing>,
 }
 
-impl PairedService {
+impl Service {
     pub fn is_approved(&self, hash: &BundleHash) -> bool {
         self.approvals.iter().any(|a| a.hash == *hash)
     }
@@ -236,8 +243,35 @@ impl PairedService {
     }
 }
 
-/// One approved bundle.
+impl From<&Service> for ServiceRef {
+    fn from(service: &Service) -> Self {
+        Self {
+            id: service.id.clone(),
+            name: service.name.clone(),
+            base_url: service.base_url.clone(),
+        }
+    }
+}
+
+/// This machine's pairing with a service: its `pairing.json`, which
+/// belongs to this machine alone. The token that goes with it is kept in
+/// the [`SecretStore`](crate::SecretStore), never in the service's folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pairing {
+    /// The base URL the machine paired with: the only one its token is
+    /// ever sent to.
+    #[serde(with = "base_url")]
+    pub base_url: Url,
+    /// The service's ID for this machine.
+    pub machine_id: String,
+    #[serde(with = "crate::rfc3339")]
+    pub paired_at: SystemTime,
+}
+
+/// One approved bundle, as `service.json` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Approval {
     pub hash: BundleHash,
     /// The bundle's name and version, from its verified manifest.
@@ -245,6 +279,60 @@ pub struct Approval {
     pub version: String,
     #[serde(with = "crate::rfc3339")]
     pub approved_at: SystemTime,
+}
+
+/// `service.json`: which service a folder is for, and what the owner
+/// approved for it, including approvals that don't count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceFile {
+    #[serde(with = "base_url")]
+    pub base_url: Url,
+    pub name: String,
+    #[serde(default)]
+    pub approvals: Vec<Approval>,
+}
+
+impl ServiceFile {
+    /// Why the file is invalid beyond what serde checks, if it is.
+    pub fn check(&self) -> Result<(), String> {
+        let chars = self.name.chars().count();
+        if (1..=MAX_NAME_CHARS).contains(&chars) && !self.name.chars().any(char::is_control) {
+            Ok(())
+        } else {
+            Err(format!(
+                "name must be 1 to {MAX_NAME_CHARS} characters, none of them control characters"
+            ))
+        }
+    }
+}
+
+impl Pairing {
+    /// Why the file is invalid beyond what serde checks, if it is.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if moil_proto::ids::is_machine_id(&self.machine_id) {
+            Ok(())
+        } else {
+            Err(format!("{:?} isn't a machine ID", self.machine_id))
+        }
+    }
+}
+
+/// Base URLs in the home's files, read as [`parse_base_url`] reads what the
+/// owner types.
+mod base_url {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::borrow::Cow;
+    use url::Url;
+
+    pub fn serialize<S: Serializer>(url: &Url, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(url.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Url, D::Error> {
+        let text = Cow::<'de, str>::deserialize(deserializer)?;
+        super::parse_base_url(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]

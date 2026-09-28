@@ -8,7 +8,7 @@ use std::time::Instant;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use moil_agent::{
-    AgentHandle, Error, Home, Machine, MachineConfig, PairedService, Review, ServiceId, Snapshot,
+    AgentHandle, Error, Home, Machine, MachineConfig, Review, Service, ServiceId, Snapshot,
     default_secrets,
 };
 use moil_proto::BundleHash;
@@ -38,7 +38,8 @@ pub trait Backend: Send + Sync + 'static {
     /// bundle for that service.
     fn revoke(&self, service: ServiceId, hash: BundleHash) -> BoxFuture<'_, Result<()>>;
 
-    /// Disconnects from a service and forgets it, stopping its running job.
+    /// Disconnects from a service and unpairs from it, stopping its running
+    /// job. Its folder, with its approvals and hooks, stays.
     fn unpair(&self, service: ServiceId) -> BoxFuture<'_, Result<()>>;
 
     /// Stops or resumes taking new jobs. A running job carries on.
@@ -59,7 +60,7 @@ pub struct Pairing {
     /// service, or the code expires. Dropping it abandons the pairing,
     /// unless the service has already sent the machine's token: then the
     /// pairing completes anyway, and the agent connects.
-    pub confirmed: BoxFuture<'static, Result<PairedService>>,
+    pub confirmed: BoxFuture<'static, Result<Service>>,
 }
 
 impl std::fmt::Debug for Pairing {

@@ -13,7 +13,7 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use moil_agent::display::{self, reveal};
 use moil_agent::{
-    Agent, Home, Machine, MachineConfig, PairedService, ReadOnlyMachine, Review, Snapshot,
+    Agent, Home, Machine, MachineConfig, ReadOnlyMachine, Review, Service, Snapshot,
     default_secrets,
 };
 use moil_bundle::PackageSource;
@@ -37,9 +37,10 @@ pub enum Command {
         #[arg(long)]
         no_browser: bool,
     },
-    /// List the paired services.
+    /// List the services this machine's home knows, paired or not.
     Services,
-    /// Forget a service, and ask it to forget this machine.
+    /// Ask a service to forget this machine, and delete the pairing here.
+    /// The service's folder, with its approvals and hooks, stays.
     Unpair {
         /// The service's ID, host, URL or name.
         service: String,
@@ -202,27 +203,27 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 fn services(machine: &ReadOnlyMachine) -> anyhow::Result<()> {
     let services = machine.services()?;
     if services.is_empty() {
-        eprintln!("No paired services. Pair one with `moil pair URL`.");
+        eprintln!("No services yet. Pair with one with `moil pair URL`.");
         return Ok(());
     }
-    let rows: Vec<[String; 4]> = services
-        .iter()
-        .map(|s| {
-            [
-                s.id.to_string(),
-                s.base_url.to_string(),
-                s.approvals.len().to_string(),
-                reveal(&s.name).into_owned(),
-            ]
-        })
-        .collect();
-    table(&["ID", "URL", "APPROVED", "NAME"], &rows);
+    let mut rows: Vec<[String; 5]> = Vec::new();
+    for s in &services {
+        let paired = if machine.is_paired(s)? { "yes" } else { "no" };
+        rows.push([
+            s.id.to_string(),
+            s.base_url.to_string(),
+            paired.into(),
+            s.approvals.len().to_string(),
+            reveal(&s.name).into_owned(),
+        ]);
+    }
+    table(&["ID", "URL", "PAIRED", "APPROVED", "NAME"], &rows);
     Ok(())
 }
 
 /// The service's bundles and whether each is approved, plus approved
 /// bundles it no longer offers.
-async fn bundles(machine: &ReadOnlyMachine, service: &PairedService) -> anyhow::Result<()> {
+async fn bundles(machine: &ReadOnlyMachine, service: &Service) -> anyhow::Result<()> {
     let offered = machine.bundles(&service.id).await?;
     let listed: HashSet<BundleHash> = offered.iter().map(|b| b.hash).collect();
     let mut rows: Vec<[String; 3]> = offered
@@ -435,8 +436,7 @@ async fn agent(machine: Machine) -> anyhow::Result<()> {
         Ok(n) => tracing::info!("cleaned up {n} attempts left over from a crash"),
         Err(e) => tracing::warn!("couldn't clean up attempts left over from a crash: {e}"),
     }
-    let services = machine.services()?;
-    if services.is_empty() {
+    if machine.services()?.iter().all(|s| s.pairing.is_none()) {
         tracing::warn!("no paired services yet; pair one with `moil pair URL`");
     }
     if machine.settings().paused {
@@ -521,7 +521,7 @@ mod tests {
     use std::time::SystemTime;
 
     use moil_agent::display::is_hidden;
-    use moil_agent::{PairedService, ServiceId};
+    use moil_agent::{Pairing, Service, ServiceId};
     use moil_bundle::Bundle;
 
     use super::*;
@@ -545,15 +545,18 @@ mod tests {
         let manifest = "{\"moil\": 1, \"name\": \"echo\", \"version\": \"1.0\u{3164}\", \
                         \"description\": \"Harmless.\u{200b}\"}";
         let bundle = Bundle::new(script, lockfile, manifest).unwrap();
-        let base_url = "https://klisi.example.com/moil".parse().unwrap();
+        let pairing = Pairing {
+            base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            machine_id: "m_1".into(),
+            paired_at: SystemTime::now(),
+        };
         Review {
-            service: PairedService {
+            service: Service {
                 id: ServiceId::new("klisi.example.com").unwrap(),
-                base_url,
+                base_url: pairing.base_url.clone(),
                 name: format!("klisi{clear}\u{2066}"),
-                machine_id: "m_1".into(),
-                paired_at: SystemTime::now(),
                 approvals: vec![],
+                pairing: Some(pairing),
             },
             previous: Some(bundle.clone()),
             bundle,

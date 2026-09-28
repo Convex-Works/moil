@@ -31,7 +31,7 @@ use url::Url;
 
 use super::AgentOptions;
 use super::coordinator::Input;
-use crate::{Error, Machine, PairedService, ServiceId, net};
+use crate::{Error, Machine, Service, ServiceId, net};
 
 /// The largest control message either side may send (spec §10).
 const MAX_MESSAGE_BYTES: usize = 1 << 20;
@@ -134,7 +134,7 @@ pub(super) fn outbox() -> (Outbox, Frames) {
 /// can tell it from the tasks it replaced.
 pub(super) fn spawn(
     machine: Machine,
-    service: &PairedService,
+    service: &Service,
     task: u64,
     options: AgentOptions,
     inputs: mpsc::UnboundedSender<Input>,

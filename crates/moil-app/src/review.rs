@@ -590,7 +590,7 @@ fn file_diff(diff: &FileDiff) -> Markup {
 mod tests {
     use std::time::Duration;
 
-    use moil_agent::{Approval, PairedService};
+    use moil_agent::{Approval, Pairing, Service};
     use moil_bundle::Bundle;
 
     use super::*;
@@ -601,13 +601,16 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000)
     }
 
-    fn service(approved: &[&Bundle]) -> PairedService {
-        PairedService {
+    fn service(approved: &[&Bundle]) -> Service {
+        Service {
             id: "klisi.example.com".parse().unwrap(),
             base_url: "https://klisi.example.com/moil".parse().unwrap(),
             name: "klisi".into(),
-            machine_id: "m_7Hq2Xk9Lw3".into(),
-            paired_at: now() - Duration::from_secs(90 * 86400),
+            pairing: Some(Pairing {
+                base_url: "https://klisi.example.com/moil".parse().unwrap(),
+                machine_id: "m_7Hq2Xk9Lw3".into(),
+                paired_at: now() - Duration::from_secs(90 * 86400),
+            }),
             approvals: approved
                 .iter()
                 .map(|b| Approval {

@@ -2,13 +2,13 @@
 
 use moil_bundle::{Bundle, FileDiff};
 
-use crate::PairedService;
+use crate::Service;
 
 /// A bundle fetched from a service and verified against the hash the owner
 /// is asked to approve, with the version it would replace.
 #[derive(Debug, Clone)]
 pub struct Review {
-    pub service: PairedService,
+    pub service: Service,
     pub bundle: Bundle,
     /// The most recently approved bundle with the same name from the same
     /// service, if any.
