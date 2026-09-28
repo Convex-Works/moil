@@ -199,9 +199,10 @@ time, in the order their attempts ended. The machine goes on taking jobs
 while a hook runs, and hooks run while the machine is paused too.
 
 moil executes the file directly, so it needs a `#!` line or must be a
-program. If something is at the hook's path but it isn't a regular file,
-or a symbolic link to one, that the owner can execute, moil doesn't run it,
-writes why in the hook's log (§2.3), and reports it as a problem (§3.3).
+program; moil doesn't guess at a shell for a file that is neither. If
+something is at the hook's path but it isn't such a file, or a symbolic
+link to one, that the owner can execute, moil doesn't run it, writes why
+in the hook's log (§2.3), and reports it as a problem (§3.3).
 
 ### 2.2 What a hook gets
 
@@ -281,6 +282,8 @@ The closing line is one of:
 - `== killed by signal <number> after <duration>`
 - `== stopped after an hour`
 - `== stopped: moil quit`
+- `== stopped: moil stopped unexpectedly`, written when moil next starts,
+  before the hook runs again
 - `== not run: <reason>`
 
 Once a log passes 1 MiB, moil renames it to `<bundle name>.log.1`,
