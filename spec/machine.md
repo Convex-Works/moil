@@ -267,8 +267,9 @@ The hook runs:
   wants to keep an output copies or moves it elsewhere. The outputs' names
   come from the service, so moil doesn't run the hook among them, where a
   file such as `uv.toml` could change what the hook runs.
-- **With only these environment variables:** `HOME`, `USER`, `LANG`
-  (moil's own, else `C.UTF-8`), `MOIL_HOME`, `TMPDIR`, and `PATH`, which
+- **With only these environment variables:** `HOME`; `USER`, if moil has
+  one; `LANG`, moil's own or else `C.UTF-8`; `MOIL_HOME`; `TMPDIR`; and
+  `PATH`, which
   is `<home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
   `.machine/bin` holds the `moil` and `uv` this machine runs, so a hook
   starting `#!/usr/bin/env -S uv run --script` can declare its Python
