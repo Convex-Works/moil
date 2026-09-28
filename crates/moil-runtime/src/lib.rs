@@ -23,12 +23,15 @@
 //!   [`RuntimeConfig::max_download_bytes`].
 //! - Each bundle has a uv environment of its own, which goes once the
 //!   bundle is no longer stored.
+//! - An attempt that succeeds can leave the outputs it uploaded to the
+//!   machine's owner (spec §8.5): see [`HandOff`].
 //!
 //! Unix only: scripts run in their own process group.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -41,12 +44,13 @@ use tokio::sync::{mpsc, watch};
 mod assets;
 mod attempt;
 mod environments;
+mod hand_off;
 mod http;
 mod limits;
 mod locks;
 mod orphans;
 mod outcome;
-mod process;
+pub mod process;
 mod progress;
 mod stderr;
 mod stdout;
@@ -56,6 +60,7 @@ pub mod uv;
 mod workdir;
 
 pub use uv::Uv;
+pub use workdir::remove_tree;
 
 /// Where a running attempt's events go. Unbounded, so a slow consumer never
 /// stalls the script.
@@ -97,6 +102,9 @@ pub struct Job {
     /// [`UrlPolicy::for_service`]. [`RuntimeConfig::allow_insecure_http`]
     /// widens it to `http` anywhere.
     pub url_policy: UrlPolicy,
+    /// Where to leave the outputs if the attempt succeeds, rather than
+    /// delete them with the working directory.
+    pub hand_off: Option<HandOff>,
 }
 
 impl Job {
@@ -114,7 +122,61 @@ impl Job {
             outputs: assign.outputs,
             timeout: assign.timeout_ms.map(Duration::from_millis),
             url_policy: UrlPolicy::HTTPS_ONLY,
+            hand_off: None,
         }
+    }
+}
+
+/// A directory where an attempt that succeeds leaves the outputs it
+/// uploaded, for the machine's owner to use (spec §8.5), such as with a
+/// hook (spec/machine.md §2).
+///
+/// Once the outcome is known to be a success, and before the working
+/// directory goes, the runtime moves each output the result named into the
+/// directory, under its name: by renaming it, or by copying it if it can't
+/// be renamed there or the working directory is being kept. Nothing about
+/// it changes the outcome. If an output can't be handed off, the runtime
+/// takes back what it put in the directory, so that the directory never
+/// holds only some of the outputs, and records why: see
+/// [`HandOff::result`]. After any other outcome the directory is left as
+/// it was.
+///
+/// Clones share the result, so keep one to read it after the attempt.
+#[derive(Debug, Clone)]
+pub struct HandOff {
+    dir: PathBuf,
+    result: Arc<OnceLock<Result<(), String>>>,
+}
+
+impl HandOff {
+    /// Hands outputs off to `dir`, which the runtime creates if it's
+    /// missing. It should be empty, on the same file system as
+    /// [`RuntimeConfig::jobs_dir`] so that outputs are moved rather than
+    /// copied, and absolute.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            result: Arc::default(),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// `None` until an attempt with this hand-off has succeeded; then `Ok`
+    /// once the directory holds every output the result names, or why it
+    /// holds none of them.
+    pub fn result(&self) -> Option<Result<(), &str>> {
+        self.result
+            .get()
+            .map(|result| result.as_ref().map(|_| ()).map_err(String::as_str))
+    }
+
+    /// Records how handing off went, as [`Runtime`] does once an attempt
+    /// succeeds; for other [`Executor`]s. Only the first result counts.
+    pub fn set_result(&self, result: Result<(), String>) {
+        let _ = self.result.set(result);
     }
 }
 

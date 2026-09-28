@@ -421,6 +421,7 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
             loopback_http: true,
             any_http: false,
         },
+        hand_off: None,
     };
     let work_dir = runtime.work_dir(&job.id, job.attempt);
 
