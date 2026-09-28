@@ -83,24 +83,30 @@ pub async fn approve(
     yes: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    ctx.change(
-        async |mut client| {
-            let review = client.review(service, hash).await?;
-            if confirm(&review, service, yes, json)? {
-                client.approve(service, hash).await?;
-            }
-            Ok(())
-        },
-        async |machine| {
+    let (review, agent) = match ctx.agent().await? {
+        Some(mut client) => (client.review(service, hash).await?, Some(client)),
+        None => {
+            let machine = ctx.reader()?;
             let found = machine.find_service(service)?;
-            let review = machine.review(&found.id, hash).await?;
-            if confirm(&review, service, yes, json)? {
-                machine.approve(&review)?;
+            (machine.review(&found.id, hash).await?, None)
+        }
+    };
+    if confirm(&review, service, yes, json)? {
+        match agent {
+            // The agent approves the bundle it fetches, if it hashes to
+            // what the owner read.
+            Some(mut client) => client.approve(service, hash).await?,
+            // The home is locked only now, not while the owner reads: an
+            // agent may start meanwhile, and then approves it.
+            None => {
+                ctx.change(
+                    async |mut client| Ok(client.approve(service, hash).await?),
+                    async |machine| Ok(machine.approve(&review).map(drop)?),
+                )
+                .await?
             }
-            Ok(())
-        },
-    )
-    .await?;
+        }
+    }
     Labels::new().with("Approved", hash.to_string()).print(json);
     Ok(())
 }

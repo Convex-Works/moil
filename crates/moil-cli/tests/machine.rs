@@ -53,6 +53,12 @@ struct Approved {
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Revoked {
+    revoked: BundleHash,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Unpaired {
     unpaired: String,
 }
@@ -163,6 +169,13 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
                 |m| matches!(m, MachineMessage::Approved { hashes } if hashes.is_empty()),
             );
         }
+        home.run(&["approve", "klisi", &text_hash, "--yes", "--json"])
+            .success();
+        let json = home
+            .run(&["revoke", "klisi", &text_hash, "--json"])
+            .success();
+        assert_eq!(json.json::<Revoked>(), Revoked { revoked: hash });
+        assert_label_rule(&revoked.stdout(), &json.stdout());
         let run = home
             .run(&["revoke", "klisi", &text_hash, "--json"])
             .failure(1);
@@ -400,6 +413,21 @@ fn changes_also_work_while_the_agent_runs() {
     let file = std::fs::read_to_string(folder.join("service.json")).unwrap();
     assert!(!file.contains(&hash), "{file}");
     assert!(agent.is_running(), "{}", agent.log.join("\n"));
+}
+
+/// Whichever of an agent starting and a change made meanwhile takes the
+/// home first, both work: the change is made on the home, which the agent
+/// then reads, or through the agent once it answers.
+#[test]
+fn a_change_made_as_an_agent_starts_works_either_way() {
+    for _ in 0..3 {
+        let home = Home::new();
+        let mut agent = Agent::spawn(&home);
+        assert_eq!(home.run(&["pause"]).success().stdout(), "Paused: true\n");
+        agent.logged("moil commands reach this agent");
+        let status: Status = home.run(&["status", "--json"]).success().json();
+        assert!(status.paused && status.agent.is_some(), "{status:?}");
+    }
 }
 
 #[test]

@@ -39,9 +39,9 @@ fn write_status(status: &Status, out: &mut impl Write) -> io::Result<()> {
         Some(agent) => {
             let host = match agent.host {
                 Host::App => "the moil app",
-                Host::Agent => "moil agent",
+                Host::Agent => "`moil agent`",
             };
-            writeln!(out, "Agent: {host}, moil {}", agent.version)?;
+            writeln!(out, "Agent: {host} (moil {})", agent.version)?;
         }
         None => writeln!(out, "Agent: none")?,
     }
