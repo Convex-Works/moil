@@ -158,7 +158,10 @@ impl Machine {
         let lock = config.home.lock()?;
         let settings = config.home.load_settings()?;
         let machine = Self::with_lock(config, settings, Some(lock))?;
-        machine.inner.home.write_guides()?;
+        // Nothing moil does depends on them.
+        if let Err(e) = machine.inner.home.write_guides() {
+            tracing::warn!("couldn't write the home's README.md and .gitignore files: {e}");
+        }
         machine.prune_bundle_store();
         Ok(machine)
     }
@@ -483,7 +486,9 @@ impl Machine {
                 (id, file)
             }
         };
-        home.write_service_gitignore(&id)?;
+        if let Err(e) = home.write_service_gitignore(&id) {
+            tracing::warn!("couldn't write {id}'s .gitignore: {e}");
+        }
         if file.name != name {
             file.name = name;
             self.save_service_file(&id, &file)?;

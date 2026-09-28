@@ -241,21 +241,18 @@ pub(crate) enum NotCounted {
 impl NotCounted {
     /// The problem to report, for the owner to fix.
     fn problem(&self, id: &ServiceId, approval: &Approval) -> Problem {
+        let (name, hash) = (&approval.name, approval.hash);
         let folder = Path::new("services").join(id.as_str());
-        let what = format!("{:?} {:?}", approval.name, approval.version);
-        let hash = approval.hash;
-        if let Self::Unnamed = self {
-            return Problem {
-                path: folder.join("service.json"),
-                message: format!(
-                    "moil ignores the approval of {hash}: {:?} isn't a bundle's name. Correct it, \
-                     or remove the approval.",
-                    approval.name
-                ),
-            };
-        }
         let why = match self {
-            Self::Unnamed => unreachable!(),
+            Self::Unnamed => {
+                return Problem {
+                    path: folder.join("service.json"),
+                    message: format!(
+                        "moil ignores the approval of {hash}: {name:?} isn't a bundle's name. \
+                         Correct it, or remove the approval."
+                    ),
+                };
+            }
             Self::Missing => format!(
                 "the bundle's files aren't all here. Approve it again with `moil approve {id} \
                  {hash}`, or remove the approval from service.json"
@@ -274,11 +271,11 @@ impl NotCounted {
             ),
         };
         Problem {
-            path: folder
-                .join("bundles")
-                .join(&approval.name)
-                .join(hash.to_string()),
-            message: format!("moil ignores the approval of {what}: {why}."),
+            path: folder.join("bundles").join(name).join(hash.to_string()),
+            message: format!(
+                "moil ignores the approval of {name:?} {:?}: {why}.",
+                approval.version
+            ),
         }
     }
 }
@@ -447,9 +444,11 @@ pub(crate) fn remove_bundle(dir: &Path) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
+    // Elsewhere, read-only files can't be deleted at all.
     #[cfg(not(unix))]
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let mut permissions = entry.metadata()?.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         let _ = fs::set_permissions(entry.path(), permissions);
     }

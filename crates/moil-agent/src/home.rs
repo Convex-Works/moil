@@ -81,7 +81,7 @@ logs/
 /// The `.gitignore` moil writes in a service's folder when there is none,
 /// so that the folder can be a repository of its own.
 pub const SERVICE_GITIGNORE: &str = "\
-# Written by moil because there was none; yours to change. See ../../README.md.
+# Written by moil because there was none; yours to change.
 # What belongs to this machine alone:
 /pairing.json
 /logs/

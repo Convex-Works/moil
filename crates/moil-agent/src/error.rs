@@ -9,7 +9,7 @@ pub enum Error {
     UnknownService(String),
     /// A service the home knows, which this machine isn't paired with
     /// (spec/machine.md §1.2).
-    #[error("this machine isn't paired with {0}; pair with it first")]
+    #[error("this machine isn't paired with {0}; `moil pair {0}` pairs it")]
     NotPaired(crate::ServiceId),
     #[error("{query:?} matches more than one service: {matches}")]
     AmbiguousService { query: String, matches: String },
