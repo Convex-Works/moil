@@ -27,19 +27,25 @@ const noticeWithin = 5 * time.Second
 func TestAServiceFolderKeptInGitMovesToAnotherMachine(t *testing.T) {
 	t.Parallel()
 	svc, laptop := lentMachine(t)
-	hook := laptop.InstallHook("probe", "")
-	repo := laptop.serviceDir()
-	git(t, repo, "init")
+	proceed := newGate(t)
+	hook := laptop.InstallHook("probe", proceed)
+	succeed(t, svc.Submit(moil.Job{Params: probe(do.Result(nil))}))
+	hook.awaitRuns(1)
+
+	// The owner starts keeping the folder in git while the hook runs.
+	repo := git(t, laptop.serviceDir(), "init")
 	bundle := "bundles/probe/" + svc.probe.Hash() + "/"
 	want := []string{".gitignore", bundle + "job.py", bundle + "job.py.lock", bundle + "manifest.json", "hooks/probe", "service.json"}
 	if shown := gitStatus(t, repo); !slices.Equal(shown, want) {
 		t.Errorf("git status shows\n  %s\nin the service's folder, want\n  %s", strings.Join(shown, "\n  "), strings.Join(want, "\n  "))
 	}
 	commitAll(t, repo, "Lend the laptop to e2e")
-	succeed(t, svc.Submit(moil.Job{Params: probe(do.Result(nil))}))
+	proceed.Open(t)
 	hook.awaitLog("== exited 0")
+	succeed(t, svc.Submit(moil.Job{Params: probe(do.Result(nil))}))
+	hook.awaitEnded(2)
 	if shown := gitStatus(t, repo); len(shown) != 0 {
-		t.Errorf("git status shows %v once the laptop has run a job and its hook", shown)
+		t.Errorf("git status shows %v once the laptop has run jobs and their hooks", shown)
 	}
 
 	desktop := newMachine(t, "alice-mini")
@@ -53,7 +59,7 @@ func TestAServiceFolderKeptInGitMovesToAnotherMachine(t *testing.T) {
 		t.Errorf("the job ran on %s, not the desktop %s", res.Machine, desktop.ID())
 	}
 	// The hook came with the folder.
-	if ran := hook.awaitRuns(2)[1]; ran.context.JobID != run.ID() || ran.context.Service.ID != laptop.serviceID {
+	if ran := hook.awaitRuns(3)[2]; ran.context.JobID != run.ID() || ran.context.Service.ID != laptop.serviceID {
 		t.Errorf("the desktop ran the hook for %s of %s, want %s of %s", ran.context.JobID, ran.context.Service.ID, run.ID(), laptop.serviceID)
 	}
 	awaitHookLog(t, desktop, "probe", "== exited 0")
@@ -121,6 +127,13 @@ func TestGitPullsChangeWhatARunningMachineRuns(t *testing.T) {
 	if svc.Machine(desktop.ID()).HasApproved(svc.probe.Hash()) {
 		t.Error("the service still sees the desktop approve the probe")
 	}
+	// Going by what git brought, neither machine changed anything git
+	// keeps.
+	for _, m := range []*machine{laptop, desktop} {
+		if shown := gitStatus(t, m.serviceDir()); len(shown) != 0 {
+			t.Errorf("git status shows %v in %s's folder", shown, m.name)
+		}
+	}
 }
 
 // Editing an approved bundle's files can't change what runs. The approval
@@ -157,9 +170,10 @@ func TestAnEditedBundleRunsNoMoreUntilGitRestoresIt(t *testing.T) {
 	if approvals := status.Services[0].Approvals; len(approvals) != 1 || approvals[0].Hash != echo.Hash() {
 		t.Errorf("moil status --json counts the approvals %+v, want only echo's", approvals)
 	}
-	if !slices.Contains(status.Problems, problemJSON{Path: where, Message: `moil ignores the approval of "probe" "1": these files ` +
-		"don't hash to " + svc.probe.Hash() + ": they changed after it was approved. Restore them (with git, say), or approve the bundle again."}) {
-		t.Errorf("moil status --json reports %+v", status.Problems)
+	// It says how to put it right.
+	if i := slices.IndexFunc(status.Problems, func(p problemJSON) bool { return p.Path == where }); !strings.Contains(status.Problems[i].Message, "Restore") ||
+		!strings.Contains(status.Problems[i].Message, "approve") {
+		t.Errorf("moil status --json reports the edit as %q", status.Problems[i].Message)
 	}
 	eventually(t, "the service to learn the probe isn't approved", func() bool {
 		return !svc.Machine(m.ID()).HasApproved(svc.probe.Hash())

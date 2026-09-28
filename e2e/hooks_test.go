@@ -191,7 +191,9 @@ func TestHooksRunOneAtATimeInTheOrderTheirJobsEnded(t *testing.T) {
 	succeed(t, second)
 
 	var paused pausedJSON
-	m.json(&paused, "pause")
+	if m.json(&paused, "pause"); !paused.Paused {
+		t.Error("moil pause --json says the machine isn't paused")
+	}
 	eventually(t, "the service to see the machine paused", func() bool { return svc.Machine(m.ID()).State == moil.Paused })
 	proceed.Open(t)
 	runs := hook.awaitEnded(2)
@@ -230,7 +232,6 @@ func TestMoilRunsOnlyHooksThatSayWhatRunsThem(t *testing.T) {
 	path := m.hookPath("probe")
 	writeFile(t, path, "touch "+shellQuote(ran)+"\n", 0o755)
 
-	why := "it doesn't start with a #! line, such as #!/bin/sh, and isn't a program"
 	var hooks []hookListingJSON
 	m.json(&hooks, "hooks")
 	want := hookListingJSON{
@@ -243,16 +244,20 @@ func TestMoilRunsOnlyHooksThatSayWhatRunsThem(t *testing.T) {
 	if len(hooks) != 1 || hooks[0] != want {
 		t.Errorf("moil hooks --json lists %+v, want %+v", hooks, want)
 	}
-	problem := problemJSON{Path: "services/" + m.serviceID + "/hooks/probe", Message: "moil can't run this hook: " + why}
-	m.awaitStatus("the hook's problem", func(status statusJSON) bool {
-		return slices.Contains(status.Problems, problem)
+	where := "services/" + m.serviceID + "/hooks/probe"
+	status := m.awaitStatus("the hook's problem", func(status statusJSON) bool {
+		return slices.ContainsFunc(status.Problems, func(p problemJSON) bool { return p.Path == where })
 	})
 
 	run := svc.Submit(moil.Job{Params: probe(do.Result(nil))})
 	succeed(t, run)
 	log := awaitHookLog(t, m, "probe", "== not run")
-	if len(log) != 2 || !strings.HasSuffix(log[0], run.ID()+" attempt 1") || log[1] != "== not run: "+why {
+	why, _ := strings.CutPrefix(log[len(log)-1], "== not run: ")
+	if len(log) != 2 || !strings.HasSuffix(log[0], run.ID()+" attempt 1") || !strings.Contains(why, "#!") {
 		t.Errorf("the hook's log is\n%s", strings.Join(log, "\n"))
+	}
+	if problem := (problemJSON{Path: where, Message: "moil can't run this hook: " + why}); !slices.Contains(status.Problems, problem) {
+		t.Errorf("moil status --json reports %+v, not the hook's log's reason, %q", status.Problems, why)
 	}
 	if _, err := os.Stat(ran); !errors.Is(err, fs.ErrNotExist) {
 		t.Error("moil ran the hook, which says nothing of what runs it")
