@@ -197,8 +197,10 @@ const MAX_NAME_CHARS: usize = 64;
 
 /// A service the home knows: a folder `services/<id>/` whose
 /// `service.json` is valid (spec/machine.md §1.2), whether or not this
-/// machine is paired with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// machine is paired with it. It serializes only for the control socket
+/// (spec/machine.md §4); the home keeps it as `service.json` and
+/// `pairing.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Service {
     /// The name of the service's folder.
     pub id: ServiceId,

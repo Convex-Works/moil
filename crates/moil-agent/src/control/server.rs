@@ -25,7 +25,7 @@ use super::messages::{
 use super::socket::{self, ShortPath, private_dir, remove_if_present, user_id};
 use crate::report::{AgentInfo, ListedBundle, ServiceRef};
 use crate::status::{self, Clock};
-use crate::{AgentHandle, Error, PairedService};
+use crate::{AgentHandle, Error, Service};
 
 /// The longest request the agent reads, in bytes.
 const MAX_REQUEST_BYTES: usize = 1 << 20;
@@ -281,14 +281,14 @@ impl Shared {
                 let service = self.find(service).await?;
                 let unpaired = agent.unpair(&service.id).await;
                 self.changed();
-                json(unpaired.map(|()| service_ref(&service)))
+                json(unpaired.map(|()| ServiceRef::from(&service)))
             }
             Request::Bundles { service } => {
                 let service = self.find(service).await?;
                 let offered = agent.machine().bundles(&service.id).await;
                 json(offered.map(|offered| ServiceBundles {
                     bundles: ListedBundle::listing(&offered, &service.approvals),
-                    service: service_ref(&service),
+                    service: ServiceRef::from(&service),
                 }))
             }
             Request::Review { service, hash } => {
@@ -324,7 +324,7 @@ impl Shared {
 
     async fn revoke(
         &self,
-        service: &PairedService,
+        service: &Service,
         hash: BundleHash,
     ) -> Result<serde_json::Value, String> {
         if !service.is_approved(&hash) {
@@ -336,7 +336,7 @@ impl Shared {
     }
 
     /// The paired service `query` names.
-    async fn find(&self, query: String) -> Result<PairedService, String> {
+    async fn find(&self, query: String) -> Result<Service, String> {
         self.agent
             .machine()
             .blocking(move |machine| machine.find_service(&query))
@@ -425,7 +425,7 @@ impl Shared {
                 // has, a status shows the service connecting.
                 self.agent.settled().await;
                 self.changed();
-                Reply::Ok(PairStep::Paired(service_ref(&service)))
+                Reply::Ok(PairStep::Paired(ServiceRef::from(&service)))
             }
             Err(e) => Reply::Error(e.to_string()),
         };
@@ -456,12 +456,4 @@ fn json<T: Serialize, E: fmt::Display>(result: Result<T, E>) -> Result<serde_jso
 
 fn value(value: impl Serialize) -> Result<serde_json::Value, String> {
     Ok(serde_json::to_value(value).expect("control messages serialize to JSON"))
-}
-
-fn service_ref(service: &PairedService) -> ServiceRef {
-    ServiceRef {
-        id: service.id.clone(),
-        name: service.name.clone(),
-        base_url: service.base_url.clone(),
-    }
 }

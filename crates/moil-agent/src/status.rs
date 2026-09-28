@@ -10,8 +10,8 @@ use crate::report::{
     ServiceReport, Status,
 };
 use crate::{
-    AgentHandle, Connection, Error, Home, JobOutcome, JobReport, JobStatus, PairedService,
-    ReadOnlyMachine, ServiceStatus, Snapshot,
+    AgentHandle, Connection, Error, Home, JobOutcome, JobReport, JobStatus, ReadOnlyMachine,
+    Service, ServiceStatus, Snapshot,
 };
 
 /// The status of a home no agent runs on: what its files say.
@@ -40,7 +40,7 @@ pub async fn from_agent(agent: &AgentHandle, info: &AgentInfo) -> Result<Status,
 
 fn build(
     home: &Home,
-    services: &[PairedService],
+    services: &[Service],
     paused: bool,
     agent: Option<(&AgentInfo, &Snapshot)>,
 ) -> Status {
@@ -66,7 +66,7 @@ fn build(
 }
 
 fn service_report(
-    service: &PairedService,
+    service: &Service,
     status: Option<&ServiceStatus>,
     clock: &Clock,
 ) -> ServiceReport {
@@ -74,7 +74,7 @@ fn service_report(
         id: service.id.clone(),
         name: service.name.clone(),
         base_url: service.base_url.clone(),
-        paired: true,
+        paired: service.pairing.is_some(),
         connection: status.map(|s| connection_report(&s.connection, clock)),
         approvals: service.approvals.clone(),
         offered: status.map(|s| {

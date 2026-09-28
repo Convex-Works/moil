@@ -17,9 +17,7 @@ use moil_agent::control::{self, Client, ClientError, HostControls, ServerHandle}
 use moil_agent::report::{
     AgentInfo, ConnectionReport, EndedJob, Host, ListedBundle, OfferedBundle, Outcome, Status,
 };
-use moil_agent::{
-    Agent, AgentHandle, AgentOptions, Connection, Home, Machine, PairedService, status,
-};
+use moil_agent::{Agent, AgentHandle, AgentOptions, Connection, Home, Machine, Service, status};
 use moil_bundle::Bundle;
 use moil_proto::{ErrorCode, MachineMessage, MachineState, ServiceMessage};
 use moil_runtime::StopReason;
@@ -67,7 +65,7 @@ struct Setup {
     _dir: TempDir,
     home: Home,
     service: FakeService,
-    paired: Option<PairedService>,
+    paired: Option<Service>,
     bundle: Bundle,
     agent: AgentHandle,
     runs: FakeRuns,
@@ -130,7 +128,7 @@ impl Setup {
         }
     }
 
-    fn paired(&self) -> &PairedService {
+    fn paired(&self) -> &Service {
         self.paired.as_ref().expect("set up paired")
     }
 
@@ -409,7 +407,7 @@ async fn approving_over_the_socket_reaches_the_service_and_the_agent() {
     let error = client.approve("nowhere", v3.hash()).await.unwrap_err();
     assert_eq!(
         error.to_string(),
-        "no paired service matches \"nowhere\"",
+        "no service matches \"nowhere\"",
         "the agent's own sentence"
     );
 }
@@ -455,7 +453,12 @@ async fn unpairing_over_the_socket_disconnects_and_forgets() {
     assert_eq!(unpaired.id, setup.paired().id);
     assert_eq!(conn.closed().await, Some(1000));
     assert_eq!(setup.service.forgotten(), [conn.token.clone()]);
-    assert_eq!(client.status().await.unwrap().services, []);
+    // The folder stays, with its approvals, for pairing again
+    // (spec/machine.md §3.2).
+    let services = client.status().await.unwrap().services;
+    assert_eq!(services.len(), 1);
+    assert!(!services[0].paired && services[0].connection.is_none());
+    assert_eq!(services[0].approvals.len(), 1);
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@ use moil_proto::BundleHash;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::PairedService;
+use crate::Service;
 use crate::report::{AgentInfo, ListedBundle, ServiceRef};
 
 /// The first line a client sends.
@@ -141,7 +141,7 @@ pub struct ServiceBundles {
 /// the hash it asked for and rebuild.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ReviewFiles {
-    pub service: PairedService,
+    pub service: Service,
     pub approved: bool,
     pub files: BTreeMap<String, String>,
     pub previous: Option<BTreeMap<String, String>>,
