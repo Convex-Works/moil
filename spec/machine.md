@@ -459,15 +459,14 @@ A service, in `status` and as each element of `moil services --json`:
 ```
 
 - `paired` is true when the folder's `pairing.json` names its URL
-  (§1.2). Whether moil also holds the token only an agent checks, since
-  reading the keychain may ask the owner first: while an agent runs, a
-  paired service without its token has no `connection` or `offered`, and
-  shows as a problem.
+  (§1.2), with or without an agent. Only an agent looks for the token,
+  since reading the keychain may ask the owner first; it tells a missing
+  one by the connection.
 - `connection` and `offered` are present while an agent runs and the
-  service is paired, with its token. `connection.state` is `connecting`, `connected`,
-  `offline` (with `error` and `retry_at`), `unpaired` (the service removed
-  this machine: pair again) or `replaced` (another connection with this
-  machine's token took over).
+  service is paired. `connection.state` is `connecting`, `connected`,
+  `offline` (with `error` and `retry_at`), `unpaired` (pair again: the
+  service removed this machine, or moil has no token for it) or
+  `replaced` (another connection with this machine's token took over).
 - `approvals` lists only approvals that count (§1.2).
 - `offered` is what the service offers, as it describes it. A bundle with
   `approved` set to `false` is waiting for the owner's review.
