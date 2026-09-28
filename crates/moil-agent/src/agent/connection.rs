@@ -222,6 +222,7 @@ impl Channel {
     /// folder names (spec/machine.md §1.2).
     async fn open(&self) -> Result<Socket, End> {
         let lost = |e: Error| End::Lost(e.to_string());
+        self.machine.check_url(&self.base_url).map_err(lost)?;
         // The keychain may even ask the owner first.
         let id = self.service.clone();
         let token = self.machine.blocking(move |machine| machine.token(&id));
@@ -242,7 +243,6 @@ impl Channel {
             },
         };
         let base_url = &token.base_url;
-        self.machine.check_url(base_url).map_err(lost)?;
 
         let mut url = Url::parse(&net::endpoint(base_url, "v1/connect"))
             .expect("a base URL stays a URL when a path is added");

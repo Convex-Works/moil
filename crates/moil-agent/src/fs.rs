@@ -106,8 +106,8 @@ pub(crate) enum Unreadable {
 /// The contents of `path`, or `None` if there is no such file. Only a
 /// regular file of at most 1 MiB is read, not through a symbolic link:
 /// git, or anyone who can push to a repository the home is kept in, can
-/// put anything at the home's paths, and mustn't make moil read another of
-/// the owner's files or a device, or wait on a FIFO.
+/// put anything at the home's paths, and mustn't make moil read a file
+/// through a link, a device or without end, or wait on a FIFO.
 pub(crate) fn read_small(path: &Path) -> Result<Option<Vec<u8>>, Unreadable> {
     use std::io::Read;
     let is_link = || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());

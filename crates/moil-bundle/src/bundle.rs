@@ -116,8 +116,8 @@ impl Bundle {
     /// Each must be a regular file, not a symbolic link, and together they
     /// must fit in [`MAX_BUNDLE_BYTES`]: whoever can change the directory,
     /// such as someone pushing to a service folder's repository, can't make
-    /// moil read another of the owner's files, a device or more than a
-    /// bundle holds, or wait on a FIFO.
+    /// moil read a file through a link, a device or more than a bundle
+    /// holds, or wait on a FIFO.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, LoadError> {
         let dir = dir.as_ref();
         let open = |name: &'static str| -> Result<(&'static str, File, u64), LoadError> {
