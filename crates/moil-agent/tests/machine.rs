@@ -626,6 +626,29 @@ async fn pairing_is_confirmed_only_on_the_services_own_origin() {
     assert!(machine.services().unwrap().is_empty());
 }
 
+/// Browsers and the operating system parse URLs their own ways: the
+/// owner is sent to the page as moil parsed it to check its origin.
+#[tokio::test]
+async fn the_confirmation_page_checked_is_the_one_opened() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let origin = service.base_url.trim_end_matches("/moil");
+
+    // A backslash that a parser could read as a user name's end.
+    let page = format!("{origin}\\@evil.example/pair");
+    service.pairing_pages(&page, &format!(" {page}?code=WDJB MJHT"));
+    let session = machine.pair(&service.base_url).await.unwrap();
+    assert_eq!(
+        session.verification_uri,
+        format!("{origin}/@evil.example/pair")
+    );
+    assert_eq!(
+        session.verification_uri_complete,
+        format!("{origin}/@evil.example/pair?code=WDJB%20MJHT")
+    );
+}
+
 #[tokio::test]
 async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
     let dir = tempfile::tempdir().unwrap();

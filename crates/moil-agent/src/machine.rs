@@ -563,10 +563,15 @@ impl Machine {
             .await
             .map_err(|e| net::unreachable(base_url.as_str(), &e))?;
         let started = Instant::now();
-        let pairing: PairResponse = net::read_json(&info.name, response).await?;
+        let mut pairing: PairResponse = net::read_json(&info.name, response).await?;
         services::check_name(&pairing.service.name).map_err(not_a_service)?;
-        check_confirmation_page(&base_url, &pairing.verification_uri)?;
-        check_confirmation_page(&base_url, &pairing.verification_uri_complete)?;
+        // The pages as they were checked are the ones shown and opened.
+        for page in [
+            &mut pairing.verification_uri,
+            &mut pairing.verification_uri_complete,
+        ] {
+            *page = check_confirmation_page(&base_url, page)?.into();
+        }
         Ok(PairingSession::new(
             self.clone(),
             base_url,

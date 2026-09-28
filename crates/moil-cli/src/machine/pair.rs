@@ -4,7 +4,7 @@
 
 use std::process::{Command as Process, Stdio};
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use moil_agent::display::reveal;
 use moil_agent::report::ServiceRef;
 use url::Url;
@@ -15,7 +15,8 @@ use super::output::Labels;
 /// What the owner needs to confirm a pairing.
 struct Started {
     user_code: String,
-    verification_uri_complete: String,
+    /// As the agent parsed it to check that it is on the service's origin.
+    verification_uri_complete: Url,
     service_name: String,
     base_url: Url,
     machine_name: String,
@@ -37,7 +38,7 @@ pub async fn run(
                 started(
                     &Started {
                         user_code: code.user_code.clone(),
-                        verification_uri_complete: code.verification_uri_complete.clone(),
+                        verification_uri_complete: page(&code.verification_uri_complete)?,
                         service_name: code.service_name.clone(),
                         base_url: code.base_url.clone(),
                         machine_name: code.machine_name.clone(),
@@ -55,7 +56,7 @@ pub async fn run(
                 started(
                     &Started {
                         user_code: session.user_code.clone(),
-                        verification_uri_complete: session.verification_uri_complete.clone(),
+                        verification_uri_complete: page(&session.verification_uri_complete)?,
                         service_name: session.service_name.clone(),
                         base_url: session.base_url().clone(),
                         machine_name: machine.info().name,
@@ -98,6 +99,12 @@ fn target(ctx: &Context, service: &str) -> anyhow::Result<String> {
     }
 }
 
+/// The confirmation page, which the agent checked is on the service's
+/// origin and passes on as it parsed it, to show and open exactly that.
+fn page(checked: &str) -> anyhow::Result<Url> {
+    Url::parse(checked).with_context(|| format!("the confirmation page {checked:?} isn't a URL"))
+}
+
 /// Shows the code to confirm and where, and opens the page.
 fn started(started: &Started, no_browser: bool, json: bool) {
     let service_name = reveal(&started.service_name);
@@ -118,7 +125,7 @@ fn started(started: &Started, no_browser: bool, json: bool) {
     eprintln!("Check that {service_name} shows the same code, then confirm it there. Waiting…");
 }
 
-fn open_browser(url: &str) -> std::io::Result<()> {
+fn open_browser(url: &Url) -> std::io::Result<()> {
     let mut command = if cfg!(target_os = "macos") {
         Process::new("open")
     } else if cfg!(windows) {
@@ -129,7 +136,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         Process::new("xdg-open")
     };
     command
-        .arg(url)
+        .arg(url.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
