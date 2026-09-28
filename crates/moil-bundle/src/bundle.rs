@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::Path;
 
 use moil_proto::BundleHash;
@@ -50,6 +51,11 @@ pub enum LoadError {
     Io { path: String, source: io::Error },
     #[error("{0} isn't UTF-8 text")]
     NotUtf8(&'static str),
+    #[error(
+        "{0} isn't a regular file: moil reads a bundle only from regular files, not through \
+         symbolic links"
+    )]
+    NotAFile(&'static str),
     #[error(transparent)]
     Invalid(#[from] BundleError),
 }
@@ -106,17 +112,56 @@ impl Bundle {
 
     /// Reads the three bundle files from `dir`. Other files in `dir` are
     /// ignored, so a bundle's source directory can hold a README or tests.
+    ///
+    /// Each must be a regular file, not a symbolic link, and together they
+    /// must fit in [`MAX_BUNDLE_BYTES`]: whoever can change the directory,
+    /// such as someone pushing to a service folder's repository, can't make
+    /// moil read another of the owner's files, a device or more than a
+    /// bundle holds, or wait on a FIFO.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, LoadError> {
         let dir = dir.as_ref();
-        let read = |name: &'static str| {
+        let open = |name: &'static str| -> Result<(&'static str, File, u64), LoadError> {
             let path = dir.join(name);
-            let bytes = std::fs::read(&path).map_err(|source| LoadError::Io {
+            let failed = |source| LoadError::Io {
                 path: path.display().to_string(),
                 source,
-            })?;
-            String::from_utf8(bytes).map_err(|_| LoadError::NotUtf8(name))
+            };
+            let file = match open_regular(&path) {
+                Ok(file) => file,
+                Err(_) if is_link(&path) => return Err(LoadError::NotAFile(name)),
+                Err(e) => return Err(failed(e)),
+            };
+            let metadata = file.metadata().map_err(failed)?;
+            if !metadata.is_file() {
+                return Err(LoadError::NotAFile(name));
+            }
+            Ok((name, file, metadata.len()))
         };
-        Ok(Self::new(read(SCRIPT)?, read(LOCKFILE)?, read(MANIFEST)?)?)
+        let files = [open(SCRIPT)?, open(LOCKFILE)?, open(MANIFEST)?];
+        let size: u64 = files.iter().map(|(_, _, len)| len).sum();
+        if size > MAX_BUNDLE_BYTES as u64 {
+            let size = usize::try_from(size).unwrap_or(usize::MAX);
+            return Err(BundleError::TooLarge(size).into());
+        }
+        // Files that grow while they're read are cut off where the bundle
+        // would pass the limit.
+        let mut left = MAX_BUNDLE_BYTES;
+        let [script, lockfile, manifest] = files.map(|(name, file, _)| {
+            let mut bytes = Vec::new();
+            file.take(left as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|source| LoadError::Io {
+                    path: dir.join(name).display().to_string(),
+                    source,
+                })?;
+            if bytes.len() > left {
+                let size = MAX_BUNDLE_BYTES - left + bytes.len();
+                return Err(LoadError::Invalid(BundleError::TooLarge(size)));
+            }
+            left -= bytes.len();
+            String::from_utf8(bytes).map_err(|_| LoadError::NotUtf8(name))
+        });
+        Ok(Self::new(script?, lockfile?, manifest?)?)
     }
 
     /// A bundle a service sent in answer to `GET /v1/bundles/{requested}`.
@@ -218,6 +263,27 @@ impl fmt::Debug for Bundle {
             .field("hash", &self.hash)
             .finish_non_exhaustive()
     }
+}
+
+/// Opens `path` for reading, unless it is a symbolic link. Never blocks,
+/// even on a FIFO; check what it opened.
+fn open_regular(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
+    if is_link(path) {
+        return Err(io::Error::other("a symbolic link"));
+    }
+    options.open(path)
+}
+
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The bundle hash of `files` (spec §5.2): the SHA-256 of their `sha256sum`
@@ -358,6 +424,61 @@ mod tests {
             Bundle::from_dir(dir.path()),
             Err(LoadError::NotUtf8("job.py"))
         ));
+    }
+
+    /// What a folder someone else can change could hold in place of a
+    /// bundle's file: nothing moil reads from it hangs, or reads more than
+    /// a bundle holds.
+    #[cfg(unix)]
+    #[test]
+    fn only_regular_files_are_read_and_only_as_much_as_a_bundle_holds() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let bundle = Bundle::from_dir(vectors_dir().join("bundles/minimal")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        bundle.write_to(elsewhere.path()).unwrap();
+        let fifo = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a valid C string.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        };
+        type Make<'a> = &'a dyn Fn(&Path);
+        let cases: [(&str, Make); 4] = [
+            ("a link to /dev/zero", &|job_py| {
+                symlink("/dev/zero", job_py).unwrap()
+            }),
+            ("a link to a valid job.py", &|job_py| {
+                symlink(elsewhere.path().join(SCRIPT), job_py).unwrap()
+            }),
+            ("a FIFO", &fifo),
+            ("a folder", &|job_py| std::fs::create_dir(job_py).unwrap()),
+        ];
+        for (what, make) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            bundle.write_to(dir.path()).unwrap();
+            let job_py = dir.path().join(SCRIPT);
+            std::fs::remove_file(&job_py).unwrap();
+            make(&job_py);
+            match Bundle::from_dir(dir.path()) {
+                Err(LoadError::NotAFile(SCRIPT)) => {}
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        bundle.write_to(dir.path()).unwrap();
+        let big = 2 * MAX_BUNDLE_BYTES;
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(SCRIPT))
+            .unwrap()
+            .set_len(big as u64)
+            .unwrap();
+        match Bundle::from_dir(dir.path()) {
+            Err(LoadError::Invalid(BundleError::TooLarge(size))) => assert!(size > big),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

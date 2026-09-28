@@ -1354,6 +1354,90 @@ async fn pairing_again_tells_only_the_service_that_issued_the_old_token() {
     );
 }
 
+/// Runs `work` on a thread of its own, failing the test if it doesn't
+/// return within [`PATIENCE`] rather than hanging it.
+fn without_hanging<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(work()));
+    result
+        .recv_timeout(PATIENCE)
+        .unwrap_or_else(|_| panic!("{what} hung"))
+}
+
+fn mkfifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+/// What someone who can push to a service folder's repository could
+/// commit in place of its files: each is a problem, and reading the home
+/// neither hangs nor reads anything else.
+#[tokio::test]
+async fn links_and_fifos_in_a_service_folder_are_problems_not_hangs() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    approve(&machine, &service, &paired, &bundle).await;
+    let bundle_dir = approved_dir(&machine, &paired, &bundle);
+    let folder = format!("services/{}", paired.id);
+    let problem = |path: String| {
+        let reader = machine.clone();
+        let problems = without_hanging("reading the home", move || reader.problems());
+        problem_at(&problems, &path).message.clone()
+    };
+
+    let link_to_zeros = |path: &Path| std::os::unix::fs::symlink("/dev/zero", path).unwrap();
+    let replacements: [&dyn Fn(&Path); 2] = [&link_to_zeros, &mkfifo];
+    for make in replacements {
+        let job_py = bundle_dir.join("job.py");
+        std::fs::remove_file(&job_py).unwrap();
+        make(&job_py);
+        let message = problem(format!("{folder}/bundles/transcribe/{}", bundle.hash()));
+        assert!(message.contains("job.py isn't a regular file"), "{message}");
+        std::fs::remove_file(&job_py).unwrap();
+        std::fs::write(&job_py, bundle.script()).unwrap();
+    }
+    assert!(machine.problems().is_empty(), "{:?}", machine.problems());
+
+    let home = machine.home();
+    for (file, path) in [
+        (
+            home.pairing_file(&paired.id),
+            format!("{folder}/pairing.json"),
+        ),
+        (
+            home.service_file(&paired.id),
+            format!("{folder}/service.json"),
+        ),
+    ] {
+        let text = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        mkfifo(&file);
+        let message = problem(path);
+        assert!(message.contains("isn't a regular file"), "{message}");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, text).unwrap();
+    }
+}
+
+/// As a home kept in git could have it after a pull.
+#[test]
+fn a_readme_that_isnt_a_file_is_written_anew_without_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let readme = dir.path().join("README.md");
+    std::os::unix::fs::symlink("/dev/zero", &readme).unwrap();
+    let root = dir.path().to_owned();
+    drop(without_hanging("opening the home", move || {
+        open_machine(&root)
+    }));
+    assert!(!readme.symlink_metadata().unwrap().is_symlink());
+    assert_eq!(std::fs::read_to_string(&readme).unwrap(), README_TEXT);
+}
+
 #[tokio::test]
 async fn service_and_pairing_files_are_strict() {
     let service = FakeService::start("klisi").await;

@@ -60,7 +60,10 @@ trailing newline, and replaces a file atomically, so a reader never sees
 half of one. Times are RFC 3339 strings in UTC, such as
 `2026-09-27T22:41:07Z`. JSON files are strict, like manifests (protocol
 §5.3): a file with unknown fields or duplicate keys is invalid, so that a
-typo is reported rather than ignored.
+typo is reported rather than ignored. moil reads `settings.json`, each
+`service.json` and `pairing.json`, and approved bundles' files only if
+they are regular files rather than symbolic links, and a JSON file only up
+to 1 MiB: a `git pull` can put anything at these paths.
 
 The owner, an editor or git MAY change `settings.json`, each
 `service.json`, anything under `hooks/`, and the `.gitignore` files once
