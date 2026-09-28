@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use moil_bundle::Bundle;
 use moil_proto::BundleHash;
@@ -404,7 +404,7 @@ impl Machine {
             base_url: base_url.clone(),
             name,
             machine_id,
-            paired_at: SystemTime::now(),
+            paired_at: crate::rfc3339::now(),
             approvals,
         };
         self.save_service(&service)?;
@@ -538,7 +538,7 @@ impl Machine {
                 hash: bundle.hash(),
                 name: bundle.manifest().name.clone(),
                 version: bundle.manifest().version.clone(),
-                approved_at: SystemTime::now(),
+                approved_at: crate::rfc3339::now(),
             });
             self.save_service(&service)?;
         }

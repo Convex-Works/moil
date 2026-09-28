@@ -83,6 +83,64 @@ impl Home {
         &self.root
     }
 
+    // The layout of spec/machine.md §1.
+
+    /// What the home is, for whoever opens it; moil keeps it current.
+    pub fn readme_file(&self) -> PathBuf {
+        self.root.join("README.md")
+    }
+
+    /// Keeps what belongs to this machine alone out of git.
+    pub fn gitignore_file(&self) -> PathBuf {
+        self.root.join(".gitignore")
+    }
+
+    /// The agent's log, whichever process runs the agent.
+    pub fn log_file(&self) -> PathBuf {
+        self.root.join("logs").join("moil.log")
+    }
+
+    /// A service's folder: `services/<id>`.
+    pub fn service_dir(&self, id: &ServiceId) -> PathBuf {
+        self.services_dir().join(id.as_str())
+    }
+
+    /// The owner's hook for a service's bundle: `services/<id>/hooks/<bundle>`.
+    /// `bundle` is a bundle name (protocol §2), so it is a plain file name.
+    pub fn hook(&self, id: &ServiceId, bundle: &str) -> PathBuf {
+        debug_assert!(is_file_name(bundle), "{bundle:?} isn't a bundle name");
+        self.service_dir(id).join("hooks").join(bundle)
+    }
+
+    /// What a hook printed: `services/<id>/logs/<bundle>.log`.
+    pub fn hook_log(&self, id: &ServiceId, bundle: &str) -> PathBuf {
+        debug_assert!(is_file_name(bundle), "{bundle:?} isn't a bundle name");
+        self.service_dir(id)
+            .join("logs")
+            .join(format!("{bundle}.log"))
+    }
+
+    /// moil's own: what only moil reads, in a layout that may change.
+    pub fn machine_dir(&self) -> PathBuf {
+        self.root.join(".machine")
+    }
+
+    /// The `moil` and `uv` this machine runs, as links: first on a hook's
+    /// `PATH` (spec/machine.md §2.2).
+    pub fn bin_dir(&self) -> PathBuf {
+        self.machine_dir().join("bin")
+    }
+
+    /// Hooks waiting to run, or running, with the outputs they get.
+    pub fn hooks_queue_dir(&self) -> PathBuf {
+        self.machine_dir().join("hooks")
+    }
+
+    /// Where the agent listens for commands (spec/machine.md §4).
+    pub fn socket(&self) -> PathBuf {
+        self.machine_dir().join("agent.sock")
+    }
+
     pub fn services_dir(&self) -> PathBuf {
         self.root.join("services")
     }
@@ -156,6 +214,11 @@ impl Home {
     pub(crate) fn save_settings(&self, settings: &Settings) -> Result<(), Error> {
         write_json(&self.settings_file(), settings, PUBLIC)
     }
+}
+
+/// Whether `name` names a file right in a directory, not a path.
+fn is_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
 }
 
 /// Creates `dir`, and any missing parents, readable only by the owner, and

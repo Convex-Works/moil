@@ -16,10 +16,13 @@ mod error;
 mod fs;
 mod hardware;
 pub mod home;
+pub mod hooks;
 pub mod machine;
 mod net;
 pub mod pairing;
+pub mod report;
 pub mod review;
+pub mod rfc3339;
 pub mod secrets;
 pub mod services;
 

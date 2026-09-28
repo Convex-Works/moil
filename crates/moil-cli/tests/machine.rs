@@ -105,7 +105,7 @@ fn what_only_reads_works_while_the_agent_runs() {
     // it without reaching for the network.
     let service = r#"{"id": "klisi.example.com", "base_url": "https://klisi.example.com/moil",
         "name": "klisi", "machine_id": "m_1",
-        "paired_at": {"secs_since_epoch": 1790000000, "nanos_since_epoch": 0}, "approvals": []}"#;
+        "paired_at": "2026-09-21T14:13:20Z", "approvals": []}"#;
     std::fs::create_dir_all(home.path().join("services")).unwrap();
     std::fs::write(home.path().join("services/klisi.example.com.json"), service).unwrap();
     let mut agent = Agent::start(home.path());

@@ -202,6 +202,7 @@ pub struct PairedService {
     pub name: String,
     /// The service's ID for this machine.
     pub machine_id: String,
+    #[serde(with = "crate::rfc3339")]
     pub paired_at: SystemTime,
     /// The bundles the owner approved for this service, oldest first.
     pub approvals: Vec<Approval>,
@@ -242,6 +243,7 @@ pub struct Approval {
     /// The bundle's name and version, from its verified manifest.
     pub name: String,
     pub version: String,
+    #[serde(with = "crate::rfc3339")]
     pub approved_at: SystemTime,
 }
 
