@@ -123,6 +123,37 @@ moil agent                                # without the app: take jobs until Ctr
 
 `cargo run -p moil-app -- --demo` shows the app with a simulated agent.
 
+## Your machine, as files
+
+Everything moil runs or acts on is in one folder, `~/.moil`, which you,
+your editor or an LLM can read, and which you can keep in git
+([spec/machine.md](spec/machine.md)):
+
+```
+~/.moil/
+  settings.json
+  services/klisi.example.com/
+    service.json                 the service, and the bundles you approved for it
+    bundles/transcribe/<hash>/   each approved bundle's files, read-only, checked before every run
+    hooks/transcribe             yours: runs after each transcribe job that succeeds here
+    logs/transcribe.log          what that hook printed
+```
+
+**Hooks** are how a job's results become yours. After a job of a bundle
+succeeds on your machine, moil runs your executable
+`services/<service>/hooks/<bundle>` with the job's context on stdin and
+its outputs in a folder. The service never learns a hook exists. The
+[example hook](examples/hooks/meeting-notes.py) turns a klisi transcript
+into meeting notes in an Obsidian vault; `moil hooks --help` has the whole
+contract.
+
+**The command line does everything the app does**, while the app runs
+too, so scripts and agents can drive moil: `moil status`, `pause`,
+`stop`, `pair`, `review`, `approve`, `hooks`, `logs` and the rest, each
+with `--json`. A service folder kept in git moves your approvals and
+hooks to your other machines; `.gitignore` keeps out what belongs to one
+machine alone, and the token never leaves the keychain.
+
 ## Write a bundle
 
 ```sh
@@ -187,6 +218,11 @@ an app means trusting its author.
   sensitive data (e.g. meeting audio) to machines their policy allows,
   typically the data owner's own.
 - There is no sandbox yet. The review window says so plainly.
+- Hooks are your own code: nobody approves them, and they run as you.
+  What they're given comes partly from the service (a job's title and
+  params, its outputs' names and contents), so a hook should treat it as
+  untrusted. Whoever can push to a service folder you keep in git can
+  approve bundles and add hooks on your machines.
 
 ## Repository
 
@@ -200,7 +236,7 @@ an app means trusting its author.
 | `crates/moil-runtime` | Runs attempts: uv environments, assets, the script, outputs |
 | `crates/moil-bundle`, `crates/moil-proto` | Bundles and wire types |
 | [`e2e/`](e2e) | End-to-end tests: the Go SDK against the real `moil` binary and uv |
-| [`examples/`](examples) | Example bundles and a demo service |
+| [`examples/`](examples) | Example bundles, a demo service, and example hooks |
 
 `make check` runs everything: formatting, lints, the Rust and Go tests and
 the end-to-end suite.
