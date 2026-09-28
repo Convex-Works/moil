@@ -128,6 +128,9 @@ pub(super) struct Coordinator {
     outputs: Outputs,
     /// Runs the owner's hooks, unless they couldn't start: then why.
     hooks: Result<Hooks, Problem>,
+    /// Queues the hook of the attempt that ended last, or removes its
+    /// entry, off the coordinator, once the one before has been.
+    settling: Option<JoinHandle<()>>,
     /// The task that reads the home when it changes, and its stop.
     watcher: Option<(CancellationToken, JoinHandle<()>)>,
     paused: bool,
@@ -402,6 +405,7 @@ impl Coordinator {
             inputs,
             outputs,
             hooks,
+            settling: None,
             watcher: Some(watcher),
             home: Arc::default(),
             services: BTreeMap::new(),
@@ -423,7 +427,7 @@ impl Coordinator {
     pub(super) fn starting_from(mut self, reading: Reading) -> Self {
         // A service without its token is connected all the same, off the
         // coordinator: finding none, its channel ends before reaching out.
-        self.home_changed(reading, true);
+        self.home_changed(reading, true, None);
         self.publish();
         self
     }
@@ -467,8 +471,11 @@ impl Coordinator {
             let _ = watcher.await;
         }
         self.close_all().await;
-        // After the attempt's `done`, so that a hook of its own isn't
-        // stopped before it started.
+        // The attempt that ended last gets its hook queued, to run now or
+        // when moil next starts.
+        if let Some(settling) = self.settling.take() {
+            let _ = settling.await;
+        }
         if let Ok(hooks) = &self.hooks {
             hooks.shutdown().await;
         }
@@ -499,10 +506,7 @@ impl Coordinator {
             } => {
                 // Shutting down, the agent connects to nothing new.
                 if self.shutdown.is_none() {
-                    if let Some(left) = left {
-                        self.leaving.remove(&left);
-                    }
-                    self.home_changed(*reading, false);
+                    self.home_changed(*reading, false, left);
                 }
                 self.replies.extend(done);
             }
@@ -570,8 +574,10 @@ impl Coordinator {
     /// home no longer has. Everything is compared with what the agent goes
     /// by, so a change is applied once, however many readings show it.
     /// The bundles already approved when the agent starts are prepared
-    /// only as their jobs come; others as they're approved.
-    fn home_changed(&mut self, reading: Reading, starting: bool) {
+    /// only as their jobs come; others as they're approved. `left` is a
+    /// service the owner has just unpaired, which is no longer
+    /// [`leaving`](Self::leaving).
+    fn home_changed(&mut self, reading: Reading, starting: bool, left: Option<ServiceId>) {
         let Merged {
             mut home,
             settings,
@@ -580,23 +586,29 @@ impl Coordinator {
         if let Err(problem) = &self.hooks {
             home.problems.push(problem.clone());
         }
-        if let Some(settings) = settings
-            && settings.paused != self.paused
+        if let Some(change) = settings
+            && change.after.paused != change.before.paused
+            && change.after.paused != self.paused
         {
-            self.paused = settings.paused;
+            self.paused = change.after.paused;
             // Any write still to come saves what the file says.
             self.paused_choice.store(self.paused, Ordering::SeqCst);
             let now = if self.paused { "paused" } else { "resumed" };
             tracing::info!("{now}, as settings.json now says");
         }
+        // Unpairing deleted those it was asked to.
         let gone: Vec<ServiceId> = self
             .home
             .pairing_files
             .iter()
-            .filter(|id| self.home.services.contains_key(*id) && !self.leaving.contains(*id))
+            .filter(|id| self.home.services.contains_key(*id))
             .filter(|id| !home.services.contains_key(*id) || !home.pairing_files.contains(*id))
+            .filter(|id| !self.leaving.contains(*id) && left.as_ref() != Some(*id))
             .cloned()
             .collect();
+        if let Some(left) = &left {
+            self.leaving.remove(left);
+        }
         self.follow_services(&home, &bundles, starting);
         for id in gone {
             self.forget(id);
@@ -1149,27 +1161,50 @@ impl Coordinator {
                 shutdown.deliver_by = Some(Instant::now() + self.options.shutdown_grace);
             }
         }
-        let Some(attempt) = self.attempts.get_mut(&key) else {
-            // Nothing is queued for the service, so the hook doesn't run.
-            return;
-        };
-        match &outcome {
-            Outcome::Succeeded { .. } => tracing::info!("{key} succeeded"),
-            Outcome::Failed { error } => tracing::info!("{key} failed: {error}"),
-            Outcome::Cancelled => tracing::info!("{key} was cancelled"),
+        let mut succeeded = None;
+        if let Some(attempt) = self.attempts.get_mut(&key) {
+            match &outcome {
+                Outcome::Succeeded { result } => {
+                    tracing::info!("{key} succeeded");
+                    succeeded = Some(result.clone());
+                }
+                Outcome::Failed { error } => tracing::info!("{key} failed: {error}"),
+                Outcome::Cancelled => tracing::info!("{key} was cancelled"),
+            }
+            attempt.push_done(&key, outcome);
+            self.unsent.insert(key.clone());
         }
-        let result = match &outcome {
-            Outcome::Succeeded { result } => Some(result.clone()),
-            _ => None,
-        };
-        attempt.push_done(&key, outcome);
-        // Its `done` is queued, so the hook can't hold up or change what
-        // the service hears (spec/machine.md §2.1). After any other
-        // outcome, the entry goes.
-        if let (Some((hook, title, ended_at)), Some(result)) = (hook, result) {
-            hook.ready(&key, title, result, ended_at);
+        // Only once its `done` is queued, so that the hook can't hold up or
+        // change what the service hears (spec/machine.md §2.1). An attempt
+        // that failed, or whose service no longer hears of it, gets none.
+        if let Some((hook, title, ended_at)) = hook {
+            let succeeded = succeeded.map(|result| (title, result, ended_at));
+            self.settle(key, hook, succeeded);
         }
-        self.unsent.insert(key);
+    }
+
+    /// Queues the hook of attempt `key` if it `succeeded`, with its title,
+    /// result and end, and removes its entry otherwise: off the
+    /// coordinator, since both take the disk a moment, but after the
+    /// attempt that ended before it, so that hooks run in the order their
+    /// attempts ended.
+    fn settle(
+        &mut self,
+        key: AttemptKey,
+        hook: ForHook,
+        succeeded: Option<(Option<String>, JobResult, SystemTime)>,
+    ) {
+        let before = self.settling.take();
+        self.settling = Some(tokio::spawn(async move {
+            if let Some(before) = before {
+                let _ = before.await;
+            }
+            let settled = tokio::task::spawn_blocking(move || match succeeded {
+                Some((title, result, ended_at)) => hook.ready(&key, title, result, ended_at),
+                None => drop(hook),
+            });
+            let _ = settled.await;
+        }));
     }
 
     fn ack(&mut self, id: &ServiceId, attempt: AttemptRef) {

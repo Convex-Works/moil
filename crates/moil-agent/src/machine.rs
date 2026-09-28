@@ -174,6 +174,16 @@ pub(crate) struct Survey {
     pub problems: Vec<Problem>,
 }
 
+/// A change made to `settings.json` from outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettingsChange {
+    /// The settings moil went by.
+    pub before: Settings,
+    /// What the file says now. Only the fields that differ from `before`
+    /// changed: moil may yet write the others as it last chose them.
+    pub after: Settings,
+}
+
 /// Makes the fields that differ between `before` and `after` the same in
 /// `target`, leaving the others as they are.
 fn carry_changes(before: &Settings, after: &Settings, target: &mut Settings) {
@@ -302,18 +312,21 @@ impl Machine {
     }
 
     /// Reads `settings.json` again, and goes by it if it changed since moil
-    /// last read or wrote it: returns the new settings then, and `None`
+    /// last read or wrote it: returns the change then, and `None`
     /// otherwise. `allow_insecure_http` and `keep_work_dirs` still take
     /// effect only when moil next starts (spec/machine.md §1.1). Fails
     /// with what's wrong with the file, keeping the settings as they were.
-    pub(crate) fn reload_settings(&self) -> Result<Option<Settings>, Error> {
+    pub(crate) fn reload_settings(&self) -> Result<Option<SettingsChange>, Error> {
         let mut settings = self.lock_settings();
         let on_disk = self.inner.home.load_settings()?;
         if on_disk == *settings {
             return Ok(None);
         }
-        *settings = on_disk.clone();
-        Ok(Some(on_disk))
+        let before = std::mem::replace(&mut *settings, on_disk.clone());
+        Ok(Some(SettingsChange {
+            before,
+            after: on_disk,
+        }))
     }
 
     /// Whether the owner allows plain `http` services, inputs and outputs

@@ -47,8 +47,9 @@ use tokio_util::sync::CancellationToken;
 use super::coordinator::Input;
 use crate::folders::{self, FolderFile};
 use crate::hooks::{self, HookScan};
+use crate::machine::SettingsChange;
 use crate::report::{HookListing, Problem};
-use crate::{Error, Home, Machine, Service, ServiceId, Settings};
+use crate::{Error, Home, Machine, Service, ServiceId};
 
 /// How many polls in a row may find the home changing before it is read
 /// all the same.
@@ -62,9 +63,9 @@ const MAX_DEPTH: usize = 4;
 /// its services is half done.
 #[derive(Debug)]
 pub(super) struct Reading {
-    /// `settings.json`, if it changed since moil last read or wrote it, or
-    /// why it can't be used.
-    pub settings: Result<Option<Settings>, Error>,
+    /// How `settings.json` changed since moil last read or wrote it, if it
+    /// did, or why it can't be used.
+    pub settings: Result<Option<SettingsChange>, Error>,
     /// The service folders, or why `services/` can't be listed.
     pub folders: Result<folders::Scan, Error>,
     pub hooks: HookScan,
@@ -101,8 +102,8 @@ pub(crate) struct HomeState {
 /// A [`Reading`], as the agent goes by it.
 pub(super) struct Merged {
     pub home: HomeState,
-    /// The settings, if they changed.
-    pub settings: Option<Settings>,
+    /// How the settings changed, if they did.
+    pub settings: Option<SettingsChange>,
     /// Verified copies of the bundles that each service's approvals that
     /// count name.
     pub bundles: BTreeMap<ServiceId, Vec<Bundle>>,

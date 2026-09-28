@@ -305,24 +305,49 @@ fn approved_dir(machine: &Machine, setup_bundle: &Bundle, service: &Service) -> 
 }
 
 #[tokio::test]
-async fn jobs_run_the_copy_verified_when_the_agent_started_whatever_happens_to_the_files() {
+async fn jobs_run_the_verified_copy_and_only_while_the_files_match_it() {
     let mut setup = Setup::new().await;
     let mut conn = setup.connect().await;
     let hash = setup.hash();
 
     // Offers are answered from memory: the approved files aren't read,
-    // let alone hashed, for each one...
-    let machine = setup.agent.machine();
-    let dir = approved_dir(machine, &setup.bundle, setup.paired());
-    overwrite(&dir.join("job.py"), "import os\n");
+    // let alone hashed, for each one, and the job gets the approved bundle,
+    // which the runtime checks its own copy against before it runs.
     conn.send(offer("j1", hash));
     assert_eq!(conn.recv().await, bid("j1"));
-
-    // ...and the job gets the approved bundle, which the runtime checks
-    // its own copy against before it runs.
     conn.send(assign("j1", 1, hash, 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
-    assert_eq!(setup.runs.next().await.job.bundle, setup.bundle);
+    let mut run = setup.runs.next().await;
+    assert_eq!(run.job.bundle, setup.bundle);
+
+    // Once the files change, the approval doesn't count, and whatever
+    // runs of it stops (spec/machine.md §1.2)...
+    let machine = setup.agent.machine();
+    let job = approved_dir(machine, &setup.bundle, setup.paired()).join("job.py");
+    let original = std::fs::read_to_string(&job).unwrap();
+    overwrite(&job, "import os\n");
+    assert_eq!(run.stopped().await, StopReason::Interrupted);
+    assert_eq!(
+        conn.recv().await,
+        MachineMessage::Approved { hashes: vec![] }
+    );
+    let (_, error) = failure(conn.recv().await);
+    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert_eq!(conn.recv().await, state(MachineState::Idle));
+    conn.send(offer("j2", hash));
+    assert_eq!(conn.recv().await, decline("j2", DeclineReason::NotApproved));
+    conn.send(assign("j2", 1, hash, 30_000));
+    let (_, error) = failure(conn.recv().await);
+    assert_eq!(error.code, ErrorCode::NotApproved);
+
+    // ...until they match again.
+    overwrite(&job, &original);
+    assert_eq!(
+        conn.recv().await,
+        MachineMessage::Approved { hashes: vec![hash] }
+    );
+    conn.send(offer("j3", hash));
+    assert_eq!(conn.recv().await, bid("j3"));
 }
 
 #[tokio::test]
