@@ -138,6 +138,8 @@ fn grouped_help(command: clap::Command) -> clap::Command {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -155,6 +157,50 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         grouped_help(Cli::command()).debug_assert();
+    }
+
+    /// What `moil` with `args` prints for help.
+    fn help(args: &[&str]) -> String {
+        let shown = grouped_help(Cli::command()).try_get_matches_from(args);
+        let help = shown.expect_err("help, rather than a command to run");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{help}");
+        help.render().to_string()
+    }
+
+    #[test]
+    fn every_command_explains_itself_with_an_example() {
+        for command in Cli::command().get_subcommands() {
+            let name = command.get_name();
+            let help = help(&["moil", name, "--help"]);
+            assert!(help.contains("\nExample"), "{name}:\n{help}");
+        }
+    }
+
+    /// Whoever reads only `moil hooks --help` can write a hook that works:
+    /// its example context is one moil writes, and it explains every field.
+    #[test]
+    fn the_hooks_help_gives_the_whole_contract() {
+        let help = help(&["moil", "hooks", "--help"]);
+        let start = help.find("\n  {\n").expect("an example context");
+        let end = start + help[start..].find("\n  }\n").expect("its end") + 4;
+        let example: serde_json::Value = serde_json::from_str(&help[start..end]).unwrap();
+        let context: moil_agent::hooks::HookContext =
+            serde_json::from_value(example.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&context).unwrap(), example);
+
+        // The table after it names each field, then says what it is.
+        let explained: BTreeSet<&str> = help[end..]
+            .lines()
+            .take_while(|line| !line.starts_with("The hook runs"))
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
+            .flat_map(|line| {
+                let names = line.split(|c: char| c.is_ascii_uppercase()).next();
+                names.unwrap_or_default().split(',').map(str::trim)
+            })
+            .collect();
+        let fields = example.as_object().unwrap().keys().map(String::as_str);
+        assert_eq!(explained, BTreeSet::from_iter(fields), "{help}");
     }
 
     #[test]

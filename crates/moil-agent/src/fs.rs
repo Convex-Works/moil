@@ -1,9 +1,11 @@
-//! State files: written so that a crash never leaves one half-written.
+//! Files and folders: state files written so that a crash never leaves one
+//! half-written, links replaced in one step, private folders, and the names
+//! the owner keeps in a folder.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
@@ -19,15 +21,10 @@ pub(crate) const PRIVATE: u32 = 0o600;
 /// Replaces `path` with `contents`: readers see either the old file or the
 /// new one, never a mix. On Unix the new file gets `mode`.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let temp = dir.join(format!(
-        ".{name}.{}-{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let temp = staging(path);
     let written = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -44,6 +41,70 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Resul
         let _ = fs::remove_file(&temp);
     }
     written
+}
+
+/// Makes `link` a symbolic link to `original`, replacing the file or link
+/// at `link`, if any, in one step: whoever looks at `link` finds what was
+/// there or the new link, never nothing.
+#[cfg(unix)]
+pub fn replace_symlink(original: &Path, link: &Path) -> io::Result<()> {
+    let staging = staging(link);
+    let _ = fs::remove_file(&staging);
+    std::os::unix::fs::symlink(original, &staging)?;
+    fs::rename(&staging, link).inspect_err(|_| {
+        let _ = fs::remove_file(&staging);
+    })
+}
+
+/// A hidden name beside `path` that no other writer, in this process or
+/// another, picks: where to make what then replaces `path` by a rename.
+fn staging(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .unwrap_or("file".as_ref())
+        .to_string_lossy();
+    path.with_file_name(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Creates `dir`, and any missing parents, readable only by the owner, and
+/// takes other users' access to it if it already exists.
+pub(crate) fn create_private(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let mode = fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode & !0o077))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)
+}
+
+/// The names in `dir` that don't start with a dot, sorted: what the owner
+/// keeps there, without the likes of `.git` and `.DS_Store`. Names that
+/// aren't UTF-8 are left out, since none of moil's are.
+pub(crate) fn visible_names(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        if let Ok(name) = entry?.file_name().into_string()
+            && !name.starts_with('.')
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// Writes `value` to `path` as pretty JSON, atomically.

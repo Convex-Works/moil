@@ -463,35 +463,15 @@ fn approve_asks_only_at_a_terminal() {
         "the bundle, to read: {stdout}"
     );
 
-    let run = home.run(&["approve", "klisi", &hash, "--json"]).failure(2);
-    assert!(run.stderr().contains("--yes"), "{}", run.stderr());
+    // A wrong command line, whose error names what's missing.
+    let stderr = home
+        .run(&["approve", "klisi", &hash, "--json"])
+        .failure(2)
+        .stderr();
+    let (error, _usage) = stderr.split_once("Usage:").unwrap();
+    assert!(error.contains("--yes"), "{stderr}");
     let services: Vec<ServiceReport> = home.run(&["services", "--json"]).success().json();
     assert!(services[0].approvals.is_empty(), "nothing was approved");
-}
-
-#[test]
-fn the_agent_points_at_moil_approve_which_works_while_it_runs() {
-    let home = Home::new();
-    let service = FakeService::start("klisi");
-    let transcribe = bundle("transcribe", "1.0.0", "print('hi')");
-    service.host(&transcribe);
-    home.pair(&service, &service.base_url);
-    let mut agent = home.agent();
-    let channel = service.accept();
-
-    let hint = agent.logged("which you haven't approved");
-    let command = hint
-        .split_once("approve it with `moil ")
-        .and_then(|(_, rest)| rest.split_once('`'))
-        .map(|(command, _)| command.to_owned())
-        .unwrap_or_else(|| panic!("the agent didn't say how to approve: {hint}"));
-    let mut args: Vec<&str> = command.split(' ').collect();
-    args.push("--yes");
-    home.run(&args).success();
-    channel.received(
-        "the approval",
-        |m| matches!(m, MachineMessage::Approved { hashes } if hashes == &[transcribe.hash()]),
-    );
 }
 
 #[test]
@@ -560,6 +540,25 @@ fn hooks_are_listed_from_the_home_alone() {
         text.contains("Problem: services/klisi/hooks/summarize: moil can't run this hook"),
         "{text}"
     );
+}
+
+/// Linux lets a path be bytes that aren't UTF-8. Reports show it with
+/// U+FFFD for what isn't, whether or not an agent runs.
+#[test]
+fn a_home_whose_path_isnt_utf8_is_shown_nearly() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(home) = Home::named(std::ffi::OsStr::from_bytes(b"caf\xe9-")) else {
+        return;
+    };
+    let shown = home.path().to_string_lossy().into_owned();
+    assert!(shown.contains("caf\u{fffd}-"), "{shown}");
+    let status: Status = home.run(&["status", "--json"]).success().json();
+    assert_eq!(status.home.to_str(), Some(shown.as_str()));
+
+    let _agent = home.agent();
+    let status: Status = home.run(&["status", "--json"]).success().json();
+    assert!(status.agent.is_some(), "{status:?}");
+    assert_eq!(status.home.to_str(), Some(shown.as_str()));
 }
 
 #[test]
@@ -646,72 +645,4 @@ fn home_prints_where_the_home_is() {
     let path = home.path().display().to_string();
     assert_eq!(json.json::<HomePath>(), HomePath { home: path });
     assert_label_rule(&text.stdout(), &json.stdout());
-}
-
-#[test]
-fn every_command_explains_itself_with_an_example() {
-    let home = Home::new();
-    for command in [
-        "status",
-        "pause",
-        "resume",
-        "stop",
-        "pair",
-        "unpair",
-        "services",
-        "review",
-        "approve",
-        "revoke",
-        "hooks",
-        "logs",
-        "home",
-        "login-item",
-        "quit",
-        "agent",
-        "init",
-        "check",
-        "hash",
-        "run",
-    ] {
-        let help = home.run(&[command, "--help"]).success().stdout();
-        assert!(help.contains("\nExample"), "{command}:\n{help}");
-    }
-    let top = home.run(&["--help"]).success().stdout();
-    let owners = top.find("Your machine:").expect("the owner's commands");
-    let authors = top
-        .find("Bundle authoring:")
-        .expect("the authoring commands");
-    assert!(owners < authors, "{top}");
-}
-
-/// Whoever reads only `moil hooks --help` can write a hook that works.
-#[test]
-fn the_hooks_help_gives_the_whole_contract() {
-    let home = Home::new();
-    let help = home.run(&["hooks", "--help"]).success().stdout();
-    for part in [
-        "<home>/services/<service ID>/hooks/<bundle name>",
-        "after an attempt of a bundle succeeds",
-        "one at a time, in the order their attempts ended",
-        "#! line",
-        "chmod +x",
-        "one line of JSON, then end-of-file",
-        "\"output_dir\"",
-        "\"outputs\"",
-        "In output_dir, as its working directory",
-        "HOME, USER, LANG, MOIL_HOME",
-        "TMPDIR",
-        "PATH, which is <home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        "for at most an hour",
-        "logs/<bundle name>.log",
-        "== exited <status> after <duration>",
-        "== stopped: moil stopped unexpectedly",
-        "== not run: <reason>",
-        "runs again from the start",
-        "cope with running twice",
-        "Treat them as untrusted",
-        "#!/usr/bin/env -S uv run --script",
-    ] {
-        assert!(help.contains(part), "{part:?} in\n{help}");
-    }
 }

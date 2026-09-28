@@ -1,18 +1,20 @@
 //! Service folders (spec/machine.md §1.2): what moil makes of what the
-//! owner, git and moil itself wrote there, and what's wrong with it.
+//! owner, git and moil itself wrote there, the owner's hooks included
+//! (§2), and what's wrong with it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
+use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use moil_bundle::{Bundle, BundleError, LoadError};
 use moil_proto::BundleHash;
 use moil_proto::ids::is_bundle_name;
 
-use crate::fs::{read_strict_json, with_path};
-use crate::report::Problem;
+use crate::fs::{read_strict_json, visible_names, with_path};
+use crate::report::{HookListing, HookReport, Problem};
 use crate::services::{Approval, Pairing, Service, ServiceFile, ServiceId};
 use crate::{Error, Home};
 
@@ -430,7 +432,7 @@ fn stray_bundle_problems(home: &Home, id: &ServiceId, approvals: &[Approval]) ->
             "moil keeps only approved bundles in bundles/<name>/<hash>/, and {why}. Remove it."
         ),
     };
-    for name in visible_entries(&dir) {
+    for name in visible_names(&dir).unwrap_or_default() {
         let path = dir.join(&name);
         if !path.is_dir() || !is_bundle_name(&name) {
             problems.push(not_a_bundle(
@@ -439,7 +441,7 @@ fn stray_bundle_problems(home: &Home, id: &ServiceId, approvals: &[Approval]) ->
             ));
             continue;
         }
-        for hash in visible_entries(&path) {
+        for hash in visible_names(&path).unwrap_or_default() {
             if approved.contains(&(name.as_str(), hash.clone())) {
                 continue;
             }
@@ -459,17 +461,174 @@ fn stray_bundle_problems(home: &Home, id: &ServiceId, approvals: &[Approval]) ->
     problems
 }
 
-/// The names in `dir` that don't start with a dot, sorted; none if it
-/// can't be read.
-fn visible_entries(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
+/// A home's hooks, and what's wrong with them: for `moil hooks`, `moil
+/// status` and the app.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookScan {
+    /// Every hook, by service and then bundle, whether or not moil can run
+    /// it.
+    pub hooks: Vec<HookListing>,
+    /// One for each hook moil can't run, for each file among a service's
+    /// hooks that can't be one, and for each `hooks/` moil can't list.
+    pub problems: Vec<Problem>,
+}
+
+impl HookScan {
+    /// The hooks of service `id`, as its report lists them.
+    pub fn for_service(&self, id: &ServiceId) -> Vec<HookReport> {
+        self.hooks
+            .iter()
+            .filter(|listing| listing.service == *id)
+            .map(|listing| listing.hook.clone())
+            .collect()
+    }
+}
+
+/// Looks for hooks in every service folder of `home` (spec/machine.md §2).
+/// Hidden files are passed over.
+pub fn scan_hooks(home: &Home) -> HookScan {
+    let mut scan = HookScan::default();
+    let problem = |path: &Path, message: String| Problem {
+        path: path.strip_prefix(home.root()).unwrap_or(path).to_owned(),
+        message,
+    };
+    // What's wrong with services/ itself, `scan` reports.
+    let ids = visible_names(&home.services_dir()).unwrap_or_default();
+    for id in ids
         .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.'))
-        .collect();
-    names.sort();
-    names
+        .filter_map(|name| ServiceId::new(name).ok())
+        .filter(|id| home.service_dir(id).is_dir())
+    {
+        let hooks_dir = home.service_dir(&id).join("hooks");
+        let names = match visible_names(&hooks_dir) {
+            Ok(names) => names,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotADirectory => {
+                let message = "moil looks for this service's hooks in a folder named hooks, but \
+                               this is a file";
+                scan.problems.push(problem(&hooks_dir, message.into()));
+                continue;
+            }
+            Err(e) => {
+                let message = format!(
+                    "moil can't list the hooks in this folder ({e}). Make it readable, with \
+                     chmod u+rx, say."
+                );
+                scan.problems.push(problem(&hooks_dir, message));
+                continue;
+            }
+        };
+        for name in names {
+            if !is_bundle_name(&name) {
+                let message = "moil never runs this file: a hook is named exactly after its \
+                               bundle, in lowercase letters, digits and hyphens, such as \
+                               hooks/transcribe";
+                scan.problems
+                    .push(problem(&hooks_dir.join(&name), message.into()));
+                continue;
+            }
+            let path = home.hook(&id, &name);
+            let runnable = runnable(&path);
+            if let Err(why) = &runnable {
+                let message = format!("moil can't run this hook: {why}");
+                scan.problems.push(problem(&path, message));
+            }
+            scan.hooks.push(HookListing {
+                service: id.clone(),
+                hook: HookReport {
+                    log: home.hook_log(&id, &name),
+                    bundle: name,
+                    path,
+                    runnable: runnable.is_ok(),
+                },
+            });
+        }
+    }
+    scan
+}
+
+/// Why moil can't run what is at a hook's path (spec/machine.md §2.1).
+#[derive(Debug)]
+pub(crate) enum Unrunnable {
+    Folder,
+    BrokenLink,
+    NotAFile,
+    NotExecutable,
+    NoInterpreter,
+    Unreadable(io::Error),
+}
+
+impl fmt::Display for Unrunnable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Folder => f.write_str("it's a folder, not a file"),
+            Self::BrokenLink => f.write_str("it's a symbolic link to a file that doesn't exist"),
+            Self::NotAFile => f.write_str("it isn't a regular file"),
+            Self::NotExecutable => f.write_str("it isn't executable. Run chmod +x on it."),
+            Self::NoInterpreter => f.write_str(
+                "it doesn't start with a #! line, such as #!/bin/sh, and isn't a program",
+            ),
+            Self::Unreadable(error) => write!(f, "moil can't look at it: {error}"),
+        }
+    }
+}
+
+/// Whether moil can run the hook at `path`: a regular file, or a symbolic
+/// link to one, that its owner can execute, and that says what runs it.
+pub(crate) fn runnable(path: &Path) -> Result<(), Unrunnable> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() => {
+            return Err(Unrunnable::BrokenLink);
+        }
+        Err(e) => return Err(Unrunnable::Unreadable(e)),
+    };
+    if metadata.is_dir() {
+        Err(Unrunnable::Folder)
+    } else if !metadata.is_file() {
+        Err(Unrunnable::NotAFile)
+    } else if metadata.permissions().mode() & 0o100 == 0 {
+        Err(Unrunnable::NotExecutable)
+    } else if !is_executable_format(path) {
+        Err(Unrunnable::NoInterpreter)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the file at `path` starts as one the system can execute does:
+/// with `#!`, or as a Mach-O or ELF program. libc runs any other file with
+/// `/bin/sh` instead, but a hook's file must say what runs it
+/// (spec/machine.md §2.1). A file moil can't read is left to the system.
+fn is_executable_format(path: &Path) -> bool {
+    const PROGRAMS: [[u8; 4]; 9] = [
+        *b"\x7fELF",
+        // Mach-O, 32 and 64 bits, either byte order.
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        // Universal binaries.
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0xbe, 0xba, 0xfe, 0xca],
+        [0xca, 0xfe, 0xba, 0xbf],
+        [0xbf, 0xba, 0xfe, 0xca],
+    ];
+    let mut start = [0; 4];
+    let read = File::open(path).and_then(|file| {
+        let mut read = 0;
+        while read < start.len() {
+            match file.read_at(&mut start[read..], read as u64)? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        Ok(read)
+    });
+    match read {
+        Ok(read) => start[..read].starts_with(b"#!") || PROGRAMS.contains(&start),
+        Err(_) => true,
+    }
 }
 
 /// Writes `bundle`'s three files, read-only, into `dir`, unless it already

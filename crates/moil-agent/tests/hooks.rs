@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
-use moil_agent::hooks::{BundleRef, HookOptions, Hooks, Succeeded, link_bin, scan};
+use moil_agent::hooks::{BundleRef, HookOptions, Hooks, PendingHook, scan};
 use moil_agent::report::{HookReport, Problem, ServiceRef};
 use moil_agent::{Home, ServiceId};
-use moil_proto::{FileInfo, FileName, JobId, JobResult};
+use moil_proto::{Assign, FileInfo, FileName, JobResult};
 use serde_json::{Value, json};
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -26,6 +26,16 @@ async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(PATIENCE, waiting)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// The uv hooks run: `find_uv`, or where uv's installer puts it.
+fn uv() -> PathBuf {
+    moil_runtime::find_uv()
+        .or_else(|| {
+            let installed = PathBuf::from(std::env::var_os("HOME")?).join(".local/bin/uv");
+            installed.is_file().then_some(installed)
+        })
+        .expect("these tests run real uv: install it, or set MOIL_UV to it")
 }
 
 fn service() -> ServiceId {
@@ -118,53 +128,75 @@ fn closing_lines(log: &str) -> Vec<&str> {
         .collect()
 }
 
-/// An attempt of `bundle` that succeeded with `outputs`.
-fn attempt(bundle: &str, job_id: &str, outputs: &[&str]) -> Succeeded {
-    Succeeded {
-        service: ServiceRef {
-            id: service(),
-            name: "klisi".into(),
-            base_url: "https://klisi.example.com/moil".parse().unwrap(),
-        },
-        bundle: BundleRef {
-            name: bundle.into(),
-            version: "0.3.0".into(),
-            hash: "42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6"
-                .parse()
-                .unwrap(),
-        },
-        job_id: JobId::new(job_id).unwrap(),
-        attempt: 2,
-        title: Some("Weekly sync".into()),
-        params: json!({"language": "en"}),
-        result: JobResult {
-            meta: Some(json!({"speakers": 3})),
-            files: outputs
-                .iter()
-                .map(|name| {
-                    let info = FileInfo {
-                        size_bytes: 0,
-                        sha256: "0".repeat(64),
-                    };
-                    (FileName::new(*name).unwrap(), info)
-                })
-                .collect(),
-        },
-        ended_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
-    }
+/// The entry the agent makes as the service assigns attempt 2 of job
+/// `job_id`, of `bundle`.
+fn entry(hooks: &Hooks, bundle: &str, job_id: &str) -> PendingHook {
+    let service = ServiceRef {
+        id: service(),
+        name: "klisi".into(),
+        base_url: "https://klisi.example.com/moil".parse().unwrap(),
+    };
+    let bundle = BundleRef {
+        name: bundle.into(),
+        version: "0.3.0".into(),
+        hash: "42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6"
+            .parse()
+            .unwrap(),
+    };
+    let assign: Assign = serde_json::from_value(json!({
+        "job_id": job_id,
+        "attempt": 2,
+        "bundle_hash": bundle.hash,
+        "title": "Weekly sync",
+        "params": {"language": "en"},
+        "lease_ms": 30_000,
+    }))
+    .unwrap();
+    hooks.entry(service, bundle, &assign)
 }
 
-/// Does what the agent and the runtime do for an attempt that succeeded:
-/// makes an entry, hands the outputs off to it, and marks it ready.
-fn queue(hooks: &Hooks, attempt: Succeeded, outputs: &[(&str, &str)]) {
-    let pending = hooks.entry().unwrap();
+/// Does what the runtime does for an attempt that succeeded with
+/// `outputs`: hands them off to the entry.
+fn hand_off(pending: &PendingHook, outputs: &[(&str, &str)]) {
     let hand_off = pending.hand_off();
     fs::create_dir_all(hand_off.dir()).unwrap();
     for (name, contents) in outputs {
         fs::write(hand_off.dir().join(name), contents).unwrap();
     }
     hand_off.set_result(Ok(()));
-    pending.ready(attempt);
+}
+
+/// Marks the entry ready as the agent does once the attempt succeeded,
+/// uploading `outputs`.
+fn ready(pending: PendingHook, outputs: &[&str]) {
+    let files = outputs
+        .iter()
+        .map(|name| {
+            let info = FileInfo {
+                size_bytes: 0,
+                sha256: "0".repeat(64),
+            };
+            (FileName::new(*name).unwrap(), info)
+        })
+        .collect();
+    let result = JobResult {
+        meta: Some(json!({"speakers": 3})),
+        files,
+    };
+    pending.ready(
+        result,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
+    );
+}
+
+/// Does what the agent and the runtime do for an attempt of `bundle` that
+/// succeeded with `outputs`: makes an entry, hands the outputs off to it,
+/// and marks it ready.
+fn queue(hooks: &Hooks, bundle: &str, job_id: &str, outputs: &[(&str, &str)]) {
+    let pending = entry(hooks, bundle, job_id);
+    hand_off(&pending, outputs);
+    let names: Vec<&str> = outputs.iter().map(|(name, _)| *name).collect();
+    ready(pending, &names);
 }
 
 /// Runs a hook written with `WARM_UP` in it just far enough to get it past
@@ -195,17 +227,19 @@ fn is_running(pid: &str) -> bool {
 }
 
 #[tokio::test]
-async fn a_hook_gets_its_context_on_stdin_and_runs_among_its_outputs() {
+async fn a_hook_gets_its_context_on_stdin_and_runs_in_an_empty_directory() {
     let t = Test::new();
     t.hook(
         "transcribe",
         r#"#!/bin/sh
 cat > REPORT/stdin
 pwd -P > REPORT/cwd
-ls -A > REPORT/listing
-cat transcript.txt > REPORT/transcript.txt
+ls -A > REPORT/cwd-listing
 echo "$TMPDIR" > REPORT/tmpdir
-test -d "$TMPDIR" && touch "$TMPDIR/scratch" && echo yes > REPORT/tmp-usable
+touch scratch && echo yes > REPORT/tmp-usable
+out=$(sed -E 's/.*"output_dir":"([^"]*)".*/\1/' REPORT/stdin)
+ls -A "$out" > REPORT/listing
+cat "$out/transcript.txt" > REPORT/transcript.txt
 echo to stdout
 echo to stderr >&2
 printf 'without a newline'
@@ -215,11 +249,8 @@ exit 3
     let hooks = t.start();
     queue(
         &hooks,
-        attempt(
-            "transcribe",
-            "recording-1",
-            &["transcript.txt", "transcript.vtt"],
-        ),
+        "transcribe",
+        "recording-1",
         &[("transcript.txt", "hello"), ("transcript.vtt", "WEBVTT")],
     );
     let log = t.closed("transcribe", 1).await;
@@ -263,11 +294,18 @@ exit 3
         })
     );
 
-    // It ran in a directory holding the outputs and nothing else.
-    assert_eq!(t.reported("cwd").trim_end(), output_dir.to_str().unwrap());
+    // It ran in its TMPDIR, which was empty, and found the outputs, and
+    // nothing else, in output_dir.
+    let tmpdir = t.reported("tmpdir");
+    assert!(
+        Path::new(tmpdir.trim_end()).starts_with(t.home.hooks_queue_dir()),
+        "{tmpdir}"
+    );
+    assert_eq!(t.reported("cwd"), tmpdir);
+    assert_eq!(t.reported("cwd-listing"), "");
+    assert_eq!(t.reported("tmp-usable"), "yes\n");
     assert_eq!(t.reported("listing"), "transcript.txt\ntranscript.vtt\n");
     assert_eq!(t.reported("transcript.txt"), "hello");
-    assert_eq!(t.reported("tmp-usable"), "yes\n");
 
     // Between moil's lines, what it printed, as it printed it.
     let lines: Vec<&str> = log.lines().collect();
@@ -289,8 +327,44 @@ exit 3
 
     // Nothing is left: its TMPDIR, its outputs or its entry.
     until("the entry to go", || t.queued().is_empty()).await;
-    assert!(!Path::new(t.reported("tmpdir").trim_end()).exists());
+    assert!(!Path::new(tmpdir.trim_end()).exists());
     assert!(!output_dir.exists());
+}
+
+/// The outputs' names come from the service, and a file such as uv.toml
+/// where a `uv run --script` hook runs would change what it runs.
+#[tokio::test]
+async fn outputs_cant_configure_what_runs_a_hook() {
+    let t = Test::new();
+    t.home.link_bin(Path::new("/usr/bin/true"), &uv()).unwrap();
+    // A cache of the tests' own, as the runtime's tests have.
+    let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("uv-cache");
+    t.hook(
+        "transcribe",
+        &format!(
+            r#"#!/usr/bin/env -S UV_CACHE_DIR={} uv run --script
+# /// script
+# dependencies = []
+# ///
+import json, sys
+
+context = json.load(sys.stdin)
+print("read", open(context["outputs"]["uv.toml"]).read())
+"#,
+            cache.display()
+        ),
+    );
+    let hooks = t.start();
+    // uv refuses to run anything where it finds a uv.toml it can't read.
+    queue(
+        &hooks,
+        "transcribe",
+        "recording-1",
+        &[("uv.toml", "index-url = [\n")],
+    );
+    let log = t.closed("transcribe", 1).await;
+    assert!(log.contains("\nread index-url = [\n"), "{log}");
+    assert!(exited(closing_lines(&log)[0], 0), "{log}");
 }
 
 #[tokio::test]
@@ -301,7 +375,7 @@ async fn a_hook_gets_only_the_environment_the_spec_lists() {
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/usr/bin/env", &hook).unwrap();
     let hooks = t.start();
-    queue(&hooks, attempt("transcribe", "recording-1", &[]), &[]);
+    queue(&hooks, "transcribe", "recording-1", &[]);
     let log = t.closed("transcribe", 1).await;
 
     let env: BTreeMap<&str, &str> = log
@@ -360,8 +434,8 @@ async fn hooks_find_this_machines_moil_and_uv_first_on_their_path() {
     let linked_uv = t.report.join("uv-link");
     std::os::unix::fs::symlink(&uv, &linked_uv).unwrap();
 
-    link_bin(&t.home, &moil, &linked_uv).unwrap();
-    link_bin(&t.home, &moil, &linked_uv).unwrap();
+    t.home.link_bin(&moil, &linked_uv).unwrap();
+    t.home.link_bin(&moil, &linked_uv).unwrap();
     assert_eq!(fs::read_link(bin.join("moil")).unwrap(), moil);
     assert_eq!(fs::read_link(bin.join("uv")).unwrap(), uv);
     let mut names: Vec<_> = fs::read_dir(&bin)
@@ -373,7 +447,7 @@ async fn hooks_find_this_machines_moil_and_uv_first_on_their_path() {
 
     t.hook("transcribe", "#!/bin/sh\nmoil status\nuv run\n");
     let hooks = t.start();
-    queue(&hooks, attempt("transcribe", "recording-1", &[]), &[]);
+    queue(&hooks, "transcribe", "recording-1", &[]);
     let log = t.closed("transcribe", 1).await;
     assert!(log.contains("\nmoil status\nuv run\n== exited 0"), "{log}");
 }
@@ -390,16 +464,35 @@ async fn logs_are_renamed_once_they_pass_a_mebibyte() {
     fs::write(&old, "older still").unwrap();
 
     let hooks = t.start();
-    queue(&hooks, attempt("transcribe", "recording-1", &[]), &[]);
+    queue(&hooks, "transcribe", "recording-1", &[]);
     t.closed("transcribe", 1).await;
     assert_eq!(fs::read_to_string(&old).unwrap(), full);
-    queue(&hooks, attempt("transcribe", "recording-2", &[]), &[]);
+    queue(&hooks, "transcribe", "recording-2", &[]);
     let current = t.closed("transcribe", 2).await;
 
     // The new log holds both runs; a log under the limit stays put.
     assert_eq!(current.matches("\nfresh\n").count(), 2, "{current}");
     assert!(current.starts_with("== "), "{current}");
     assert_eq!(fs::read_to_string(&old).unwrap(), full);
+}
+
+#[tokio::test]
+async fn a_log_that_is_a_symbolic_link_isnt_written_through() {
+    let t = Test::new();
+    t.hook("transcribe", "#!/bin/sh\necho printed\ntouch REPORT/ran\n");
+    // As a commit could leave it, pointing at another of the owner's files.
+    let theirs = t.report.join("notes.md");
+    fs::write(&theirs, "mine\n").unwrap();
+    let log = t.home.hook_log(&service(), "transcribe");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&theirs, &log).unwrap();
+
+    let hooks = t.start();
+    queue(&hooks, "transcribe", "recording-1", &[]);
+    until("the hook to run", || t.report.join("ran").exists()).await;
+    until("the entry to go", || t.queued().is_empty()).await;
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), "mine\n");
+    assert!(fs::symlink_metadata(&log).unwrap().is_symlink());
 }
 
 #[tokio::test]
@@ -420,8 +513,8 @@ async fn a_hook_that_runs_too_long_is_stopped_as_a_script_is() {
         time_limit: Duration::from_millis(300),
         ..options()
     });
-    queue(&hooks, attempt("polite", "recording-1", &[]), &[]);
-    queue(&hooks, attempt("stubborn", "recording-2", &[]), &[]);
+    queue(&hooks, "polite", "recording-1", &[]);
+    queue(&hooks, "stubborn", "recording-2", &[]);
 
     let polite = t.closed("polite", 1).await;
     assert!(
@@ -444,7 +537,7 @@ async fn nothing_a_hook_starts_outlives_it() {
         "#!/bin/sh\nsleep 30 &\necho $! > REPORT/sleeper\n",
     );
     let hooks = t.start();
-    queue(&hooks, attempt("transcribe", "recording-1", &[]), &[]);
+    queue(&hooks, "transcribe", "recording-1", &[]);
     let log = t.closed("transcribe", 1).await;
     assert!(exited(closing_lines(&log)[0], 0), "{log}");
     let sleeper = t.reported("sleeper");
@@ -462,18 +555,14 @@ async fn hooks_moil_cant_run_are_logged_and_reported() {
     t.hook("outputs-lost", "#!/bin/sh\necho ran\n");
     let hooks = t.start();
     for bundle in ["not-executable", "no-interpreter", "folder"] {
-        queue(
-            &hooks,
-            attempt(bundle, "recording-1", &["a.txt"]),
-            &[("a.txt", "a")],
-        );
+        queue(&hooks, bundle, "recording-1", &[("a.txt", "a")]);
     }
     // The runtime couldn't hand the outputs off.
-    let pending = hooks.entry().unwrap();
+    let pending = entry(&hooks, "outputs-lost", "recording-1");
     pending
         .hand_off()
         .set_result(Err("couldn't move output a.txt: disk full".into()));
-    pending.ready(attempt("outputs-lost", "recording-1", &["a.txt"]));
+    ready(pending, &["a.txt"]);
 
     let reason = |log: &str| {
         let [closing] = closing_lines(log)[..] else {
@@ -585,6 +674,34 @@ async fn the_scan_lists_every_hook_by_service_and_bundle() {
     );
 }
 
+#[test]
+fn a_hooks_folder_moil_cant_read_is_a_problem() {
+    let t = Test::new();
+    let hook = t.hook("transcribe", "#!/bin/sh\n");
+    let hooks_dir = hook.parent().unwrap();
+    fs::set_permissions(hooks_dir, fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads it all the same.
+    let unreadable = fs::read_dir(hooks_dir).is_err();
+    let scan = scan(&t.home);
+    fs::set_permissions(hooks_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if !unreadable {
+        return;
+    }
+
+    assert_eq!(scan.hooks, []);
+    let [problem] = &scan.problems[..] else {
+        panic!("{:?}", scan.problems);
+    };
+    assert_eq!(problem.path, Path::new("services/klisi.example.com/hooks"));
+    assert!(
+        problem
+            .message
+            .starts_with("moil can't list the hooks in this folder ("),
+        "{}",
+        problem.message
+    );
+}
+
 /// A hook for `bundle` that records when it starts and ends, and waits for
 /// `REPORT/release` in between.
 fn recording_hook(t: &Test, bundle: &str) {
@@ -601,30 +718,28 @@ fn recording_hook(t: &Test, bundle: &str) {
 #[tokio::test]
 async fn hooks_run_one_at_a_time_in_the_order_their_attempts_ended() {
     let t = Test::new();
-    for bundle in ["first", "a", "b", "c", "gone"] {
+    for bundle in ["a", "b", "gone", "c"] {
         recording_hook(&t, bundle);
     }
     let hooks = t.start();
-    // Entries are made as attempts start, and marked ready as they end.
-    let [a, b, c, gone] = [(); 4].map(|()| hooks.entry().unwrap());
-    queue(&hooks, attempt("first", "recording-0", &[]), &[]);
+    queue(&hooks, "a", "recording-1", &[]);
     until("the first hook to start", || {
         fs::read_to_string(t.report.join("order")).is_ok()
     })
     .await;
-    c.ready(attempt("c", "recording-3", &[]));
-    gone.ready(attempt("gone", "recording-4", &[]));
-    a.ready(attempt("a", "recording-1", &[]));
-    b.ready(attempt("b", "recording-2", &[]));
+    // Attempts that end meanwhile wait their turn.
+    queue(&hooks, "b", "recording-2", &[]);
+    queue(&hooks, "gone", "recording-3", &[]);
+    queue(&hooks, "c", "recording-4", &[]);
     // Removing its file turns a hook off, for attempts that already ended
     // too.
     fs::remove_file(t.home.hook(&service(), "gone")).unwrap();
     fs::write(t.report.join("release"), "").unwrap();
 
-    t.closed("b", 1).await;
+    t.closed("c", 1).await;
     assert_eq!(
         t.reported("order"),
-        "start first\nend first\nstart c\nend c\nstart a\nend a\nstart b\nend b\n"
+        "start a\nend a\nstart b\nend b\nstart c\nend c\n"
     );
     until("the entries to go", || t.queued().is_empty()).await;
     assert_eq!(t.log("gone"), "");
@@ -634,14 +749,18 @@ async fn hooks_run_one_at_a_time_in_the_order_their_attempts_ended() {
 async fn attempts_without_a_hook_leave_nothing_queued() {
     let t = Test::new();
     let hooks = t.start();
-    let failed = hooks.entry().unwrap();
-    let without_hook = hooks.entry().unwrap();
+    let failed = entry(&hooks, "transcribe", "recording-1");
+    let without_hook = entry(&hooks, "transcribe", "recording-2");
     // One that moil crashed during, as far as the queue can tell.
-    std::mem::forget(hooks.entry().unwrap());
+    let crashed = entry(&hooks, "transcribe", "recording-3");
+    for pending in [&failed, &without_hook, &crashed] {
+        hand_off(pending, &[("a.txt", "a")]);
+    }
     assert_eq!(t.queued().len(), 3);
 
     drop(failed);
-    without_hook.ready(attempt("transcribe", "recording-1", &[]));
+    ready(without_hook, &["a.txt"]);
+    std::mem::forget(crashed);
     assert_eq!(t.queued().len(), 1);
     hooks.shutdown().await;
 
@@ -653,50 +772,13 @@ async fn attempts_without_a_hook_leave_nothing_queued() {
 /// the first time it runs.
 const MOVING_HOOK: &str = r#"#!/bin/sh
 echo run >> REPORT/runs
-mv transcript.txt REPORT/kept.txt
+out=$(sed -E 's/.*"output_dir":"([^"]*)".*/\1/')
+mv "$out/transcript.txt" REPORT/kept.txt
 if [ "$(wc -l < REPORT/runs)" -eq 1 ]; then
   echo $$ > REPORT/pid.tmp && mv REPORT/pid.tmp REPORT/pid
   exec sleep 30
 fi
 "#;
-
-#[tokio::test]
-async fn a_hook_moil_quits_during_runs_again_with_the_same_outputs() {
-    let t = Test::new();
-    t.hook("transcribe", MOVING_HOOK);
-    let hooks = t.start();
-    queue(
-        &hooks,
-        attempt("transcribe", "recording-1", &["transcript.txt"]),
-        &[("transcript.txt", "hello")],
-    );
-    until("the hook to start", || t.report.join("pid").exists()).await;
-    fs::remove_file(t.report.join("kept.txt")).unwrap();
-
-    hooks.shutdown().await;
-    let log = t.log("transcribe");
-    assert_eq!(closing_lines(&log), ["stopped: moil quit"], "{log}");
-    assert!(!is_running(&t.reported("pid")));
-    let [entry] = &t.queued()[..] else {
-        panic!("the entry is kept");
-    };
-    let mut kept: Vec<_> = fs::read_dir(entry)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    kept.sort();
-    assert_eq!(kept, ["hook.json", "outputs"]);
-
-    let _hooks = t.start();
-    let log = t.closed("transcribe", 2).await;
-    let ["stopped: moil quit", second] = closing_lines(&log)[..] else {
-        panic!("{log}");
-    };
-    assert!(exited(second, 0), "{log}");
-    assert_eq!(t.reported("runs"), "run\nrun\n");
-    assert_eq!(t.reported("kept.txt"), "hello");
-    until("the entry to go", || t.queued().is_empty()).await;
-}
 
 const CRASH_HOME: &str = "MOIL_TEST_HOOKS_CRASH_HOME";
 
@@ -712,7 +794,8 @@ async fn run_hooks_until_killed() {
     let hooks = Hooks::start(&Home::new(root), options()).unwrap();
     queue(
         &hooks,
-        attempt("transcribe", "recording-1", &["transcript.txt"]),
+        "transcribe",
+        "recording-1",
         &[("transcript.txt", "hello")],
     );
     std::future::pending::<()>().await;

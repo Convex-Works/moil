@@ -3,7 +3,6 @@
 //! beside it, so that shells find the command that matches the running
 //! app.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -108,19 +107,7 @@ pub fn link(path: &Path, target: &Path) -> io::Result<Linked> {
         std::os::unix::fs::symlink(target, path)?;
         return Ok(Linked::Created);
     };
-    // Renamed over the old link, so that the path never goes missing.
-    let name = path.file_name().unwrap_or(OsStr::new("moil"));
-    let staging = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&staging);
-    std::os::unix::fs::symlink(target, &staging)?;
-    if let Err(e) = fs::rename(&staging, path) {
-        let _ = fs::remove_file(&staging);
-        return Err(e);
-    }
+    moil_agent::fs::replace_symlink(target, path)?;
     Ok(Linked::Replaced { previous })
 }
 

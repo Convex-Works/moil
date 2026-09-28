@@ -6,8 +6,8 @@
 //! time, in the order their attempts ended. For each attempt it runs, the
 //! agent:
 //!
-//! 1. makes a [`PendingHook`] with [`Hooks::entry`] before the attempt
-//!    starts, and gives the runtime its [`hand_off`](PendingHook::hand_off)
+//! 1. makes a [`PendingHook`] with [`Hooks::entry`] as the attempt is
+//!    assigned, and gives the runtime its [`hand_off`](PendingHook::hand_off)
 //!    as the attempt's [`Job::hand_off`](moil_runtime::Job::hand_off);
 //! 2. once the attempt has ended and its `done` is queued for the service,
 //!    calls [`PendingHook::ready`] if it succeeded, and drops the entry
@@ -16,21 +16,22 @@
 //! A hook that didn't get to exit because moil quit or crashed runs again
 //! from the start, with the same outputs, the next time [`Hooks::start`]
 //! runs on the home. [`scan`] lists a home's hooks and what's wrong with
-//! them, whether or not an agent runs, and [`link_bin`] links the `moil`
-//! and `uv` that hooks find first on their `PATH`.
+//! them, whether or not an agent runs.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
+use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use moil_proto::{BundleHash, FileName, JobId, JobResult};
+use moil_bundle::Bundle;
+use moil_proto::{Assign, BundleHash, FileName, JobId, JobResult};
 use moil_runtime::HandOff;
 use moil_runtime::process::{Group, Process};
 use serde::de::DeserializeOwned;
@@ -41,9 +42,11 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::Home;
+use crate::folders::runnable;
+pub use crate::folders::{HookScan, scan_hooks as scan};
 use crate::fs::{PRIVATE, with_path, write_atomic};
-use crate::report::{HookListing, HookReport, Problem, ServiceRef};
-use crate::{Home, ServiceId};
+use crate::report::ServiceRef;
 
 /// The hook contract's version: the context's `v`.
 pub const HOOK_CONTRACT_VERSION: u32 = 1;
@@ -68,8 +71,7 @@ pub struct HookContext {
     pub meta: Option<serde_json::Value>,
     #[serde(with = "crate::rfc3339")]
     pub ended_at: SystemTime,
-    /// A directory holding the outputs and nothing else; the hook runs in
-    /// it.
+    /// A directory holding the outputs and nothing else.
     pub output_dir: PathBuf,
     /// Each output the attempt uploaded, with its absolute path.
     pub outputs: BTreeMap<FileName, PathBuf>,
@@ -83,24 +85,14 @@ pub struct BundleRef {
     pub hash: BundleHash,
 }
 
-/// An attempt that succeeded, as its hook is told about it
-/// (spec/machine.md §2.2): the [`HookContext`] but for where the outputs
-/// are, which its [`PendingHook`] knows.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Succeeded {
-    pub service: ServiceRef,
-    /// The approved bundle that ran.
-    pub bundle: BundleRef,
-    pub job_id: JobId,
-    pub attempt: u32,
-    /// The job's title, if the service gave one.
-    pub title: Option<String>,
-    /// The job's params, as the script got them.
-    pub params: serde_json::Value,
-    /// What the attempt reported: its `meta` goes to the hook, and its
-    /// `files` name the outputs.
-    pub result: JobResult,
-    pub ended_at: SystemTime,
+impl From<&Bundle> for BundleRef {
+    fn from(bundle: &Bundle) -> Self {
+        Self {
+            name: bundle.manifest().name.clone(),
+            version: bundle.manifest().version.clone(),
+            hash: bundle.hash(),
+        }
+    }
 }
 
 /// How hooks run. The defaults are the spec's; tests shrink them.
@@ -124,18 +116,22 @@ impl Default for HookOptions {
 }
 
 // A queue entry is a directory, `<queue>/<number>`, numbered in the order
-// entries were made:
+// entries were made. One attempt runs at a time, so that is also the order
+// the attempts ended in.
 //
 //   outputs/      the outputs as the runtime handed them off, untouched
 //   hook.json     once the attempt succeeded: a `Queued`
-//   running.json  while the hook runs: a `Running`
+//   running.json  while the hook runs: the process running it
+//   group.json    once the hook has started: the leader of its process
+//                 group
 //   out/          the hook's output_dir, made afresh from outputs/ for
 //                 every run
-//   tmp/          the hook's TMPDIR while it runs
+//   tmp/          the hook's working directory and TMPDIR while it runs
 
 const OUTPUTS: &str = "outputs";
 const QUEUED: &str = "hook.json";
 const RUNNING: &str = "running.json";
+const GROUP: &str = "group.json";
 const OUT: &str = "out";
 const TMP: &str = "tmp";
 
@@ -153,23 +149,10 @@ const DEFAULT_LANG: &str = "C.UTF-8";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Queued {
-    /// Hooks run in this order, which is the order their attempts ended in.
-    order: u64,
     /// Why the hook can't run, when that was known as it was queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     not_run: Option<String>,
     context: HookContext,
-}
-
-/// `running.json`: which process runs the hook, and the hook's process
-/// group once it has started, so that the processes a crash leaves behind
-/// can be found.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Running {
-    supervisor: Process,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    group: Option<Process>,
 }
 
 /// A home's queue of hooks, and the task that runs them. Dropping it stops
@@ -184,27 +167,13 @@ pub struct Hooks {
 struct Inner {
     /// With its root made absolute and canonical, as hooks are told it.
     home: Home,
-    queue_dir: PathBuf,
     options: HookOptions,
-    state: Mutex<State>,
+    /// The entries ready to run, by number.
+    ready: Mutex<BTreeMap<u64, Queued>>,
+    next_number: AtomicU64,
     /// Told whenever an entry becomes ready.
     wake: Notify,
     quit: CancellationToken,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    /// The entries ready to run, by order and then number.
-    ready: BTreeMap<(u64, u64), Entry>,
-    next_order: u64,
-    next_number: u64,
-}
-
-/// A queue entry whose hook is ready to run.
-#[derive(Debug)]
-struct Entry {
-    dir: PathBuf,
-    queued: Queued,
 }
 
 impl Hooks {
@@ -224,12 +193,12 @@ impl Hooks {
         let home = Home::new(root);
         let queue_dir = home.hooks_queue_dir();
         fs::create_dir_all(&queue_dir).map_err(|e| with_path(e, &queue_dir))?;
-        let state = recover(&home).map_err(|e| with_path(e, &queue_dir))?;
+        let (ready, next_number) = recover(&home).map_err(|e| with_path(e, &queue_dir))?;
         let inner = Arc::new(Inner {
             home,
-            queue_dir,
             options,
-            state: Mutex::new(state),
+            ready: Mutex::new(ready),
+            next_number: AtomicU64::new(next_number),
             wake: Notify::new(),
             quit: CancellationToken::new(),
         });
@@ -240,23 +209,34 @@ impl Hooks {
         })
     }
 
-    /// A queue entry for an attempt about to start, whose hook runs if the
-    /// attempt succeeds. Dropping it removes it.
-    pub fn entry(&self) -> io::Result<PendingHook> {
-        let number = {
-            let mut state = self.inner.state();
-            state.next_number += 1;
-            state.next_number - 1
+    /// A queue entry for the attempt that `assign` starts, of `bundle` for
+    /// `service`: if the attempt succeeds, its hook runs with the outputs
+    /// the runtime leaves in the entry. Touches no disk; dropping the entry
+    /// removes what the runtime left there.
+    pub fn entry(&self, service: ServiceRef, bundle: BundleRef, assign: &Assign) -> PendingHook {
+        let number = self.inner.next_number.fetch_add(1, Ordering::Relaxed);
+        let dir = self.inner.entry_dir(number);
+        let mut context = HookContext {
+            v: HOOK_CONTRACT_VERSION,
+            service,
+            bundle,
+            job_id: assign.job_id.clone(),
+            attempt: assign.attempt,
+            title: assign.title.clone(),
+            params: assign.params.clone(),
+            // Known once the attempt has ended.
+            meta: None,
+            ended_at: SystemTime::UNIX_EPOCH,
+            output_dir: PathBuf::new(),
+            outputs: BTreeMap::new(),
         };
-        let dir = self.inner.queue_dir.join(number.to_string());
-        fs::create_dir(&dir).map_err(|e| with_path(e, &dir))?;
-        Ok(PendingHook {
+        locate_outputs(&mut context, &dir);
+        PendingHook {
             inner: self.inner.clone(),
-            hand_off: HandOff::new(dir.join(OUTPUTS)),
-            dir,
             number,
-            queued: false,
-        })
+            hand_off: HandOff::new(dir.join(OUTPUTS)),
+            context: Some(context),
+        }
     }
 
     /// Stops the hook that is running, if any, writing `== stopped: moil
@@ -282,10 +262,10 @@ impl Drop for Hooks {
 #[derive(Debug)]
 pub struct PendingHook {
     inner: Arc<Inner>,
-    dir: PathBuf,
     number: u64,
     hand_off: HandOff,
-    queued: bool,
+    /// What the hook is told, so far; taken once the entry is queued.
+    context: Option<HookContext>,
 }
 
 impl PendingHook {
@@ -295,130 +275,122 @@ impl PendingHook {
         self.hand_off.clone()
     }
 
-    /// The context a hook gets for `attempt`, with this entry's outputs.
-    pub fn context(&self, attempt: &Succeeded) -> HookContext {
-        let mut context = HookContext {
-            v: HOOK_CONTRACT_VERSION,
-            service: attempt.service.clone(),
-            bundle: attempt.bundle.clone(),
-            job_id: attempt.job_id.clone(),
-            attempt: attempt.attempt,
-            title: attempt.title.clone(),
-            params: attempt.params.clone(),
-            meta: attempt.result.meta.clone(),
-            ended_at: attempt.ended_at,
-            output_dir: PathBuf::new(),
-            outputs: attempt
-                .result
-                .files
-                .keys()
-                .map(|name| (name.clone(), PathBuf::new()))
-                .collect(),
-        };
-        locate_outputs(&mut context, &self.dir);
-        context
-    }
-
-    /// Queues the hook of `attempt`, which succeeded, to run once the hooks
-    /// of attempts that ended before it have. If there is no hook for its
-    /// service and bundle by now, the entry is removed instead.
+    /// Queues the hook of the attempt, which succeeded with `result` at
+    /// `ended_at`, to run once the hooks of the entries made before it
+    /// have. If there is no hook for its service and bundle by now, the
+    /// entry is removed instead. Blocks while it writes to the disk.
     ///
     /// Call it once the attempt's `done` is queued for its service, so that
     /// the hook never runs before the service hears how the attempt ended
-    /// (spec/machine.md §2.1).
-    pub fn ready(mut self, attempt: Succeeded) {
-        let context = self.context(&attempt);
+    /// (spec/machine.md §2.1), and only after the entries made before this
+    /// one were readied or dropped, so that no hook runs before those of
+    /// attempts that ended earlier.
+    pub fn ready(mut self, result: JobResult, ended_at: SystemTime) {
+        let dir = self.inner.entry_dir(self.number);
+        let mut context = self.context.take().expect("an entry is readied once");
         let hook = self
             .inner
             .home
             .hook(&context.service.id, &context.bundle.name);
         // The file is the whole setup: without it, there is nothing to run.
         if is_absent(&hook) {
-            return;
+            return remove_entry(&dir);
         }
+        context.meta = result.meta;
+        context.ended_at = ended_at;
+        context.outputs = result
+            .files
+            .into_keys()
+            .map(|name| (name, PathBuf::new()))
+            .collect();
+        locate_outputs(&mut context, &dir);
         let not_run = match self.hand_off.result() {
             Some(Err(why)) => Some(format!("moil couldn't keep the attempt's outputs: {why}")),
             // Otherwise the outputs are checked as the hook starts.
             Some(Ok(())) | None => None,
         };
-        let mut state = self.inner.state();
-        let queued = Queued {
-            order: state.next_order,
-            not_run,
-            context,
-        };
-        let path = self.dir.join(QUEUED);
-        let mut json = serde_json::to_vec_pretty(&queued).expect("a queued hook serializes");
-        json.push(b'\n');
-        if let Err(error) = write_atomic(&path, &json, PRIVATE) {
+        let queued = Queued { not_run, context };
+        let path = dir.join(QUEUED);
+        let written = serde_json::to_vec_pretty(&queued)
+            .map_err(io::Error::from)
+            .and_then(|mut json| {
+                json.push(b'\n');
+                write_atomic(&path, &json, PRIVATE)
+            });
+        if let Err(error) = written {
             tracing::warn!(
                 "couldn't queue the hook for {} attempt {}, so it won't run: {}",
                 queued.context.job_id,
                 queued.context.attempt,
                 with_path(error, &path)
             );
-            return;
+            return remove_entry(&dir);
         }
-        state.next_order += 1;
-        let entry = Entry {
-            dir: self.dir.clone(),
-            queued,
-        };
-        state.ready.insert((entry.queued.order, self.number), entry);
-        drop(state);
-        self.queued = true;
+        self.inner.ready().insert(self.number, queued);
         self.inner.wake.notify_one();
     }
 }
 
 impl Drop for PendingHook {
     fn drop(&mut self) {
-        if !self.queued {
-            remove_entry(&self.dir);
+        // Not queued: the attempt didn't succeed, or its service no longer
+        // hears of it.
+        if self.context.is_some() {
+            remove_entry(&self.inner.entry_dir(self.number));
         }
     }
 }
 
 impl Inner {
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn ready(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Queued>> {
+        self.ready.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn entry_dir(&self, number: u64) -> PathBuf {
+        self.home.hooks_queue_dir().join(number.to_string())
     }
 
     /// Runs ready hooks, one at a time, until moil quits.
     async fn work(self: Arc<Self>) {
         let supervisor = Process::current();
         loop {
-            let entry = tokio::select! {
+            let (number, queued) = tokio::select! {
                 biased;
                 () = self.quit.cancelled() => return,
-                entry = self.next() => entry,
+                next = self.next() => next,
             };
-            let ending = self.run(&entry, supervisor.as_ref()).await;
+            let dir = self.entry_dir(number);
+            let ending = self.run(&dir, &queued, supervisor.as_ref()).await;
             if matches!(ending, Some(Ending::Quit)) {
                 // It runs again from the start next time.
                 for leftover in [OUT, TMP] {
-                    remove_quietly(&entry.dir.join(leftover));
+                    remove_quietly(&dir.join(leftover));
                 }
                 return;
             }
-            remove_entry(&entry.dir);
+            remove_entry(&dir);
         }
     }
 
     /// The first entry ready to run, once there is one.
-    async fn next(&self) -> Entry {
+    async fn next(&self) -> (u64, Queued) {
         loop {
-            if let Some((_, entry)) = self.state().ready.pop_first() {
-                return entry;
+            if let Some(next) = self.ready().pop_first() {
+                return next;
             }
             self.wake.notified().await;
         }
     }
 
-    /// Runs the hook of `entry`, logging how it went, unless its file is
-    /// gone. Returns how it ended.
-    async fn run(&self, entry: &Entry, supervisor: Option<&Process>) -> Option<Ending> {
-        let context = &entry.queued.context;
+    /// Runs the hook of the entry in `dir`, logging how it went, unless its
+    /// file is gone. Returns how it ended.
+    async fn run(
+        &self,
+        dir: &Path,
+        queued: &Queued,
+        supervisor: Option<&Process>,
+    ) -> Option<Ending> {
+        let context = &queued.context;
         let hook = self.home.hook(&context.service.id, &context.bundle.name);
         // Removing the file turns the hook off, for attempts that already
         // ended too.
@@ -435,33 +407,42 @@ impl Inner {
             context.job_id,
             context.attempt
         ));
-        let ending = match &entry.queued.not_run {
+        // Until the closing line, a crash leaves this record, for moil to
+        // write that line and kill what's left of the hook when it next
+        // starts.
+        let running = dir.join(RUNNING);
+        let recorded = supervisor.is_some_and(|supervisor| record(&running, supervisor));
+        let ending = match &queued.not_run {
             Some(why) => Ending::NotRun(why.clone()),
-            None => self.run_hook(entry, &hook, &log, supervisor).await,
+            None => self.run_hook(dir, context, &hook, &log, recorded).await,
         };
         log.line(&ending.to_string());
+        remove_quietly(&dir.join(GROUP));
+        remove_quietly(&running);
         Some(ending)
     }
 
+    /// Runs `hook` with `context`, as the entry in `dir` has it, and
+    /// records its process group if the run is `recorded`.
     async fn run_hook(
         &self,
-        entry: &Entry,
+        dir: &Path,
+        context: &HookContext,
         hook: &Path,
         log: &Log,
-        supervisor: Option<&Process>,
+        recorded: bool,
     ) -> Ending {
         if let Err(why) = runnable(hook) {
             return Ending::NotRun(why.to_string());
         }
-        let context = &entry.queued.context;
         let out = &context.output_dir;
-        if let Err(why) = give_outputs(&entry.dir.join(OUTPUTS), out, context.outputs.keys()) {
+        if let Err(why) = give_outputs(&dir.join(OUTPUTS), out, context.outputs.keys()) {
             return Ending::NotRun(why);
         }
-        let tmp = entry.dir.join(TMP);
+        let tmp = dir.join(TMP);
         if let Err(error) = moil_runtime::remove_tree(&tmp).and_then(|()| fs::create_dir(&tmp)) {
             return Ending::NotRun(format!(
-                "moil couldn't make its TMPDIR, {}: {error}",
+                "moil couldn't make the directory it runs in, {}: {error}",
                 tmp.display()
             ));
         }
@@ -470,7 +451,9 @@ impl Inner {
         command
             .env_clear()
             .envs(self.environment(&tmp))
-            .current_dir(out)
+            // Not among the outputs, whose names come from the service: a
+            // file such as uv.toml there could change what the hook runs.
+            .current_dir(&tmp)
             .stdin(Stdio::piped())
             .stdout(log.stdio())
             .stderr(log.stdio());
@@ -479,21 +462,10 @@ impl Inner {
             Err(error) => return Ending::NotRun(cant_start(&error)),
         };
         let started = Instant::now();
-        let running = entry.dir.join(RUNNING);
-        if let Some(supervisor) = supervisor {
-            let record = Running {
-                supervisor: supervisor.clone(),
-                group: Some(group.leader()),
-            };
-            let json = serde_json::to_vec(&record).expect("a record serializes");
-            if let Err(error) = write_atomic(&running, &json, PRIVATE) {
-                tracing::warn!(
-                    "couldn't record a running hook, so moil can't stop it if it crashes: {}",
-                    with_path(error, &running)
-                );
-            }
+        if recorded {
+            record(&dir.join(GROUP), &group.leader());
         }
-        let mut line = serde_json::to_vec(context).expect("a hook context serializes");
+        let mut line = serde_json::to_vec(context).expect("a queued context serializes");
         line.push(b'\n');
         let stdin = group.child_mut().stdin.take();
         // A hook that doesn't read its stdin must not hold anything up.
@@ -516,7 +488,6 @@ impl Inner {
         // Nothing the hook started outlives it.
         let status = group.finish().await;
         let after = started.elapsed();
-        remove_quietly(&running);
         remove_quietly(&tmp);
         stopped.unwrap_or_else(|| Ending::from_status(status, after))
     }
@@ -538,6 +509,22 @@ impl Inner {
         path.push(SYSTEM_PATH);
         env.push(("PATH", path));
         env
+    }
+}
+
+/// Writes `process` to the record at `path`. Returns whether it did: if
+/// not, moil can't clean up after the hook should it crash, and says so.
+fn record(path: &Path, process: &Process) -> bool {
+    let json = serde_json::to_vec(process).expect("a process serializes");
+    match write_atomic(path, &json, PRIVATE) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "couldn't record a running hook, so moil can't stop it if moil crashes: {}",
+                with_path(error, path)
+            );
+            false
+        }
     }
 }
 
@@ -632,7 +619,7 @@ impl Log {
             .map_err(|error| {
                 tracing::warn!(
                     "couldn't open a hook's log, so what the hook prints is lost: {}",
-                    with_path(error, &path)
+                    log_error(error, &path)
                 );
             })
             .ok();
@@ -642,14 +629,13 @@ impl Log {
     /// The log at `path`, to add to it, if it's there: a log that's gone,
     /// or a service folder, isn't made again just for a closing line.
     fn existing(path: PathBuf) -> Self {
-        let file = File::options().read(true).append(true).open(&path);
-        let file = match file {
+        let file = match log_options().open(&path) {
             Ok(file) => Some(file),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(error) => {
                 tracing::warn!(
                     "couldn't write to a hook's log: {}",
-                    with_path(error, &path)
+                    log_error(error, &path)
                 );
                 None
             }
@@ -690,16 +676,33 @@ fn open_log(path: &Path) -> io::Result<File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    if fs::metadata(path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > MAX_LOG_BYTES) {
         let mut old = path.as_os_str().to_owned();
         old.push(".1");
         fs::rename(path, old)?;
     }
-    File::options()
+    log_options().create(true).open(path)
+}
+
+/// How moil opens a hook's log, to add to it: never through a symbolic
+/// link, which a commit could put there to have moil write to another of
+/// the owner's files.
+fn log_options() -> fs::OpenOptions {
+    let mut options = File::options();
+    options
         .read(true)
         .append(true)
-        .create(true)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW);
+    options
+}
+
+/// `error`, from opening the log at `path`, as a sentence.
+fn log_error(error: io::Error, path: &Path) -> io::Error {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        let why = "it's a symbolic link, which moil doesn't write through. Remove it";
+        return io::Error::new(error.kind(), format!("{}: {why}", path.display()));
+    }
+    with_path(error, path)
 }
 
 /// Makes `out` afresh with copies of the outputs `names` from `kept`, so
@@ -735,99 +738,16 @@ fn cant_start(error: &io::Error) -> String {
     format!("moil couldn't start it: {error}{hint}")
 }
 
-/// Why moil can't run what is at a hook's path (spec/machine.md §2.1).
-#[derive(Debug)]
-enum Unrunnable {
-    Folder,
-    BrokenLink,
-    NotAFile,
-    NotExecutable,
-    NoInterpreter,
-    Unreadable(io::Error),
-}
-
-impl fmt::Display for Unrunnable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Folder => f.write_str("it's a folder, not a file"),
-            Self::BrokenLink => f.write_str("it's a symbolic link to a file that doesn't exist"),
-            Self::NotAFile => f.write_str("it isn't a regular file"),
-            Self::NotExecutable => f.write_str("it isn't executable. Run chmod +x on it."),
-            Self::NoInterpreter => f.write_str(
-                "it doesn't start with a #! line, such as #!/bin/sh, and isn't a program",
-            ),
-            Self::Unreadable(error) => write!(f, "moil can't look at it: {error}"),
-        }
-    }
-}
-
-/// Whether moil can run the hook at `path`: a regular file, or a symbolic
-/// link to one, that its owner can execute, and that says what runs it.
-fn runnable(path: &Path) -> Result<(), Unrunnable> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() => {
-            return Err(Unrunnable::BrokenLink);
-        }
-        Err(e) => return Err(Unrunnable::Unreadable(e)),
-    };
-    if metadata.is_dir() {
-        Err(Unrunnable::Folder)
-    } else if !metadata.is_file() {
-        Err(Unrunnable::NotAFile)
-    } else if metadata.permissions().mode() & 0o100 == 0 {
-        Err(Unrunnable::NotExecutable)
-    } else if !is_executable_format(path) {
-        Err(Unrunnable::NoInterpreter)
-    } else {
-        Ok(())
-    }
-}
-
-/// Whether the file at `path` starts as one the system can execute does:
-/// with `#!`, or as a Mach-O or ELF program. libc runs any other file with
-/// `/bin/sh` instead, but a hook's file must say what runs it
-/// (spec/machine.md §2.1). A file moil can't read is left to the system.
-fn is_executable_format(path: &Path) -> bool {
-    const PROGRAMS: [[u8; 4]; 9] = [
-        *b"\x7fELF",
-        // Mach-O, 32 and 64 bits, either byte order.
-        [0xfe, 0xed, 0xfa, 0xce],
-        [0xce, 0xfa, 0xed, 0xfe],
-        [0xfe, 0xed, 0xfa, 0xcf],
-        [0xcf, 0xfa, 0xed, 0xfe],
-        // Universal binaries.
-        [0xca, 0xfe, 0xba, 0xbe],
-        [0xbe, 0xba, 0xfe, 0xca],
-        [0xca, 0xfe, 0xba, 0xbf],
-        [0xbf, 0xba, 0xfe, 0xca],
-    ];
-    let mut start = [0; 4];
-    let read = File::open(path).and_then(|file| {
-        let mut read = 0;
-        while read < start.len() {
-            match file.read_at(&mut start[read..], read as u64)? {
-                0 => break,
-                n => read += n,
-            }
-        }
-        Ok(read)
-    });
-    match read {
-        Ok(read) => start[..read].starts_with(b"#!") || PROGRAMS.contains(&start),
-        Err(_) => true,
-    }
-}
-
 /// Whether nothing at all is at `path`, not even a broken link.
 fn is_absent(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
-/// The queue of `home` as a crash or quit left it: kills what's left of
-/// hooks that were running, and removes entries that aren't ready.
-fn recover(home: &Home) -> io::Result<State> {
-    let mut state = State::default();
+/// The queue of `home` as a crash or quit left it: the entries ready to
+/// run, by number, and the number the next entry takes. Kills what's left
+/// of hooks that were running, and removes entries that aren't ready.
+fn recover(home: &Home) -> io::Result<(BTreeMap<u64, Queued>, u64)> {
+    let (mut ready, mut next_number) = (BTreeMap::new(), 0);
     for item in fs::read_dir(home.hooks_queue_dir())? {
         let item = item?;
         let dir = item.path();
@@ -840,13 +760,10 @@ fn recover(home: &Home) -> io::Result<State> {
             remove_quietly(&dir);
             continue;
         };
-        state.next_number = state.next_number.max(number + 1);
+        next_number = next_number.max(number + 1);
         match recover_entry(home, &dir) {
             Ok(Some(queued)) => {
-                state.next_order = state.next_order.max(queued.order + 1);
-                state
-                    .ready
-                    .insert((queued.order, number), Entry { dir, queued });
+                ready.insert(number, queued);
             }
             Ok(None) => {}
             Err(error) => tracing::warn!(
@@ -856,21 +773,23 @@ fn recover(home: &Home) -> io::Result<State> {
             ),
         }
     }
-    Ok(state)
+    Ok((ready, next_number))
 }
 
 /// The hook to run for the entry at `dir`, if it is to run.
 fn recover_entry(home: &Home, dir: &Path) -> io::Result<Option<Queued>> {
     let queued = read_record::<Queued>(&dir.join(QUEUED));
     let running = dir.join(RUNNING);
-    if let Some(record) = read_record::<Running>(&running) {
+    if let Some(supervisor) = read_record::<Process>(&running) {
         // Another process runs it; with the home's lock, that can only be
         // a moil that is about to exit.
-        if record.supervisor.is_running() {
+        if supervisor.is_running() {
             return Ok(None);
         }
-        if let Some(group) = &record.group {
-            group.kill_group()?;
+        let group = dir.join(GROUP);
+        if let Some(leader) = read_record::<Process>(&group) {
+            leader.kill_group()?;
+            fs::remove_file(&group)?;
         }
         fs::remove_file(&running)?;
         // The run moil lost track of gets its closing line before the next
@@ -943,136 +862,4 @@ fn remove_quietly(path: &Path) {
     if let Err(error) = removed {
         tracing::warn!("couldn't remove {}: {error}", path.display());
     }
-}
-
-/// A home's hooks, and what's wrong with them: for `moil hooks`, `moil
-/// status` and the app.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HookScan {
-    /// Every hook, by service and then bundle, whether or not moil can run
-    /// it.
-    pub hooks: Vec<HookListing>,
-    /// One for each hook moil can't run, and for each file among a
-    /// service's hooks that can't be one.
-    pub problems: Vec<Problem>,
-}
-
-impl HookScan {
-    /// The hooks of service `id`, as its report lists them.
-    pub fn for_service(&self, id: &ServiceId) -> Vec<HookReport> {
-        self.hooks
-            .iter()
-            .filter(|listing| listing.service == *id)
-            .map(|listing| listing.hook.clone())
-            .collect()
-    }
-}
-
-/// Looks for hooks in every service folder of `home` (spec/machine.md §2).
-/// Hidden files are passed over. What can't be read counts as missing.
-pub fn scan(home: &Home) -> HookScan {
-    let mut scan = HookScan::default();
-    for id in sorted_names(&home.services_dir())
-        .into_iter()
-        .filter_map(|name| ServiceId::new(name).ok())
-        .filter(|id| home.service_dir(id).is_dir())
-    {
-        let hooks_dir = home.service_dir(&id).join("hooks");
-        if fs::metadata(&hooks_dir).is_ok_and(|m| !m.is_dir()) {
-            scan.problems.push(Problem {
-                path: relative(home, &hooks_dir),
-                message: "moil looks for this service's hooks in a folder named hooks, \
-                          but this is a file"
-                    .into(),
-            });
-            continue;
-        }
-        for name in sorted_names(&hooks_dir) {
-            if name.starts_with('.') {
-                continue;
-            }
-            if !moil_proto::ids::is_bundle_name(&name) {
-                scan.problems.push(Problem {
-                    path: relative(home, &hooks_dir.join(&name)),
-                    message: "moil never runs this file: a hook is named exactly after its \
-                              bundle, in lowercase letters, digits and hyphens, such as \
-                              hooks/transcribe"
-                        .into(),
-                });
-                continue;
-            }
-            let path = home.hook(&id, &name);
-            let runnable = runnable(&path);
-            if let Err(why) = &runnable {
-                scan.problems.push(Problem {
-                    path: relative(home, &path),
-                    message: format!("moil can't run this hook: {why}"),
-                });
-            }
-            scan.hooks.push(HookListing {
-                service: id.clone(),
-                hook: HookReport {
-                    log: home.hook_log(&id, &name),
-                    bundle: name,
-                    path,
-                    runnable: runnable.is_ok(),
-                },
-            });
-        }
-    }
-    scan
-}
-
-/// The names in `dir`, sorted, or none if it can't be read.
-fn sorted_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.ok()?.file_name().into_string().ok())
-        .collect();
-    names.sort();
-    names
-}
-
-/// `path` relative to the home, as problems name it.
-fn relative(home: &Home, path: &Path) -> PathBuf {
-    path.strip_prefix(home.root()).unwrap_or(path).to_owned()
-}
-
-/// Links `.machine/bin/moil` and `.machine/bin/uv` to `moil` and `uv`,
-/// replacing whatever is there, so that hooks find this machine's own
-/// first on their `PATH` (spec/machine.md §2.2) and a command can point to
-/// the agent's own moil (§4).
-///
-/// The process running the agent calls it when it starts, with its own
-/// `moil` and the uv it runs jobs with. The links point to where the files
-/// really are, whatever links lead there.
-pub fn link_bin(home: &Home, moil: &Path, uv: &Path) -> io::Result<()> {
-    let bin = home.bin_dir();
-    fs::create_dir_all(&bin).map_err(|e| with_path(e, &bin))?;
-    for (name, target) in [("moil", moil), ("uv", uv)] {
-        let target = target.canonicalize().map_err(|e| with_path(e, target))?;
-        let link = bin.join(name);
-        if fs::read_link(&link).is_ok_and(|current| current == target) {
-            continue;
-        }
-        let failed = |error: io::Error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "couldn't link {} to {}: {error}",
-                    link.display(),
-                    target.display()
-                ),
-            )
-        };
-        let staging = bin.join(format!(".{name}.{}.tmp", std::process::id()));
-        remove_quietly(&staging);
-        std::os::unix::fs::symlink(&target, &staging).map_err(failed)?;
-        if fs::symlink_metadata(&link).is_ok_and(|m| m.is_dir()) {
-            moil_runtime::remove_tree(&link).map_err(failed)?;
-        }
-        fs::rename(&staging, &link).map_err(failed)?;
-    }
-    Ok(())
 }

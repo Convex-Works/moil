@@ -40,7 +40,7 @@ use super::{
     AgentOptions, BundleStatus, Connection, JobReport, JobStatus, Published, ServiceStatus,
     Snapshot,
 };
-use crate::hooks::{BundleRef, Hooks, PendingHook, Succeeded};
+use crate::hooks::{BundleRef, Hooks, PendingHook};
 use crate::report::{Problem, ServiceRef};
 use crate::{Machine, ServiceId, services};
 
@@ -305,37 +305,7 @@ struct Running {
     stopper: Stopper,
     status: JobStatus,
     /// Where its outputs go for its hook, if it succeeds.
-    hook: Option<ForHook>,
-}
-
-/// What an attempt's hook is told of it, besides how it ended.
-struct ForHook {
-    pending: PendingHook,
-    service: ServiceRef,
-    bundle: BundleRef,
-    params: serde_json::Value,
-}
-
-impl ForHook {
-    /// Queues the hook of attempt `key`, which succeeded with `result`.
-    fn ready(
-        self,
-        key: &AttemptKey,
-        title: Option<String>,
-        result: JobResult,
-        ended_at: SystemTime,
-    ) {
-        self.pending.ready(Succeeded {
-            service: self.service,
-            bundle: self.bundle,
-            job_id: key.attempt.job_id.clone(),
-            attempt: key.attempt.attempt,
-            title,
-            params: self.params,
-            result,
-            ended_at,
-        });
-    }
+    hook: Option<PendingHook>,
 }
 
 /// Where the coordinator publishes what it does.
@@ -949,25 +919,10 @@ impl Coordinator {
         tracing::info!("starting {key}: {}", bundle.manifest().name);
         // Where the attempt leaves its outputs if it succeeds, for the hook
         // there may be by then.
-        let hook = match &self.hooks {
-            Ok(hooks) => match hooks.entry() {
-                Ok(pending) => Some(ForHook {
-                    pending,
-                    service: ServiceRef::from(&self.services[id].paired),
-                    bundle: BundleRef {
-                        name: bundle.manifest().name.clone(),
-                        version: bundle.manifest().version.clone(),
-                        hash: bundle.hash(),
-                    },
-                    params: assign.params.clone(),
-                }),
-                Err(e) => {
-                    tracing::warn!("{key} runs, but its hook won't: {e}");
-                    None
-                }
-            },
-            Err(_) => None,
-        };
+        let hook = self.hooks.as_ref().ok().map(|hooks| {
+            let service = ServiceRef::from(&self.services[id].paired);
+            hooks.entry(service, BundleRef::from(&bundle), &assign)
+        });
         let (stopper, stop) = moil_runtime::stop_signal();
         let status = JobStatus {
             service: id.clone(),
@@ -987,7 +942,7 @@ impl Coordinator {
         );
         let mut job = Job::from_assign(assign, bundle);
         job.url_policy = self.url_policy(&key.service);
-        job.hand_off = hook.as_ref().map(|hook| hook.pending.hand_off());
+        job.hand_off = hook.as_ref().map(PendingHook::hand_off);
         self.running = Some(Running {
             key: key.clone(),
             bundle: job.bundle.hash(),
@@ -1153,9 +1108,8 @@ impl Coordinator {
     fn finished(&mut self, key: AttemptKey, outcome: Outcome) {
         let mut hook = None;
         if let Some(running) = self.running.take_if(|r| r.key == key) {
-            let title = running.status.title.clone();
             let report = running.status.ended((&outcome).into());
-            hook = running.hook.map(|hook| (hook, title, report.ended_at));
+            hook = running.hook.map(|hook| (hook, report.ended_at));
             self.last_job = Some(report);
             if let Some(shutdown) = &mut self.shutdown {
                 shutdown.deliver_by = Some(Instant::now() + self.options.shutdown_grace);
@@ -1177,30 +1131,23 @@ impl Coordinator {
         // Only once its `done` is queued, so that the hook can't hold up or
         // change what the service hears (spec/machine.md §2.1). An attempt
         // that failed, or whose service no longer hears of it, gets none.
-        if let Some((hook, title, ended_at)) = hook {
-            let succeeded = succeeded.map(|result| (title, result, ended_at));
-            self.settle(key, hook, succeeded);
+        if let Some((hook, ended_at)) = hook {
+            self.settle(hook, succeeded.map(|result| (result, ended_at)));
         }
     }
 
-    /// Queues the hook of attempt `key` if it `succeeded`, with its title,
-    /// result and end, and removes its entry otherwise: off the
-    /// coordinator, since both take the disk a moment, but after the
-    /// attempt that ended before it, so that hooks run in the order their
-    /// attempts ended.
-    fn settle(
-        &mut self,
-        key: AttemptKey,
-        hook: ForHook,
-        succeeded: Option<(Option<String>, JobResult, SystemTime)>,
-    ) {
+    /// Queues the hook of an attempt if it `succeeded`, with its result
+    /// and end, and removes its entry otherwise: off the coordinator, since
+    /// both take the disk a moment, but after the attempt that ended before
+    /// it, so that hooks run in the order their attempts ended.
+    fn settle(&mut self, hook: PendingHook, succeeded: Option<(JobResult, SystemTime)>) {
         let before = self.settling.take();
         self.settling = Some(tokio::spawn(async move {
             if let Some(before) = before {
                 let _ = before.await;
             }
             let settled = tokio::task::spawn_blocking(move || match succeeded {
-                Some((title, result, ended_at)) => hook.ready(&key, title, result, ended_at),
+                Some((result, ended_at)) => hook.ready(result, ended_at),
                 None => drop(hook),
             });
             let _ = settled.await;

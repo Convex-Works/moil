@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::control::{self, HostControls, ServerHandle};
 use crate::report::{AgentInfo, Host};
-use crate::{Agent, AgentHandle, AgentOptions, Error, Machine, hooks};
+use crate::{Agent, AgentHandle, AgentOptions, Error, Machine};
 
 /// What a process needs to run the agent.
 pub struct HostConfig {
@@ -76,7 +76,7 @@ impl Hosted {
                 tracing::warn!("couldn't clean up attempts left over from an earlier run: {e}");
             }
         }
-        if let Err(e) = hooks::link_bin(machine.home(), &moil, &runtime.config().uv) {
+        if let Err(e) = machine.home().link_bin(&moil, &runtime.config().uv) {
             tracing::warn!("hooks won't find moil and uv on their PATH: {e}");
         }
         let agent = Agent::start_with(machine, Arc::new(runtime), options);

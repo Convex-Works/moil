@@ -302,6 +302,9 @@ The closing line is one of:
 
 Before a hook runs, if its log has passed 1 MiB, moil renames it to
 `<bundle name>.log.1`, replacing any older one, and starts a new log.
+moil never writes to a log through a symbolic link, which a commit could
+put at its path to point at another of the owner's files: what that hook
+prints is lost, and moil says why in `logs/moil.log`.
 
 moil records a hook's exit status and doesn't retry a hook that failed.
 But a hook that didn't get to exit, because moil quit or crashed, runs
@@ -354,8 +357,9 @@ context carries no token, and no URL other than the service's base URL.
   failed, with a sentence on stderr saying why and what to do. `2` when the
   command line was wrong. `3` when it needs a running agent and none runs.
 - **No prompts without a terminal.** The only command that asks, `approve`,
-  refuses to approve when stdin isn't a terminal or `--json` is given,
-  unless `--yes` is, and says so.
+  refuses to approve when stdin isn't a terminal, unless `--yes` is given,
+  and says so. `approve --json` without `--yes` is a wrong command line: it
+  exits with status 2, with a message that names `--yes`.
 - **Services** are named by their ID, host, base URL or name.
 - **Help.** `moil <command> --help` explains the command, with an example.
   `moil hooks --help` gives the hook contract (§2) in full.
