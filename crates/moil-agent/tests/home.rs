@@ -469,6 +469,40 @@ async fn a_service_folder_deleted_on_disk_is_disconnected_and_forgotten() {
 }
 
 #[tokio::test]
+async fn a_service_pointed_elsewhere_is_disconnected_and_connected_again_once_pointed_back() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let file = setup.home().service_file(&setup.paired.id);
+    let elsewhere = "https://elsewhere.example.com/moil";
+
+    // The token goes only to where it was issued, and stays for going
+    // back, as the problem says.
+    edit_json(&file, |file| file["base_url"] = elsewhere.into());
+    assert_eq!(conn.closed().await, Some(1000));
+    let pairing_json = format!("services/{}/pairing.json", setup.paired.id);
+    let status = until_status(&setup, "the problem to show", |status| {
+        status
+            .problems
+            .iter()
+            .any(|p| p.path == Path::new(&pairing_json))
+    })
+    .await;
+    assert!(!status.services[0].paired, "{status:?}");
+    assert_eq!(tokens(setup.dir.path()).len(), 1);
+
+    edit_json(&file, |file| {
+        file["base_url"] = setup.service.base_url.as_str().into();
+    });
+    let conn = setup.connect().await;
+    assert_eq!(conn.token, "moil_token_1");
+    snapshot_where(&setup.agent, "the service to be connected", |s| {
+        s.service(&setup.paired.id)
+            .is_some_and(|s| s.connection == Connection::Connected)
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn pausing_in_settings_json_takes_effect() {
     let setup = Setup::new().await;
     let mut conn = setup.connect().await;

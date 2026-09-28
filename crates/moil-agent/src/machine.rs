@@ -665,7 +665,10 @@ impl Machine {
     pub(crate) fn forget_if_gone(&self, id: &ServiceId) -> Result<bool, Error> {
         let _services = self.lock_services();
         let home = &self.inner.home;
-        let absent = |path: &Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        let absent = |path: &Path| match std::fs::symlink_metadata(path) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(_) => false,
+        };
         let service_gone = absent(&home.service_file(id));
         if !service_gone && !absent(&home.pairing_file(id)) {
             return Ok(false);

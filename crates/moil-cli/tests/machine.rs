@@ -113,7 +113,7 @@ fn what_only_reads_works_while_the_agent_runs() {
         "paired_at": "2026-09-21T14:13:20Z"}"#;
     std::fs::write(folder.join("pairing.json"), pairing).unwrap();
     let mut agent = Agent::start(home.path());
-    agent.logged("klisi removed this machine");
+    agent.logged("moil has no token for klisi");
 
     let listed = moil(home.path(), &["services"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&listed.stdout);

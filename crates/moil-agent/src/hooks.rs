@@ -555,7 +555,7 @@ enum Ending {
     /// Stopped once it had run for this long.
     TimedOut(Duration),
     Quit,
-    /// Moil crashed, or was killed, while it ran.
+    /// moil crashed, or was killed, while it ran.
     Crashed,
     NotRun(String),
     /// Should never happen: its exit status couldn't be read.

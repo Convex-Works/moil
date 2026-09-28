@@ -55,9 +55,10 @@ impl fmt::Debug for Hosted {
 
 impl Hosted {
     /// Kills what attempts of a crashed run left behind, links
-    /// `.machine/bin`, starts the agent and serves the control socket. Must
-    /// be called from within a Tokio runtime. Fails only if commands
-    /// couldn't reach the agent, having shut it down again.
+    /// `.machine/bin`, starts the agent, and with it the owner's hooks, and
+    /// serves the control socket. Must be called from within a Tokio
+    /// runtime. Fails only if commands couldn't reach the agent, having
+    /// shut it down again.
     pub async fn start(config: HostConfig) -> Result<Self, Error> {
         let HostConfig {
             machine,
@@ -99,9 +100,9 @@ impl Hosted {
         &self.agent
     }
 
-    /// Stops the running job and reports it, closes every connection, and
-    /// then stops listening for commands. Commands can still reach the
-    /// agent while it shuts down.
+    /// Stops the running job and reports it, closes every connection,
+    /// stops the running hook, and then stops listening for commands.
+    /// Commands can still reach the agent while it shuts down.
     pub async fn shutdown(&self) {
         self.agent.shutdown().await;
         if let Some(server) = self.server.lock().await.take() {

@@ -73,7 +73,7 @@ pub(super) enum LinkEvent {
     },
     /// The service removed this machine (4401). The task has ended.
     Unpaired,
-    /// Moil has no token for the service. The task has ended.
+    /// moil has no token for the service. The task has ended.
     NoToken,
     /// Another connection with this machine's token took over (4409). The
     /// task has ended.

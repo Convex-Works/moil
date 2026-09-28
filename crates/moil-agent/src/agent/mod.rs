@@ -501,6 +501,9 @@ mod tests {
         // Spec/machine.md §1.3: changes made from outside within five
         // seconds, with a second to read them.
         assert!(options.home_poll * 3 + Duration::from_secs(1) <= Duration::from_secs(5));
-        assert_eq!(options.hooks, HookOptions::default());
+        // Spec/machine.md §2.2: an hour, then stopped as a script is
+        // (spec §8.6).
+        assert_eq!(options.hooks.time_limit, Duration::from_secs(3600));
+        assert_eq!(options.hooks.kill_grace, Duration::from_secs(10));
     }
 }
