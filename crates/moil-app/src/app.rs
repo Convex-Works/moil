@@ -4,18 +4,29 @@
 //! each window's module decides what its page shows and what its buttons
 //! do. This module carries events to them and carries out what they ask
 //! for, on the main thread for windows and on Tokio for the agent.
+//!
+//! Commands reach the app too, through the control socket that the agent's
+//! host serves (spec/machine.md §4). Most go to the agent directly; what
+//! only the app can do, quitting and Open at Login, comes here as an event
+//! ([`Controls`]), and is done as the menu does it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use moil_agent::control::HostControls;
 use moil_agent::{Review, ServiceId, Snapshot};
 use moil_proto::BundleHash;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+use tao::event_loop::{
+    ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
+};
 use tao::window::{Theme, WindowBuilder, WindowId};
+use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tray_icon::menu::{Menu, MenuEvent, MenuId};
 use url::Url;
@@ -24,10 +35,11 @@ use wry::{NewWindowResponse, WebView, WebViewBuilder};
 use crate::backend::{Backend, Pairing, PairingCode};
 use crate::ipc::{self, ConfirmMessage, PairMessage, ReviewMessage};
 use crate::links::{DeepLink, Navigation, browser_url};
-use crate::login::LoginItem;
+use crate::login::{self, LoginItem};
 use crate::page;
 use crate::pair::{PairEffect, PairWindow};
 use crate::platform;
+use crate::reports::{self, HomeReport};
 use crate::review::{ReviewEffect, ReviewWindow};
 use crate::snapshots::Snapshots;
 use crate::tray::Tray;
@@ -44,6 +56,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum AppEvent {
     /// The agent's state changed: take the latest snapshot.
     Snapshot,
+    /// The home's hooks or problems changed: take the latest report.
+    Report,
     Menu(MenuId),
     /// A page posted a message.
     Ipc {
@@ -73,22 +87,67 @@ pub enum AppEvent {
     },
     /// A signal asked the app to quit.
     Quit,
+    /// `moil quit` asked the app to quit, as the menu's Quit does.
+    QuitCommand,
+    /// `moil login-item` asked whether the app opens at login, and to turn
+    /// that on or off if `set` says to.
+    LoginItem {
+        set: Option<bool>,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     /// The agent has shut down; the app can exit.
     ShutDown,
 }
 
-/// Runs the app until the owner quits. `backend` is the agent, or why it
-/// couldn't start; `links` are `moil://` links from the command line;
-/// `log_file` is where the app logs, if it keeps a file.
+/// The app's event loop, set up for a menu-bar app. Must be made on the
+/// main thread.
+pub fn event_loop() -> EventLoop<AppEvent> {
+    let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    platform::configure(&mut event_loop);
+    event_loop
+}
+
+/// What commands ask of the app itself, carried into its event loop. A
+/// command can come at any time, from another thread; one that comes
+/// before the event loop runs waits for it.
+#[derive(Debug)]
+pub struct Controls(EventLoopProxy<AppEvent>);
+
+impl Controls {
+    pub fn new(event_loop: &EventLoop<AppEvent>) -> Self {
+        Self(event_loop.create_proxy())
+    }
+}
+
+impl HostControls for Controls {
+    fn quit(&self) {
+        let _ = self.0.send_event(AppEvent::QuitCommand);
+    }
+
+    fn login_item(&self, set: Option<bool>) -> BoxFuture<'_, Result<bool, String>> {
+        let (reply, answer) = oneshot::channel();
+        // If the event loop has ended, the reply goes with the event.
+        let _ = self.0.send_event(AppEvent::LoginItem { set, reply });
+        async move {
+            answer
+                .await
+                .unwrap_or_else(|_| Err("moil quit before it could answer.".to_owned()))
+        }
+        .boxed()
+    }
+}
+
+/// Runs the app on `event_loop` until the owner quits. `backend` is the
+/// agent, or why it couldn't start; `links` are `moil://` links from the
+/// command line; `log_file` is where the app logs, if it keeps a file.
 pub fn run(
+    event_loop: EventLoop<AppEvent>,
     runtime: tokio::runtime::Runtime,
     backend: Result<Arc<dyn Backend>, String>,
     login: Box<dyn LoginItem>,
     links: Vec<String>,
     log_file: Option<PathBuf>,
 ) -> ! {
-    let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
-    platform::configure(&mut event_loop);
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -108,6 +167,8 @@ pub fn run(
         tray: None,
         snapshots: None,
         snapshot: Snapshot::default(),
+        reports: None,
+        report: HomeReport::default(),
         deferred: HashSet::new(),
         windows: HashMap::new(),
         quitting: false,
@@ -170,6 +231,9 @@ struct App {
     tray: Option<Tray>,
     snapshots: Option<Snapshots>,
     snapshot: Snapshot,
+    reports: Option<Snapshots<HomeReport>>,
+    /// The home's hooks and problems, which the snapshot doesn't have.
+    report: HomeReport,
     /// Reviews the owner closed without approving.
     deferred: HashSet<(ServiceId, BundleHash)>,
     windows: HashMap<WindowId, Window>,
@@ -243,6 +307,18 @@ impl App {
         let mut snapshots = Snapshots::watch(backend.subscribe(), self.runtime.handle(), wake);
         self.snapshot = snapshots.take();
         self.snapshots = Some(snapshots);
+
+        let changes = backend.subscribe();
+        let status = move || {
+            let backend = backend.clone();
+            async move { backend.status().await }.boxed()
+        };
+        let reports = reports::watch(changes, self.runtime.handle(), status);
+        let proxy = self.proxy.clone();
+        let wake = move || proxy.send_event(AppEvent::Report).is_ok();
+        let mut reports = Snapshots::watch(reports, self.runtime.handle(), wake);
+        self.report = reports.take();
+        self.reports = Some(reports);
         match Tray::new(self.view()) {
             Ok(tray) => self.tray = Some(tray),
             Err(e) => tracing::error!("{e}"),
@@ -260,6 +336,7 @@ impl App {
                 has_log: self.log_file.is_some(),
                 quitting: self.quitting,
                 deferred: &self.deferred,
+                home: &self.report,
             },
         );
         self.refresh_at = view.refresh_at;
@@ -278,6 +355,12 @@ impl App {
             AppEvent::Snapshot => {
                 if let Some(snapshots) = &mut self.snapshots {
                     self.snapshot = snapshots.take();
+                    self.refresh_tray();
+                }
+            }
+            AppEvent::Report => {
+                if let Some(reports) = &mut self.reports {
+                    self.report = reports.take();
                     self.refresh_tray();
                 }
             }
@@ -339,6 +422,17 @@ impl App {
                 tracing::info!("quitting, as a signal asks");
                 self.quit();
             }
+            AppEvent::QuitCommand => {
+                if !self.quitting {
+                    tracing::info!("quitting, as `moil quit` asks");
+                }
+                self.quit();
+            }
+            AppEvent::LoginItem { set, reply } => {
+                let answer = login::answer(&*self.login, set);
+                self.refresh_tray();
+                let _ = reply.send(answer);
+            }
             AppEvent::ShutDown => self.exit = true,
         }
     }
@@ -363,6 +457,7 @@ impl App {
                 }
                 self.refresh_tray();
             }
+            Action::OpenHome => platform::open_folder(&backend.home()),
             Action::ShowLog => {
                 if let Some(path) = &self.log_file {
                     platform::reveal(path);
