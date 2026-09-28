@@ -545,6 +545,7 @@ async fn files_pulled_from_git_never_send_the_token_elsewhere() {
 #[tokio::test]
 async fn files_pulled_from_git_while_moil_was_off_never_send_the_token_elsewhere() {
     let setup = Setup::new().await;
+    let _conn = setup.connect().await;
     within("the agent to shut down", setup.agent.shutdown()).await;
     drop(setup.agent);
     let elsewhere = FakeService::start("klisi").await;
