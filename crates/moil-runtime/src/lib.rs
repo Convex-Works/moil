@@ -133,9 +133,9 @@ impl Job {
 ///
 /// Once the outcome is known to be a success, and before the working
 /// directory goes, the runtime moves each output the result named into the
-/// directory, under its name: by renaming it, or by copying it if it can't
-/// be renamed there or the working directory is being kept. Nothing about
-/// it changes the outcome. If an output can't be handed off, the runtime
+/// directory, under its name: by renaming it, or by copying it when the
+/// directory is on another file system or the working directory is kept.
+/// Nothing about it changes the outcome. If an output can't be handed off, the runtime
 /// takes back what it put in the directory, so that the directory never
 /// holds only some of the outputs, and records why: see
 /// [`HandOff::result`]. After any other outcome the directory is left as
