@@ -170,7 +170,8 @@ func TestHooksRunOneAtATimeInTheOrderTheirJobsEnded(t *testing.T) {
 	first := svc.Submit(moil.Job{Title: "first", Params: probe(do.Result(nil))})
 	succeed(t, first)
 	running := hook.awaitRuns(1)[0]
-	follow := m.follow("logs", m.serviceID, "probe", "-f")
+	// The owner names the service as it names itself.
+	follow := m.follow("logs", "e2e", "probe", "-f")
 	if shown := follow.await(running.complained); !strings.HasPrefix(shown[0], "== ") || !strings.HasSuffix(shown[0], first.ID()+" attempt 1") {
 		t.Errorf("moil logs -f showed %q", shown)
 	}
@@ -179,6 +180,13 @@ func TestHooksRunOneAtATimeInTheOrderTheirJobsEnded(t *testing.T) {
 	// hook to run.
 	failed := svc.Submit(moil.Job{Title: "failed", Params: probe(do.Fail("the recording is empty", false))})
 	failure(t, failed)
+	status := m.awaitStatus("the failed job as the last", func(s statusJSON) bool {
+		return s.LastJob != nil && s.LastJob.JobID == failed.ID()
+	})
+	if last := status.LastJob; last.Outcome != "failed" || last.Error == nil ||
+		*last.Error != (errorJSON{Code: string(moil.CodeScriptError), Message: "the recording is empty"}) {
+		t.Errorf("moil status --json shows the failed job as %+v, with the error %+v", last, last.Error)
+	}
 	second := svc.Submit(moil.Job{Title: "second", Params: probe(do.Result(nil))})
 	succeed(t, second)
 
@@ -322,13 +330,14 @@ esac
 
 // When moil stops while a hook runs, the hook runs again from the start,
 // with the same context and outputs, when moil next starts. After a
-// crash, moil first kills what the hook left and closes its log with a
-// line saying so; `moil quit` stops the hook as moil quits.
+// crash, moil first kills what the hook left, a child that ignores
+// SIGTERM included, and closes its log with a line saying so; `moil quit`
+// stops the hook as moil quits.
 func TestAHookSurvivesItsMachineCrashing(t *testing.T) {
 	t.Parallel()
 	svc, m := lentMachine(t)
 	proceed := newGate(t)
-	hook := m.InstallHook("probe", proceed)
+	hook := m.InstallHook("probe", proceed, leaveAChild)
 	transcript := randomBytes(t, 64<<10)
 	run := svc.Submit(moil.Job{
 		Params:  probe(do.Copy("audio.ogg", "transcript.txt"), do.Result(nil, "transcript.txt")),
@@ -339,11 +348,11 @@ func TestAHookSurvivesItsMachineCrashing(t *testing.T) {
 	first := hook.awaitRuns(1)[0]
 
 	m.Kill()
-	if !alive(first.pid) {
+	if !alive(first.pid) || !alive(first.child) {
 		t.Fatal("the hook ended with moil; the test can't tell whether moil cleans up after it")
 	}
 	m.Start()
-	awaitGone(t, "the hook the crash left behind", first.pid)
+	awaitGone(t, "the hook the crash left behind", first.pid, first.child)
 	second := hook.awaitRuns(2)[1]
 
 	var quit nothingJSON
@@ -351,7 +360,7 @@ func TestAHookSurvivesItsMachineCrashing(t *testing.T) {
 	if err := m.Exited(); err != nil {
 		t.Errorf("moil agent exited with %v after moil quit", err)
 	}
-	awaitGone(t, "the hook moil quit", second.pid)
+	awaitGone(t, "the hook moil quit", second.pid, second.child)
 	m.Start()
 	third := hook.awaitRuns(3)[2]
 	proceed.Open(t)
@@ -404,10 +413,15 @@ type shellHook struct {
 	saved string
 }
 
+// leaveAChild makes a shellHook start a child that ignores SIGTERM, and
+// save its pid, before it waits.
+const leaveAChild = `(trap '' TERM; exec /bin/sleep 60) &
+echo $! > "$run/child"`
+
 // InstallHook installs a shellHook for bundle, for the service the
-// machine is paired with. It records its process group where the
-// service's leak check finds it.
-func (m *machine) InstallHook(bundle string, proceed gate) *shellHook {
+// machine is paired with, with extra lines to run before it waits. It
+// records its process group where the service's leak check finds it.
+func (m *machine) InstallHook(bundle string, proceed gate, extra ...string) *shellHook {
 	m.t.Helper()
 	h := &shellHook{t: m.t, m: m, bundle: bundle, path: m.hookPath(bundle), saved: m.t.TempDir()}
 	script := fmt.Sprintf(`#!/bin/sh
@@ -431,6 +445,7 @@ ls -A "$TMPDIR" > "$run/tmp-listing"
 touch "$TMPDIR/scratch"
 echo "$TMPDIR" > "$run/tmpdir"
 moil home --json > "$run/moil-home"
+%s
 touch "$run/saved"
 echo "hook $$ saved what moil gave it"
 echo "hook $$ complains on stderr" >&2
@@ -444,7 +459,7 @@ while [ -n "$gate" ] && [ ! -e "$gate" ]; do
 	sleep 0.05
 done
 echo "ended $$" >> "$saved/runs"
-`, shellQuote(h.saved), shellQuote(m.svc.record), shellQuote(string(proceed)))
+`, shellQuote(h.saved), shellQuote(m.svc.record), shellQuote(string(proceed)), strings.Join(extra, "\n"))
 	writeFile(m.t, h.path, script, 0o755)
 	return h
 }
@@ -468,6 +483,7 @@ type hookRun struct {
 	tmpdir     string
 	tmpListing []string // what its TMPDIR held as it started
 	moilHome   homeJSON // `moil home --json`, run by the hook
+	child      int      // the child it left, with leaveAChild
 	// said and complained are what it printed to stdout and stderr.
 	said, complained string
 }
@@ -572,6 +588,9 @@ func (h *shellHook) load(name string) hookRun {
 	r.tmpListing = strings.Fields(read("tmp-listing"))
 	if err := decodeStrict([]byte(read("moil-home")), &r.moilHome); err != nil {
 		h.t.Errorf("`moil home --json` printed JSON that isn't in the spec's shape: %v", err)
+	}
+	if child, err := os.ReadFile(filepath.Join(dir, "child")); err == nil {
+		r.child, _ = strconv.Atoi(strings.TrimSpace(string(child)))
 	}
 	return r
 }

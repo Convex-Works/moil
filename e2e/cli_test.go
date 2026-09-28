@@ -41,6 +41,10 @@ func TestAnOwnersAgentDrivesMoilThroughItsCommandLine(t *testing.T) {
 	writeFile(t, m.hookPath("transcribe"), "#!/bin/sh\n", 0o644)
 	m.Start()
 	watch := m.follow("status", "--watch", "--json")
+	var stopping stoppingJSON
+	if m.json(&stopping, "stop"); stopping.Stopping != "" {
+		t.Errorf("moil stop --json says it's stopping %q, with no job running", stopping.Stopping)
+	}
 
 	var home homeJSON
 	if m.json(&home, "home"); home.Home != m.home {
@@ -136,13 +140,18 @@ func TestAnOwnersAgentDrivesMoilThroughItsCommandLine(t *testing.T) {
 		t.Errorf("moil review --json shows the echo bundle as %+v", review)
 	}
 
-	// It approves the bundle while the agent runs, and a job waiting for
-	// it runs. Without --yes, it can't.
+	// It approves the bundle while the agent runs, naming the service by
+	// its URL, and a job waiting for it runs. Without --yes, moil won't
+	// approve it, since nobody answers at a terminal.
 	waiting := svc.Submit(moil.Job{Bundle: echo, Params: map[string]any{"text": "hi"}})
-	if stdout, _, err := m.try("approve", m.serviceID, echo.Hash(), "--json"); err == nil || stdout != "" {
+	if stdout, _, err := m.try("approve", baseURL, echo.Hash(), "--json"); err == nil || stdout != "" {
 		t.Errorf("moil approve --json without --yes approved (%v), printing %q", err, stdout)
 	}
-	m.json(&approved, "approve", m.serviceID, echo.Hash(), "--yes")
+	if stdout, stderr, err := m.try("approve", baseURL, echo.Hash()); err == nil || !strings.Contains(stdout, echo.Hash()) ||
+		!strings.Contains(stderr, "--yes") {
+		t.Errorf("moil approve without --yes or a terminal: %v, printing\n%s\n%s", err, stdout, stderr)
+	}
+	m.json(&approved, "approve", baseURL, echo.Hash(), "--yes")
 	if approved.Approved != echo.Hash() {
 		t.Errorf("moil approve --json says it approved %q, want %s", approved.Approved, echo.Hash())
 	}
@@ -184,7 +193,6 @@ func TestAnOwnersAgentDrivesMoilThroughItsCommandLine(t *testing.T) {
 	}
 
 	// It stops the job, which the service sees interrupted and retries.
-	var stopping stoppingJSON
 	if m.json(&stopping, "stop"); stopping.Stopping != job.ID()+" attempt 1" {
 		t.Errorf("moil stop --json says it's stopping %q, want %s attempt 1", stopping.Stopping, job.ID())
 	}
@@ -199,9 +207,10 @@ func TestAnOwnersAgentDrivesMoilThroughItsCommandLine(t *testing.T) {
 		t.Errorf("moil status --json shows the last job as %+v", last)
 	}
 
-	// It revokes the probe, which stops its running attempt.
+	// It revokes the probe, naming the service by its name, which stops
+	// the probe's running attempt.
 	var revokedHash revokedJSON
-	if m.json(&revokedHash, "revoke", m.serviceID, svc.probe.Hash()); revokedHash.Revoked != svc.probe.Hash() {
+	if m.json(&revokedHash, "revoke", "e2e", svc.probe.Hash()); revokedHash.Revoked != svc.probe.Hash() {
 		t.Errorf("moil revoke --json says it revoked %q, want %s", revokedHash.Revoked, svc.probe.Hash())
 	}
 	if e := awaitRetry(t, job, 2); e.Code != moil.CodeInterrupted {
@@ -296,6 +305,29 @@ func TestAnOwnersAgentDrivesMoilThroughItsCommandLine(t *testing.T) {
 	if status := m.Status(); status.Agent != nil || status.Job != nil || status.LastJob != nil || status.Paused ||
 		len(status.Services) != 1 || !status.Services[0].Paired || status.Services[0].Connection != nil || status.Services[0].Offered != nil {
 		t.Errorf("moil status --json with no agent says %+v", status)
+	}
+}
+
+// With settings.json invalid, `moil pause` fails without an agent: moil
+// can't keep the choice. Through a running agent it must fail the same
+// way (spec/machine.md §3.1), rather than report a pause that lasts only
+// until the agent next starts.
+func TestAPauseMoilCantKeepFailsWithAnAgentToo(t *testing.T) {
+	t.Parallel()
+	t.Skip("bug: with settings.json invalid, `moil pause` through a running agent exits 0 and pauses the agent, " +
+		"but coordinator.rs remember_paused only logs that it couldn't save the choice, even once the file is fixed, " +
+		"so the next start takes jobs again; without an agent, it exits 1")
+	_, m := lentMachine(t)
+	if err := os.WriteFile(filepath.Join(m.home, "settings.json"), []byte(`{"pasued": true}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.awaitStatus("settings.json as a problem", func(s statusJSON) bool {
+		return slices.ContainsFunc(s.Problems, func(p problemJSON) bool { return p.Path == "settings.json" })
+	})
+	stdout, stderr, err := m.try("pause", "--json")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 || stdout != "" || !strings.Contains(stderr, "settings.json") {
+		t.Errorf("moil pause with settings.json invalid: %v, printing %q and %q; want exit status 1, and why", err, stdout, stderr)
 	}
 }
 

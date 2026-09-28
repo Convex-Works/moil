@@ -319,6 +319,9 @@ type follower struct {
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
 	lines  chan string
+	// unread is why lines closed, if not because stdout did: a line too
+	// long to read, say.
+	unread error
 	done   chan struct{}
 	err    error // how it exited, once done is closed
 }
@@ -347,11 +350,15 @@ func (m *machine) follow(args ...string) *follower {
 	}
 	go func() {
 		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(nil, 1<<20)
+		scanner.Buffer(nil, 4<<20)
 		for scanner.Scan() {
 			f.lines <- scanner.Text()
 		}
+		f.unread = scanner.Err()
 		close(f.lines)
+		if f.unread != nil {
+			cancel()
+		}
 		f.err = f.cmd.Wait()
 		close(f.done)
 	}()
@@ -368,8 +375,10 @@ func (f *follower) next() string {
 	select {
 	case line, ok := <-f.lines:
 		if !ok {
-			<-f.done
-			f.t.Fatalf("%s exited (%v) without printing another line", f.what, f.err)
+			if f.unread != nil {
+				f.t.Fatalf("reading what %s prints: %v", f.what, f.unread)
+			}
+			f.t.Fatalf("%s exited (%v) without printing another line", f.what, f.exited())
 		}
 		return line
 	case <-time.After(patience):

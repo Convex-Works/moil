@@ -91,6 +91,12 @@ func TestGitPullsChangeWhatARunningMachineRuns(t *testing.T) {
 	if took := time.Since(pulled); took > noticeWithin {
 		t.Errorf("the service learned of the pulled approval %v after the pull", took)
 	}
+	// The service offers the job at once, and gives it to the first bid
+	// once its bid window closes.
+	awaitEvent(t, waiting, "the desktop to take the echo job", func(ev moil.Event) bool { return ev.Kind == moil.EventAssigned })
+	if took := time.Since(pulled); took > noticeWithin+svc.cfg.BidWindow {
+		t.Errorf("the desktop took the echo job %v after the pull", took)
+	}
 	if res := succeed(t, waiting); res.Machine != desktop.ID() {
 		t.Errorf("the echo job ran on %s, not the desktop %s", res.Machine, desktop.ID())
 	}
