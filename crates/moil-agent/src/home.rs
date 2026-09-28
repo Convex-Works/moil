@@ -10,6 +10,7 @@ use moil_proto::BundleHash;
 use serde::{Deserialize, Serialize};
 
 use crate::fs::{PUBLIC, read_strict_json, with_path, write_atomic, write_json};
+use crate::report::Problem;
 use crate::{Error, ServiceId};
 
 /// A machine's home (spec/machine.md §1): plain files that the owner, an
@@ -281,6 +282,32 @@ impl Home {
 
     pub(crate) fn save_settings(&self, settings: &Settings) -> Result<(), Error> {
         write_json(&self.settings_file(), settings, PUBLIC)
+    }
+
+    /// The problem to report when `settings.json` can't be used, as
+    /// [`load_settings`](Self::load_settings) says: `kept` when a running
+    /// agent goes on with the settings it read before.
+    pub(crate) fn settings_problem(error: &Error, kept: bool) -> Problem {
+        let message = match (error, kept) {
+            (Error::Invalid { reason, .. }, false) => format!(
+                "This file isn't valid ({reason}), and moil won't start until it is. Fix it, or \
+                 remove it to go back to the defaults."
+            ),
+            (Error::Invalid { reason, .. }, true) => format!(
+                "This file isn't valid ({reason}), so moil goes on with the settings it read \
+                 before, and won't start again until it is. Fix it, or remove it to go back to \
+                 the defaults."
+            ),
+            (error, false) => format!("moil can't read this file ({error})."),
+            (error, true) => format!(
+                "moil can't read this file ({error}), so it goes on with the settings it read \
+                 before."
+            ),
+        };
+        Problem {
+            path: "settings.json".into(),
+            message,
+        }
     }
 
     /// Writes what the home's readers go by: `README.md`, whenever its text

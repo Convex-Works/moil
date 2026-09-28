@@ -210,8 +210,9 @@ struct Entry {
 impl Hooks {
     /// Starts running the hooks queued in `home`: those that were waiting
     /// when moil last stopped, and those that were running then, after
-    /// killing what's left of them. Entries of attempts that never ended
-    /// are removed.
+    /// killing what's left of them and closing their logs with `==
+    /// stopped: moil stopped unexpectedly` if moil crashed. Entries of
+    /// attempts that never ended are removed.
     ///
     /// Call it once, from within a Tokio runtime, in the process that holds
     /// the home's lock, before it runs any attempt.
@@ -223,7 +224,7 @@ impl Hooks {
         let home = Home::new(root);
         let queue_dir = home.hooks_queue_dir();
         fs::create_dir_all(&queue_dir).map_err(|e| with_path(e, &queue_dir))?;
-        let state = recover(&queue_dir).map_err(|e| with_path(e, &queue_dir))?;
+        let state = recover(&home).map_err(|e| with_path(e, &queue_dir))?;
         let inner = Arc::new(Inner {
             home,
             queue_dir,
@@ -554,6 +555,8 @@ enum Ending {
     /// Stopped once it had run for this long.
     TimedOut(Duration),
     Quit,
+    /// Moil crashed, or was killed, while it ran.
+    Crashed,
     NotRun(String),
     /// Should never happen: its exit status couldn't be read.
     Unknown {
@@ -598,6 +601,7 @@ impl fmt::Display for Ending {
                 write!(f, "stopped after {}", humantime::format_duration(*limit))
             }
             Self::Quit => f.write_str("stopped: moil quit"),
+            Self::Crashed => f.write_str("stopped: moil stopped unexpectedly"),
             Self::NotRun(why) => write!(f, "not run: {why}"),
             Self::Unknown { error, after } => write!(
                 f,
@@ -632,6 +636,24 @@ impl Log {
                 );
             })
             .ok();
+        Self { path, file }
+    }
+
+    /// The log at `path`, to add to it, if it's there: a log that's gone,
+    /// or a service folder, isn't made again just for a closing line.
+    fn existing(path: PathBuf) -> Self {
+        let file = File::options().read(true).append(true).open(&path);
+        let file = match file {
+            Ok(file) => Some(file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(
+                    "couldn't write to a hook's log: {}",
+                    with_path(error, &path)
+                );
+                None
+            }
+        };
         Self { path, file }
     }
 
@@ -802,11 +824,11 @@ fn is_absent(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
-/// The queue in `queue_dir` as a crash or quit left it: kills what's left
-/// of hooks that were running, and removes entries that aren't ready.
-fn recover(queue_dir: &Path) -> io::Result<State> {
+/// The queue of `home` as a crash or quit left it: kills what's left of
+/// hooks that were running, and removes entries that aren't ready.
+fn recover(home: &Home) -> io::Result<State> {
     let mut state = State::default();
-    for item in fs::read_dir(queue_dir)? {
+    for item in fs::read_dir(home.hooks_queue_dir())? {
         let item = item?;
         let dir = item.path();
         let Some(number) = item
@@ -819,7 +841,7 @@ fn recover(queue_dir: &Path) -> io::Result<State> {
             continue;
         };
         state.next_number = state.next_number.max(number + 1);
-        match recover_entry(&dir) {
+        match recover_entry(home, &dir) {
             Ok(Some(queued)) => {
                 state.next_order = state.next_order.max(queued.order + 1);
                 state
@@ -838,7 +860,8 @@ fn recover(queue_dir: &Path) -> io::Result<State> {
 }
 
 /// The hook to run for the entry at `dir`, if it is to run.
-fn recover_entry(dir: &Path) -> io::Result<Option<Queued>> {
+fn recover_entry(home: &Home, dir: &Path) -> io::Result<Option<Queued>> {
+    let queued = read_record::<Queued>(&dir.join(QUEUED));
     let running = dir.join(RUNNING);
     if let Some(record) = read_record::<Running>(&running) {
         // Another process runs it; with the home's lock, that can only be
@@ -850,12 +873,19 @@ fn recover_entry(dir: &Path) -> io::Result<Option<Queued>> {
             group.kill_group()?;
         }
         fs::remove_file(&running)?;
+        // The run moil lost track of gets its closing line before the next
+        // one starts (spec/machine.md §2.3).
+        if let Some(queued) = &queued {
+            let context = &queued.context;
+            Log::existing(home.hook_log(&context.service.id, &context.bundle.name))
+                .line(&Ending::Crashed.to_string());
+        }
         tracing::info!(
             "a hook was running when moil stopped; it runs again from the start: {}",
             dir.display()
         );
     }
-    match read_record::<Queued>(&dir.join(QUEUED)) {
+    match queued {
         // Wherever the home is now.
         Some(mut queued) => {
             locate_outputs(&mut queued.context, dir);

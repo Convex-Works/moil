@@ -21,6 +21,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
+use moil_agent::hooks::HookOptions;
 use moil_agent::{
     AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, SecretStore, Service,
     Snapshot,
@@ -32,8 +33,8 @@ use moil_proto::http::{
     TokenRequest, TokenResponse,
 };
 use moil_proto::{
-    Assign, AttemptRef, BundleHash, ErrorCode, JobError, JobEvent, MachineMessage, Offer, Outcome,
-    ServiceInfo, ServiceMessage,
+    Assign, AttemptRef, BundleHash, ErrorCode, FileInfo, FileName, JobError, JobEvent, JobResult,
+    MachineMessage, Offer, Outcome, ServiceInfo, ServiceMessage,
 };
 use moil_runtime::{EventSink, Executor, Job, StopReason, StopSignal};
 use tokio::sync::{mpsc, oneshot};
@@ -59,13 +60,19 @@ pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     .await;
 }
 
-/// Timings that keep tests fast: reconnects in milliseconds.
+/// Timings that keep tests fast: reconnects in milliseconds, and changes
+/// to the home noticed as quickly.
 pub fn fast() -> AgentOptions {
     AgentOptions {
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(40),
         channel_timeout: Duration::from_secs(5),
         shutdown_grace: Duration::from_secs(5),
+        home_poll: Duration::from_millis(20),
+        hooks: HookOptions {
+            time_limit: PATIENCE,
+            kill_grace: Duration::from_millis(200),
+        },
         ..AgentOptions::default()
     }
 }
@@ -825,6 +832,32 @@ impl FakeRun {
     /// Ends the attempt with `outcome`.
     pub fn finish(mut self, outcome: Outcome) {
         let _ = self.finish.take().unwrap().send(outcome);
+    }
+
+    /// Ends the attempt as one that succeeded with `meta`, having uploaded
+    /// `outputs` (names and contents), and hands them off as the runtime
+    /// does (spec §8.5) if the agent asked it to.
+    pub fn succeed_with(self, meta: Option<serde_json::Value>, outputs: &[(&str, &str)]) {
+        if let Some(hand_off) = &self.job.hand_off {
+            std::fs::create_dir_all(hand_off.dir()).unwrap();
+            for (name, contents) in outputs {
+                std::fs::write(hand_off.dir().join(name), contents).unwrap();
+            }
+            hand_off.set_result(Ok(()));
+        }
+        let files = outputs
+            .iter()
+            .map(|(name, contents)| {
+                let info = FileInfo {
+                    size_bytes: contents.len() as u64,
+                    sha256: "0".repeat(64),
+                };
+                (FileName::new(*name).unwrap(), info)
+            })
+            .collect();
+        self.finish(Outcome::Succeeded {
+            result: JobResult { meta, files },
+        });
     }
 
     /// Waits until the agent asks the attempt to stop, and says why. The

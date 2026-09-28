@@ -117,6 +117,11 @@ pub struct ServiceReport {
     pub id: ServiceId,
     pub name: String,
     pub base_url: Url,
+    /// Whether this machine is paired with the service (spec/machine.md
+    /// §1.2): its `pairing.json` names the base URL in its `service.json`,
+    /// and, while an agent runs, the agent hasn't found its token missing
+    /// as it connected. Without an agent the token isn't looked for, since
+    /// reading the keychain may ask the owner first.
     pub paired: bool,
     /// While an agent runs and the service is paired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +132,7 @@ pub struct ServiceReport {
     /// and the service is paired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offered: Option<Vec<OfferedBundle>>,
+    /// The owner's hooks for the service's bundles, by bundle.
     pub hooks: Vec<HookReport>,
 }
 
