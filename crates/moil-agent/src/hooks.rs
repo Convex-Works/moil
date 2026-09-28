@@ -957,17 +957,6 @@ pub struct HookScan {
     pub problems: Vec<Problem>,
 }
 
-impl HookScan {
-    /// The hooks of service `id`, as its report lists them.
-    pub fn for_service(&self, id: &ServiceId) -> Vec<HookReport> {
-        self.hooks
-            .iter()
-            .filter(|listing| listing.service == *id)
-            .map(|listing| listing.hook.clone())
-            .collect()
-    }
-}
-
 /// Looks for hooks in every service folder of `home` (spec/machine.md §2).
 /// Hidden files are passed over. What can't be read counts as missing.
 pub fn scan(home: &Home) -> HookScan {

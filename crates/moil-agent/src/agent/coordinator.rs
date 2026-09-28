@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt;
@@ -35,14 +34,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::connection::{self, LinkEvent, Outbox};
-use super::watcher::{HomeState, Merged, Reading};
+use super::watcher::{HomeState, Reading};
 use super::{
-    AgentOptions, BundleStatus, Connection, JobReport, JobStatus, Published, ServiceStatus,
-    Snapshot,
+    AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
 };
 use crate::hooks::{BundleRef, Hooks, PendingHook, Succeeded};
 use crate::report::{Problem, ServiceRef};
-use crate::{Machine, ServiceId, services};
+use crate::{Error, Machine, ServiceId, services};
 
 /// Everything the coordinator reacts to.
 #[derive(Debug)]
@@ -63,6 +61,12 @@ pub(super) enum Input {
         key: AttemptKey,
         outcome: Outcome,
     },
+    /// `settings.json` now says whether the machine is paused, as the
+    /// owner asked, or couldn't be made to.
+    Paused {
+        saved: Result<(), Error>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     /// The home was read again, because it changed or the handle asked.
     Home {
         reading: Box<Reading>,
@@ -76,18 +80,20 @@ pub(super) enum Input {
     Reply(oneshot::Sender<()>),
 }
 
-/// What the handle asks for. Commands carrying a sender are answered once
-/// their effects show in the snapshot.
+/// What the handle asks for. Each is answered once its effects show in the
+/// snapshot.
 #[derive(Debug)]
 pub(super) enum Command {
     /// Close the service's channel and forget its attempts, and don't
     /// connect to it again until a reading of the home says it `left`:
     /// the owner is unpairing it.
     Disconnect(ServiceId, oneshot::Sender<()>),
-    SetPaused(bool),
-    /// The owner stopped the running job. The sender, if any, gets the job
-    /// that was running.
-    StopJob(Option<oneshot::Sender<Option<JobStatus>>>),
+    /// Pause or resume once `settings.json` says so. Answered with why it
+    /// can't, if it can't: then nothing changes (spec/machine.md §3.2).
+    SetPaused(bool, oneshot::Sender<Result<(), Error>>),
+    /// The owner stopped the running job. The sender gets the job that was
+    /// running.
+    StopJob(oneshot::Sender<Option<JobStatus>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -125,7 +131,8 @@ pub(super) struct Coordinator {
     options: AgentOptions,
     /// Handed to the tasks the coordinator starts, to report back.
     inputs: mpsc::UnboundedSender<Input>,
-    outputs: Outputs,
+    /// Where the owner gets a new [`Snapshot`] after each round.
+    snapshot: watch::Sender<Snapshot>,
     /// Runs the owner's hooks, unless they couldn't start: then why.
     hooks: Result<Hooks, Problem>,
     /// Queues the hook of the attempt that ended last, or removes its
@@ -134,9 +141,6 @@ pub(super) struct Coordinator {
     /// The task that reads the home when it changes, and its stop.
     watcher: Option<(CancellationToken, JoinHandle<()>)>,
     paused: bool,
-    /// What the settings should say about pausing, for the writes that
-    /// save it.
-    paused_choice: Arc<AtomicBool>,
     /// The home as the agent goes by it.
     home: Arc<HomeState>,
     /// The paired services, and their channels.
@@ -144,8 +148,6 @@ pub(super) struct Coordinator {
     /// Services the owner is unpairing: not connected to again meanwhile,
     /// whatever the home says.
     leaving: BTreeSet<ServiceId>,
-    /// Services whose channel found no token for them.
-    tokenless: BTreeSet<ServiceId>,
     /// Verified copies of the bundles some service's approval names, by
     /// hash: offers and assignments are answered from these, without
     /// reading the store.
@@ -338,14 +340,6 @@ impl ForHook {
     }
 }
 
-/// Where the coordinator publishes what it does.
-pub(super) struct Outputs {
-    pub snapshot: watch::Sender<Snapshot>,
-    pub published: watch::Sender<Published>,
-    /// Marked changed whenever `published` changes.
-    pub changes: watch::Sender<()>,
-}
-
 impl Running {
     /// Asks the attempt to stop; the first reason given wins. It shows as
     /// stopping until the executor returns.
@@ -391,26 +385,23 @@ impl Coordinator {
         executor: Arc<dyn Executor>,
         options: AgentOptions,
         inputs: mpsc::UnboundedSender<Input>,
-        outputs: Outputs,
+        snapshot: watch::Sender<Snapshot>,
         hooks: Result<Hooks, Problem>,
         watcher: (CancellationToken, JoinHandle<()>),
     ) -> Self {
-        let paused = machine.settings().paused;
         Self {
-            paused,
-            paused_choice: Arc::new(AtomicBool::new(paused)),
+            paused: machine.settings().paused,
             machine,
             executor,
             options,
             inputs,
-            outputs,
+            snapshot,
             hooks,
             settling: None,
             watcher: Some(watcher),
             home: Arc::default(),
             services: BTreeMap::new(),
             leaving: BTreeSet::new(),
-            tokenless: BTreeSet::new(),
             bundles: HashMap::new(),
             attempts: BTreeMap::new(),
             unsent: BTreeSet::new(),
@@ -499,6 +490,7 @@ impl Coordinator {
             }
             Input::Job { key, event } => self.job_event(&key, event),
             Input::Finished { key, outcome } => self.finished(key, outcome),
+            Input::Paused { saved, reply } => self.paused_saved(saved, reply),
             Input::Home {
                 reading,
                 left,
@@ -529,29 +521,21 @@ impl Coordinator {
                     None => self.replies.push(reply),
                 }
             }
-            Command::SetPaused(paused) => {
-                if paused != self.paused {
-                    self.paused = paused;
-                    tracing::info!("{}", if paused { "paused" } else { "resumed" });
-                    self.remember_paused();
-                }
-            }
+            Command::SetPaused(paused, reply) => self.save_paused(paused, reply),
             Command::StopJob(reply) => {
                 let stopped = self.running.as_mut().map(|running| {
                     tracing::info!("stopping {}", running.key);
                     running.stop(StopReason::Interrupted);
                     running.status.clone()
                 });
-                if let Some(reply) = reply {
-                    // Answered, like the other commands, once the snapshot
-                    // shows it.
-                    let (done, shown) = oneshot::channel();
-                    self.replies.push(done);
-                    tokio::spawn(async move {
-                        let _ = shown.await;
-                        let _ = reply.send(stopped);
-                    });
-                }
+                // Answered, like the other commands, once the snapshot
+                // shows it.
+                let (done, shown) = oneshot::channel();
+                self.replies.push(done);
+                tokio::spawn(async move {
+                    let _ = shown.await;
+                    let _ = reply.send(stopped);
+                });
             }
             Command::Shutdown(reply) => {
                 let deliver_by = Instant::now() + self.options.shutdown_grace;
@@ -577,12 +561,14 @@ impl Coordinator {
     /// only as their jobs come; others as they're approved. `left` is a
     /// service the owner has just unpaired, which is no longer
     /// [`leaving`](Self::leaving).
-    fn home_changed(&mut self, reading: Reading, starting: bool, left: Option<ServiceId>) {
-        let Merged {
+    fn home_changed(&mut self, mut reading: Reading, starting: bool, left: Option<ServiceId>) {
+        reading.keep_from(&self.home);
+        let Reading {
             mut home,
             settings,
             bundles,
-        } = self.home.merge(reading);
+            ..
+        } = reading;
         if let Err(problem) = &self.hooks {
             home.problems.push(problem.clone());
         }
@@ -591,8 +577,6 @@ impl Coordinator {
             && change.after.paused != self.paused
         {
             self.paused = change.after.paused;
-            // Any write still to come saves what the file says.
-            self.paused_choice.store(self.paused, Ordering::SeqCst);
             let now = if self.paused { "paused" } else { "resumed" };
             tracing::info!("{now}, as settings.json now says");
         }
@@ -798,7 +782,6 @@ impl Coordinator {
                 );
                 service.link = None;
                 service.connection = Connection::Unpaired;
-                self.tokenless.insert(id.clone());
                 self.drop_attempts(id);
             }
             LinkEvent::Replaced => {
@@ -1073,18 +1056,47 @@ impl Coordinator {
             .retain(|hash, _| services.values().any(|s| s.paired.is_approved(hash)));
     }
 
-    /// Saves in the settings whether the machine is paused, off the
-    /// coordinator. Each write saves the latest choice, so the last one to
-    /// run leaves it on disk, whichever order they run in.
-    fn remember_paused(&self) {
-        self.paused_choice.store(self.paused, Ordering::SeqCst);
-        let choice = self.paused_choice.clone();
+    /// Saves in `settings.json` whether the machine is `paused`, off the
+    /// coordinator, which goes by it once saved
+    /// ([`paused_saved`](Self::paused_saved)).
+    fn save_paused(&self, paused: bool, reply: oneshot::Sender<Result<(), Error>>) {
         let machine = self.machine.clone();
-        tokio::task::spawn_blocking(move || {
-            let saved = machine.update_settings(|s| s.paused = choice.load(Ordering::SeqCst));
-            if let Err(e) = saved {
-                tracing::warn!("couldn't remember whether the machine is paused: {e}");
+        let inputs = self.inputs.clone();
+        tokio::spawn(async move {
+            let saved = machine
+                .blocking(move |machine| machine.update_settings(|s| s.paused = paused))
+                .await;
+            let _ = inputs.send(Input::Paused {
+                saved: saved.map(drop),
+                reply,
+            });
+        });
+    }
+
+    /// Pauses or resumes as the settings say, now that the owner's choice
+    /// is `saved` in them, and answers `reply` once the snapshot shows it.
+    /// A choice that couldn't be saved changes nothing.
+    fn paused_saved(
+        &mut self,
+        saved: Result<(), Error>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    ) {
+        match &saved {
+            // Whichever choice was saved last.
+            Ok(()) => {
+                let paused = self.machine.settings().paused;
+                if paused != self.paused {
+                    self.paused = paused;
+                    tracing::info!("{}", if paused { "paused" } else { "resumed" });
+                }
             }
+            Err(e) => tracing::warn!("couldn't save whether the machine is paused: {e}"),
+        }
+        let (done, shown) = oneshot::channel();
+        self.replies.push(done);
+        tokio::spawn(async move {
+            let _ = shown.await;
+            let _ = reply.send(saved);
         });
     }
 
@@ -1360,7 +1372,6 @@ impl Coordinator {
     }
 
     fn connect(&mut self, paired: services::Service) {
-        self.tokenless.remove(&paired.id);
         let task = self.next_task;
         self.next_task += 1;
         let stop = CancellationToken::new();
@@ -1434,22 +1445,10 @@ impl Coordinator {
                 .collect(),
             job: self.running.as_ref().map(|r| r.status.clone()),
             last_job: self.last_job.clone(),
-        };
-        let published = Published {
-            snapshot: snapshot.clone(),
             home: self.home.clone(),
-            tokenless: self.tokenless.clone(),
         };
-        self.outputs
-            .snapshot
+        self.snapshot
             .send_if_modified(|current| replace(current, snapshot));
-        if self
-            .outputs
-            .published
-            .send_if_modified(|current| replace(current, published))
-        {
-            self.outputs.changes.send_replace(());
-        }
     }
 }
 
@@ -1542,12 +1541,7 @@ mod tests {
 
         let (jobs, mut ran) = mpsc::unbounded_channel();
         let (inputs, _) = mpsc::unbounded_channel();
-        let outputs = Outputs {
-            snapshot: watch::Sender::default(),
-            published: watch::Sender::default(),
-            changes: watch::Sender::default(),
-        };
-        let reading = Reading::take(&machine);
+        let reading = crate::agent::read_home(&machine);
         let watcher = (CancellationToken::new(), tokio::spawn(async {}));
         let hooks = Err(Problem {
             path: "hooks".into(),
@@ -1558,7 +1552,7 @@ mod tests {
             Arc::new(Jobs(jobs)),
             AgentOptions::default(),
             inputs,
-            outputs,
+            watch::Sender::default(),
             hooks,
             watcher,
         )

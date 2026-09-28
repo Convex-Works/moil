@@ -13,7 +13,6 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::bail;
 use clap::{Subcommand, ValueEnum};
 use moil_agent::control::{Client, ClientError};
 use moil_agent::report::{Host, Status};
@@ -390,11 +389,6 @@ pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
                 async |mut client| Ok(client.revoke(&service, hash).await?),
                 async |machine| {
                     let found = machine.find_service(&service)?;
-                    // An approval that doesn't count is the owner's to
-                    // remove too.
-                    if !machine.lists_approval(&found.id, &hash)? {
-                        bail!("{hash} isn't approved for {}", found.id);
-                    }
                     machine.revoke(&found.id, hash)?;
                     Ok(())
                 },
@@ -405,7 +399,7 @@ pub async fn run(command: Command, globals: &Globals) -> anyhow::Result<()> {
                 .print(format.json);
             Ok(())
         }
-        Command::Hooks { format } => show::hooks(&moil_agent::hooks::scan(&ctx.home), format.json),
+        Command::Hooks { format } => show::hooks(&ctx.status().await?, format.json),
         Command::Logs {
             service,
             bundle,
@@ -584,7 +578,7 @@ impl Context {
     async fn status(&self) -> anyhow::Result<Status> {
         match self.agent().await? {
             Some(mut client) => Ok(client.status().await?),
-            None => Ok(status::from_home(&self.reader()?)?),
+            None => Ok(status::from_home(&self.reader()?)),
         }
     }
 }

@@ -136,6 +136,13 @@ pub fn config(dir: &Path) -> MachineConfig {
     }
 }
 
+/// What `moil status` finds wrong with the home at `dir`, reading it as a
+/// command does when no agent runs.
+pub fn problems(dir: &Path) -> Vec<moil_agent::report::Problem> {
+    let reader = Machine::open_read_only(config(dir)).unwrap();
+    moil_agent::status::from_home(&reader).problems
+}
+
 /// The tokens of the machine whose home is `dir`, by key.
 pub fn tokens(dir: &Path) -> std::collections::BTreeMap<String, String> {
     match std::fs::read_to_string(Home::new(dir).secrets_file()) {

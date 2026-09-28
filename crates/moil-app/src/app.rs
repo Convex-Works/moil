@@ -39,7 +39,6 @@ use crate::login::{self, LoginItem};
 use crate::page;
 use crate::pair::{PairEffect, PairWindow};
 use crate::platform;
-use crate::reports::{self, HomeReport};
 use crate::review::{ReviewEffect, ReviewWindow};
 use crate::snapshots::Snapshots;
 use crate::tray::Tray;
@@ -56,8 +55,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum AppEvent {
     /// The agent's state changed: take the latest snapshot.
     Snapshot,
-    /// The home's hooks or problems changed: take the latest report.
-    Report,
     Menu(MenuId),
     /// A page posted a message.
     Ipc {
@@ -167,8 +164,6 @@ pub fn run(
         tray: None,
         snapshots: None,
         snapshot: Snapshot::default(),
-        reports: None,
-        report: HomeReport::default(),
         deferred: HashSet::new(),
         windows: HashMap::new(),
         quitting: false,
@@ -231,9 +226,6 @@ struct App {
     tray: Option<Tray>,
     snapshots: Option<Snapshots>,
     snapshot: Snapshot,
-    reports: Option<Snapshots<HomeReport>>,
-    /// The home's hooks and problems, which the snapshot doesn't have.
-    report: HomeReport,
     /// Reviews the owner closed without approving.
     deferred: HashSet<(ServiceId, BundleHash)>,
     windows: HashMap<WindowId, Window>,
@@ -307,18 +299,6 @@ impl App {
         let mut snapshots = Snapshots::watch(backend.subscribe(), self.runtime.handle(), wake);
         self.snapshot = snapshots.take();
         self.snapshots = Some(snapshots);
-
-        let changes = backend.changes();
-        let status = move || {
-            let backend = backend.clone();
-            async move { backend.status().await }.boxed()
-        };
-        let reports = reports::watch(changes, self.runtime.handle(), status);
-        let proxy = self.proxy.clone();
-        let wake = move || proxy.send_event(AppEvent::Report).is_ok();
-        let mut reports = Snapshots::watch(reports, self.runtime.handle(), wake);
-        self.report = reports.take();
-        self.reports = Some(reports);
         match Tray::new(self.view()) {
             Ok(tray) => self.tray = Some(tray),
             Err(e) => tracing::error!("{e}"),
@@ -336,7 +316,6 @@ impl App {
                 has_log: self.log_file.is_some(),
                 quitting: self.quitting,
                 deferred: &self.deferred,
-                home: &self.report,
             },
         );
         self.refresh_at = view.refresh_at;
@@ -355,12 +334,6 @@ impl App {
             AppEvent::Snapshot => {
                 if let Some(snapshots) = &mut self.snapshots {
                     self.snapshot = snapshots.take();
-                    self.refresh_tray();
-                }
-            }
-            AppEvent::Report => {
-                if let Some(reports) = &mut self.reports {
-                    self.report = reports.take();
                     self.refresh_tray();
                 }
             }
@@ -442,8 +415,14 @@ impl App {
             return;
         };
         match action {
-            Action::StopJob => backend.stop_job(),
-            Action::SetPaused(paused) => backend.set_paused(paused),
+            Action::StopJob => {
+                self.runtime.spawn(async move { backend.stop_job().await });
+            }
+            Action::SetPaused(paused) => {
+                // The agent logs why, if settings.json can't say so.
+                self.runtime
+                    .spawn(async move { backend.set_paused(paused).await });
+            }
             Action::Pair => self.pair(None, target),
             Action::PairAgain(url) => self.pair(Some(&url), target),
             Action::Review { service, hash } => self.review(service, hash, target),

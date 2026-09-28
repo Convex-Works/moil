@@ -7,13 +7,14 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use maud::{Markup, html};
-use moil_agent::report::{HookReport, Problem};
+use moil_agent::report::{HookListing, HookReport, Problem};
 use moil_agent::{
-    Approval, BundleStatus, Connection, JobOutcome, JobReport, JobStatus, Pairing, Review, Service,
-    ServiceStatus, Snapshot,
+    Approval, BundleStatus, Connection, HomeState, JobOutcome, JobReport, JobStatus, Pairing,
+    Review, Service, ServiceStatus, Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::{BundleInfo, ErrorCode, JobId, Phase};
@@ -24,7 +25,6 @@ use crate::icon;
 use crate::ipc::{PairMessage, ReviewMessage};
 use crate::page;
 use crate::pair::PairWindow;
-use crate::reports::HomeReport;
 use crate::review::ReviewWindow;
 use crate::unpair::UnpairWindow;
 use crate::view::{Activity, Entry, IconState, Label, MenuModel, TrayView, ViewContext};
@@ -104,6 +104,22 @@ fn menu() -> String {
         bundles: Vec::new(),
         insecure: false,
     };
+    let root = Path::new("/Users/ada/.moil/services/klisi.example.com");
+    let hook = |bundle: &str, runnable| HookListing {
+        service: klisi.id.clone(),
+        hook: HookReport {
+            bundle: bundle.into(),
+            path: root.join("hooks").join(bundle),
+            log: root.join("logs").join(format!("{bundle}.log")),
+            runnable,
+        },
+    };
+    let mut home = HomeState::default();
+    home.hooks = vec![hook("summarize", false), hook("transcribe", true)];
+    home.problems = vec![Problem {
+        path: "services/klisi.example.com/hooks/summarize".into(),
+        message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
+    }];
     let snapshot = Snapshot {
         paused: false,
         job: Some(JobStatus {
@@ -131,24 +147,7 @@ fn menu() -> String {
             ended_at: clock - Duration::from_secs(300),
         }),
         services: vec![klisi.clone(), lab],
-    };
-    let root = Path::new("/Users/ada/.moil/services/klisi.example.com");
-    let hook = |bundle: &str, runnable| HookReport {
-        bundle: bundle.into(),
-        path: root.join("hooks").join(bundle),
-        log: root.join("logs").join(format!("{bundle}.log")),
-        runnable,
-    };
-    let home = HomeReport {
-        hooks: [(
-            klisi.id,
-            vec![hook("summarize", false), hook("transcribe", true)],
-        )]
-        .into(),
-        problems: vec![Problem {
-            path: "services/klisi.example.com/hooks/summarize".into(),
-            message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
-        }],
+        home: Arc::new(home),
     };
     let view = TrayView::new(
         &snapshot,
@@ -159,7 +158,6 @@ fn menu() -> String {
             has_log: true,
             quitting: false,
             deferred: &HashSet::new(),
-            home: &home,
         },
     );
     menu_page(&view.menu)

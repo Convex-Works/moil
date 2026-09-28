@@ -21,7 +21,6 @@ mod login;
 mod page;
 mod pair;
 mod platform;
-mod reports;
 mod review;
 mod snapshots;
 mod tray;

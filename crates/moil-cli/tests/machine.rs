@@ -203,14 +203,36 @@ fn pausing_works_with_or_without_an_agent() {
             assert_label_rule(&text.stdout(), &json.stdout());
             let status: Status = home.run(&["status", "--json"]).success().json();
             assert_eq!(status.paused, paused, "{with:?}");
-            // The agent saves it as it goes on.
-            let saved = format!("\"paused\": {paused}");
-            until("the setting to be saved", || {
-                let settings = home.path().join("settings.json");
-                std::fs::read_to_string(settings).is_ok_and(|s| s.contains(&saved))
-            });
+            // Saved before it answers, agent or not.
+            let settings = std::fs::read_to_string(home.path().join("settings.json")).unwrap();
+            assert!(
+                settings.contains(&format!("\"paused\": {paused}")),
+                "{settings}"
+            );
         }
     }
+}
+
+#[test]
+fn a_pause_moil_cant_keep_fails_the_same_with_or_without_an_agent() {
+    let mut said = Vec::new();
+    for with in [With::Home, With::Agent] {
+        let home = Home::new();
+        // An agent won't start on an invalid settings.json, only go on.
+        let _agent = with.start(&home);
+        std::fs::write(home.path().join("settings.json"), "{\"paused\": maybe}").unwrap();
+        let run = home.run(&["pause", "--json"]).failure(1);
+        assert_eq!(run.stdout(), "", "{with:?}");
+        let status: Status = home.run(&["status", "--json"]).success().json();
+        assert!(!status.paused, "{with:?}");
+        said.push(run.stderr().replace(home.path().to_str().unwrap(), "HOME"));
+    }
+    assert!(
+        said[0].contains("HOME/settings.json isn't valid"),
+        "{}",
+        said[0]
+    );
+    assert_eq!(said[0], said[1]);
 }
 
 #[test]

@@ -1,6 +1,6 @@
-//! Changes made to the home from outside (spec/machine.md §1.3): what the
-//! agent reads from the home, what it makes of files it can't use, and the
-//! task that reads the home again whenever it changes.
+//! Changes made to the home from outside (spec/machine.md §1.3): what
+//! moil reads from the home, what a running agent makes of files it can't
+//! use, and the task that reads the home again whenever it changes.
 //!
 //! The task polls. Every [`AgentOptions::home_poll`] it takes a
 //! [`fingerprint`] of the files moil reads (their names, sizes, times,
@@ -45,11 +45,11 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::coordinator::Input;
-use crate::folders::{self, FolderFile};
-use crate::hooks::{self, HookScan};
+use crate::folders::{self, Unusable};
+use crate::hooks;
 use crate::machine::SettingsChange;
-use crate::report::{HookListing, Problem};
-use crate::{Error, Home, Machine, Service, ServiceId};
+use crate::report::{HookListing, HookReport, Problem};
+use crate::{Home, Machine, Service, ServiceId};
 
 /// How many polls in a row may find the home changing before it is read
 /// all the same.
@@ -59,128 +59,118 @@ const MAX_UNSETTLED_POLLS: u32 = 3;
 /// `<id>/bundles/<name>/<hash>/<file>`.
 const MAX_DEPTH: usize = 4;
 
-/// What the home says, read in one go while none of moil's own changes to
-/// its services is half done.
-#[derive(Debug)]
-pub(super) struct Reading {
-    /// How `settings.json` changed since moil last read or wrote it, if it
-    /// did, or why it can't be used.
-    pub settings: Result<Option<SettingsChange>, Error>,
-    /// The service folders, or why `services/` can't be listed.
-    pub folders: Result<folders::Scan, Error>,
-    pub hooks: HookScan,
+/// The home as moil goes by it (spec/machine.md §1): its services, its
+/// hooks, and what's wrong with it. A running agent keeps what it read
+/// before from files it can't use (§1.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HomeState {
+    /// Every service the home knows, by ID.
+    pub services: BTreeMap<ServiceId, Service>,
+    /// Every hook, by service and then bundle.
+    pub hooks: Vec<HookListing>,
+    /// What's wrong with the home, for the owner to fix.
+    pub problems: Vec<Problem>,
+    /// The service folders that have a `pairing.json`, whether moil can use
+    /// it or not.
+    pub(crate) pairing_files: BTreeSet<ServiceId>,
 }
 
-impl Reading {
-    /// Reads the home of `machine`. Blocks, and may take a while: the
-    /// approved bundles are hashed again.
-    pub fn take(machine: &Machine) -> Self {
-        let _services = machine.lock_services();
-        let home = machine.home();
-        Self {
-            settings: machine.reload_settings(),
-            folders: folders::scan(home),
-            hooks: hooks::scan(home),
-        }
+impl HomeState {
+    /// The hooks of service `id`, by bundle.
+    pub fn service_hooks(&self, id: &ServiceId) -> Vec<HookReport> {
+        self.hooks
+            .iter()
+            .filter(|listing| listing.service == *id)
+            .map(|listing| listing.hook.clone())
+            .collect()
     }
 }
 
-/// The home as the agent goes by it: what it last read from each file it
-/// could use (spec/machine.md §1.3).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct HomeState {
-    /// Every service the home knows, by ID.
-    pub services: BTreeMap<ServiceId, Service>,
-    /// The service folders that have a `pairing.json`, whether moil can use
-    /// it or not.
-    pub pairing_files: BTreeSet<ServiceId>,
-    /// Every hook, by service and then bundle.
-    pub hooks: Vec<HookListing>,
-    pub problems: Vec<Problem>,
-}
-
-/// A [`Reading`], as the agent goes by it.
-pub(super) struct Merged {
+/// What the home says, read in one go by [`read_home`].
+#[derive(Debug)]
+pub(crate) struct Reading {
+    /// The home as its files say now, without what can't be used.
     pub home: HomeState,
-    /// How the settings changed, if they did.
+    /// How `settings.json` changed since moil last read or wrote it, if it
+    /// did and moil can use it.
     pub settings: Option<SettingsChange>,
     /// Verified copies of the bundles that each service's approvals that
     /// count name.
     pub bundles: BTreeMap<ServiceId, Vec<Bundle>>,
+    /// What's there, but moil can't use.
+    pub unusable: Vec<Unusable>,
 }
 
-impl HomeState {
-    /// What the agent goes by once it has taken `reading`: what it says,
-    /// but for the files that can't be used, which keep what was read from
-    /// them before, and say so.
-    pub(super) fn merge(&self, reading: Reading) -> Merged {
-        let mut problems = Vec::new();
-        let settings = reading.settings.unwrap_or_else(|e| {
-            problems.push(Home::settings_problem(&e, true));
-            None
+/// Reads the home of `machine`, while none of moil's own changes to its
+/// services is half done: its settings, going by them if they changed
+/// since moil last read or wrote them, its services and its hooks. Each
+/// thing wrong is one problem, whoever goes by the reading. Blocks, and
+/// may take a while: the approved bundles are hashed again.
+pub(crate) fn read_home(machine: &Machine) -> Reading {
+    let _services = machine.lock_services();
+    let home = machine.home();
+    let mut problems = Vec::new();
+    let settings = machine.reload_settings().unwrap_or_else(|e| {
+        problems.push(Home::settings_problem(&e));
+        None
+    });
+    let scan = folders::scan(home).unwrap_or_else(|e| {
+        problems.push(Problem {
+            path: "services".into(),
+            message: format!("moil can't read this folder ({e})."),
         });
-        let mut merged = Merged {
-            home: HomeState::default(),
-            settings,
-            bundles: BTreeMap::new(),
-        };
-        match reading.folders {
-            Ok(scan) => {
-                let mut services: BTreeMap<ServiceId, Service> = scan
-                    .services
-                    .into_iter()
-                    .map(|service| (service.id.clone(), service))
-                    .collect();
-                let mut folder_problems = scan.problems;
-                for unusable in &scan.unusable {
-                    let before = self.services.get(&unusable.id);
-                    let kept = match unusable.file {
-                        FolderFile::Service => before.is_some_and(|before| {
-                            services.insert(before.id.clone(), before.clone());
-                            true
-                        }),
-                        FolderFile::Pairing => {
-                            let pairing = before.and_then(|before| before.pairing.as_ref());
-                            match (services.get_mut(&unusable.id), pairing) {
-                                // Only ever to the base URL it was paired with.
-                                (Some(service), Some(pairing))
-                                    if pairing.base_url == service.base_url =>
-                                {
-                                    service.pairing = Some(pairing.clone());
-                                    true
-                                }
-                                _ => false,
-                            }
-                        }
-                    };
-                    if kept {
-                        let path = unusable.path();
-                        for problem in folder_problems.iter_mut().filter(|p| p.path == path) {
-                            *problem = unusable.problem(true);
-                        }
+        folders::Scan {
+            unusable: vec![Unusable::Services],
+            ..Default::default()
+        }
+    });
+    problems.extend(scan.problems);
+    let hooks = hooks::scan(home);
+    problems.extend(hooks.problems);
+    Reading {
+        home: HomeState {
+            services: scan
+                .services
+                .into_iter()
+                .map(|service| (service.id.clone(), service))
+                .collect(),
+            hooks: hooks.hooks,
+            problems,
+            pairing_files: scan.pairing_files,
+        },
+        settings,
+        bundles: scan.bundles,
+        unusable: scan.unusable,
+    }
+}
+
+impl Reading {
+    /// Goes on with what `before` holds of the files this reading couldn't
+    /// use (spec/machine.md §1.3).
+    pub(super) fn keep_from(&mut self, before: &HomeState) {
+        let home = &mut self.home;
+        for unusable in &self.unusable {
+            match unusable {
+                Unusable::Services => {
+                    home.services.clone_from(&before.services);
+                    home.pairing_files.clone_from(&before.pairing_files);
+                }
+                Unusable::ServiceFile(id) => {
+                    if let Some(service) = before.services.get(id) {
+                        home.services.insert(id.clone(), service.clone());
                     }
                 }
-                problems.extend(folder_problems);
-                merged.home.services = services;
-                merged.home.pairing_files = scan.pairing_files;
-                merged.bundles = scan.bundles;
-            }
-            Err(e) => {
-                problems.push(Problem {
-                    path: "services".into(),
-                    message: format!(
-                        "moil can't read this folder ({e}), so it goes on with what it read from \
-                         it before."
-                    ),
-                });
-                merged.home.services = self.services.clone();
-                merged.home.pairing_files = self.pairing_files.clone();
+                Unusable::PairingFile(id) => {
+                    let pairing = before.services.get(id).and_then(|s| s.pairing.as_ref());
+                    if let (Some(service), Some(pairing)) = (home.services.get_mut(id), pairing)
+                        // Only ever to the base URL it was paired with.
+                        && pairing.base_url == service.base_url
+                    {
+                        service.pairing = Some(pairing.clone());
+                    }
+                }
             }
         }
-        problems.extend(reading.hooks.problems);
-        merged.home.hooks = reading.hooks.hooks;
-        merged.home.problems = problems;
-        merged
     }
 }
 
@@ -247,7 +237,7 @@ impl Watcher {
                 // Taken first, so that a change made while reading is
                 // noticed at the next poll.
                 let fingerprint = fingerprint(machine.home());
-                Ok((fingerprint, Reading::take(machine)))
+                Ok((fingerprint, read_home(machine)))
             });
             let Ok((fingerprint, reading)) = taken.await else {
                 return;

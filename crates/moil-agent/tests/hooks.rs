@@ -556,13 +556,13 @@ async fn the_scan_lists_every_hook_by_service_and_bundle() {
         ]
     );
     assert_eq!(
-        scan.for_service(&other),
-        [HookReport {
+        scan.hooks[2].hook,
+        HookReport {
             bundle: "summarize".into(),
             path: elsewhere,
             log: t.home.hook_log(&other, "summarize"),
             runnable: true,
-        }]
+        }
     );
     let problems: Vec<(&str, &str)> = scan
         .problems

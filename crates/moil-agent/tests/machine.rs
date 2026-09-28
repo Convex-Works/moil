@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use moil_agent::home::{GITIGNORE, README_TEXT, SERVICE_GITIGNORE};
 use moil_agent::report::Problem;
-use moil_agent::{Error, Home, Machine, MachineConfig, MemorySecrets, Service, Settings};
-use moil_bundle::{Bundle, BundleError, LineKind, LoadError};
+use moil_agent::{Error, Home, Machine, MachineConfig, MemorySecrets, Service, Settings, status};
+use moil_bundle::{Bundle, BundleError, LineKind};
 use support::*;
 
 /// Approves `bundle` for `service`, as the owner would after reviewing it.
@@ -88,8 +88,6 @@ async fn a_machine_can_be_read_while_another_process_has_it_open() {
         Err(Error::AlreadyRunning(_))
     ));
     let reader = Machine::open_read_only(config(dir.path())).unwrap();
-    assert!(reader.is_paired(&paired).unwrap());
-    assert_eq!(reader.services().unwrap(), std::slice::from_ref(&paired));
     assert_eq!(reader.find_service("klisi").unwrap(), paired);
     assert_eq!(reader.bundles(&paired.id).await.unwrap(), [info(&bundle)]);
     let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
@@ -97,7 +95,8 @@ async fn a_machine_can_be_read_while_another_process_has_it_open() {
 
     // It sees what the process that has the machine open changes.
     machine.approve(&review).unwrap();
-    assert!(reader.services().unwrap()[0].is_approved(&bundle.hash()));
+    let known = reader.find_service("klisi").unwrap();
+    assert!(known.is_approved(&bundle.hash()));
     let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
     assert!(review.approved);
 }
@@ -112,7 +111,7 @@ fn reading_a_machine_changes_nothing() {
         app_version: "0.1.0-test".into(),
     })
     .unwrap();
-    assert_eq!(reader.services().unwrap(), []);
+    assert_eq!(status::from_home(&reader).services, []);
     assert!(!root.exists(), "a home that wasn't there still isn't");
 }
 
@@ -301,7 +300,7 @@ fn moil_wont_start_with_settings_it_cant_trust() {
         // It can still be looked at, and says what's wrong.
         let reader = Machine::open_read_only(config(dir.path())).unwrap();
         assert_eq!(reader.settings(), Settings::default());
-        let problems = reader.problems();
+        let problems = problems(dir.path());
         let problem = problem_at(&problems, "settings.json");
         assert!(problem.message.contains(why), "{problem:?}");
     }
@@ -309,7 +308,7 @@ fn moil_wont_start_with_settings_it_cant_trust() {
     std::fs::write(&settings, "{\"paused\": true}\n").unwrap();
     let machine = open_machine(dir.path());
     assert!(machine.settings().paused, "every other field is optional");
-    assert!(machine.problems().is_empty(), "{:?}", machine.problems());
+    assert_eq!(problems(dir.path()), []);
 }
 
 #[test]
@@ -440,7 +439,6 @@ async fn pairing_stores_the_service_and_its_token() {
     drop(machine);
     let machine = open_machine(dir.path());
     assert_eq!(machine.services().unwrap(), std::slice::from_ref(&paired));
-    assert!(machine.is_paired(&paired).unwrap());
     let tokens = tokens(dir.path());
     assert_eq!(tokens.values().collect::<Vec<_>>(), ["moil_token_1"]);
     for file in std::fs::read_dir(&folder).unwrap() {
@@ -717,7 +715,7 @@ async fn what_moil_cant_make_sense_of_under_services_is_reported_and_ignored() {
     std::fs::create_dir(services.join(".git")).unwrap();
 
     assert_eq!(machine.services().unwrap(), [paired]);
-    let problems = machine.problems();
+    let problems = problems(dir.path());
     assert_eq!(problems.len(), 3, "{problems:#?}");
     assert!(
         problem_at(&problems, "services/Klisi.Example.com")
@@ -806,10 +804,6 @@ async fn approval_is_for_exactly_the_reviewed_bundle() {
         ("transcribe", "1.0.0")
     );
     assert_eq!(machine.service(&paired.id).unwrap(), approved);
-    assert_eq!(
-        machine.approved_bundle(&paired.id, bundle.hash()).unwrap(),
-        Some(bundle.clone())
-    );
     assert!(machine.review(&paired.id, bundle.hash()).await.is_err());
     assert_eq!(
         machine.approve(&review).unwrap(),
@@ -828,16 +822,14 @@ async fn approval_is_for_exactly_the_reviewed_bundle() {
     // And they're checked on every use: changed, they're no longer the
     // approved bundle, and the approval no longer counts.
     overwrite(&dir.join("job.py"), "print('changed on disk')\n");
-    let err = machine
-        .approved_bundle(&paired.id, bundle.hash())
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::BundleLoad(LoadError::Invalid(BundleError::HashMismatch { .. }))
-        ),
-        "{err}"
+    let problems = problems(machine.home().root());
+    let path = format!(
+        "services/{}/bundles/transcribe/{}",
+        paired.id,
+        bundle.hash()
     );
+    let problem = problem_at(&problems, &path);
+    assert!(problem.message.contains("don't hash to"), "{problem:?}");
     assert!(
         !machine
             .service(&paired.id)
@@ -852,10 +844,33 @@ async fn approval_is_for_exactly_the_reviewed_bundle() {
     let review = machine.review(&paired.id, bundle.hash()).await.unwrap();
     assert!(!review.approved);
     assert_eq!(machine.approve(&review).unwrap(), approved);
+    assert_eq!(Bundle::from_dir(&dir).unwrap(), bundle);
+}
+
+#[tokio::test]
+async fn a_review_is_no_approval_once_the_services_url_changed() {
+    let service = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &service).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    service.host(&bundle);
+    let review = machine.review(&paired.id, bundle.hash()).await.unwrap();
+
+    // While the owner reads, someone points the folder elsewhere.
+    edit_json(&machine.home().service_file(&paired.id), |file| {
+        file["base_url"] = "https://elsewhere.example.com/moil".into();
+    });
+    let err = machine.approve(&review).unwrap_err();
     assert_eq!(
-        machine.approved_bundle(&paired.id, bundle.hash()).unwrap(),
-        Some(bundle)
+        err.to_string(),
+        format!(
+            "the URL of {} changed after you reviewed the bundle; review it again",
+            paired.id
+        )
     );
+    assert!(machine.service(&paired.id).unwrap().approvals.is_empty());
+    assert!(!machine.home().approved_bundles_dir(&paired.id).exists());
 }
 
 #[tokio::test]
@@ -930,12 +945,6 @@ async fn revoking_deletes_the_bundle_and_its_runtime_copy_once_unused() {
 
     let revoked = machine.revoke(&paired[0].id, bundle.hash()).unwrap();
     assert!(!revoked.is_approved(&bundle.hash()));
-    assert_eq!(
-        machine
-            .approved_bundle(&paired[0].id, bundle.hash())
-            .unwrap(),
-        None
-    );
     let files = approved_dir(&machine, &paired[0], &bundle);
     assert!(
         !files.parent().unwrap().exists(),
@@ -951,10 +960,10 @@ async fn revoking_deletes_the_bundle_and_its_runtime_copy_once_unused() {
         "the other service still approves it"
     );
     assert!(approved_dir(&machine, &paired[1], &bundle).is_dir());
+    let again = machine.revoke(&paired[0].id, bundle.hash()).unwrap_err();
     assert_eq!(
-        machine.revoke(&paired[0].id, bundle.hash()).unwrap(),
-        revoked,
-        "revoking twice is harmless"
+        again.to_string(),
+        format!("{} isn't approved for {}", bundle.hash(), paired[0].id)
     );
 
     machine.revoke(&paired[1].id, bundle.hash()).unwrap();
@@ -1004,12 +1013,7 @@ async fn unpairing_tells_the_service_and_keeps_the_folder() {
     // The service, its approvals and hooks stay, for pairing again.
     let known = machine.service(&paired.id).unwrap();
     assert_eq!(known.pairing, None);
-    assert!(!machine.is_paired(&known).unwrap());
     assert!(known.is_approved(&bundle.hash()));
-    assert_eq!(
-        machine.approved_bundle(&paired.id, bundle.hash()).unwrap(),
-        Some(bundle.clone())
-    );
     assert!(hook.is_file());
     assert!(
         store.get(&bundle.hash()).unwrap().is_none(),
@@ -1083,9 +1087,9 @@ async fn pairing_adopts_a_folder_cloned_from_another_machine() {
     // and this machine holds no token for it.
     let known = desktop.service(&paired.id).unwrap();
     assert_eq!(known.pairing, None);
-    assert!(!desktop.is_paired(&known).unwrap());
+    assert!(tokens(second.path()).is_empty());
     assert!(known.is_approved(&bundle.hash()));
-    assert!(desktop.problems().is_empty(), "{:?}", desktop.problems());
+    assert_eq!(problems(second.path()), []);
     assert!(matches!(
         desktop.review(&paired.id, bundle.hash()).await,
         Err(Error::NotPaired(_))
@@ -1095,13 +1099,9 @@ async fn pairing_adopts_a_folder_cloned_from_another_machine() {
     assert_eq!(adopted.id, paired.id);
     assert_eq!(adopted.approvals, known.approvals);
     assert_eq!(adopted.pairing.as_ref().unwrap().machine_id, "m_2");
-    assert!(desktop.is_paired(&adopted).unwrap());
+    assert_eq!(tokens(second.path()).len(), 1);
     assert_eq!(desktop.services().unwrap(), std::slice::from_ref(&adopted));
     assert!(desktop.home().hook(&adopted.id, "transcribe").is_file());
-    assert_eq!(
-        desktop.approved_bundle(&adopted.id, bundle.hash()).unwrap(),
-        Some(bundle)
-    );
     assert_eq!(
         service.forgotten(),
         [] as [String; 0],
@@ -1174,7 +1174,7 @@ async fn approvals_that_dont_count_are_ignored_and_reported() {
     assert_eq!(counted, [intact.hash()]);
     assert_eq!(known.approved_hashes(), [intact.hash()]);
 
-    let problems = machine.problems();
+    let problems = problems(dir.path());
     let at = |bundle: &Bundle, name: &str| {
         let path = format!("services/{id}/bundles/{name}/{}", bundle.hash());
         problem_at(&problems, &path).message.clone()
@@ -1208,7 +1208,7 @@ async fn approvals_that_dont_count_are_ignored_and_reported() {
             &format!("services/{id}/bundles/transcribe/{}", unsafe_name.hash())
         )
         .message
-        .contains("doesn't hold the bundle")
+        .contains("no approval in service.json names this folder")
     );
     assert_eq!(problems.len(), 6, "{problems:#?}");
     assert!(!dir.path().join("outside").exists());
@@ -1242,13 +1242,12 @@ async fn a_pairing_for_another_base_url_doesnt_count() {
     });
     let moved = machine.service(&paired.id).unwrap();
     assert_eq!(moved.pairing, None);
-    assert!(!machine.is_paired(&moved).unwrap());
     assert!(
         moved.is_approved(&bundle.hash()),
         "the approvals are the folder's"
     );
-    let problems = machine.problems();
-    let problem = problem_at(&problems, &format!("services/{}/pairing.json", paired.id));
+    let found = problems(dir.path());
+    let problem = problem_at(&found, &format!("services/{}/pairing.json", paired.id));
     assert!(
         problem.message.contains(&old.base_url) && problem.message.contains(&new.base_url),
         "{problem:?}"
@@ -1275,7 +1274,7 @@ async fn a_pairing_for_another_base_url_doesnt_count() {
             .iter()
             .all(|token| new.tokens().contains(token))
     );
-    assert!(machine.problems().is_empty(), "{:?}", machine.problems());
+    assert_eq!(problems(dir.path()), []);
 }
 
 #[tokio::test]
@@ -1295,8 +1294,8 @@ async fn service_and_pairing_files_are_strict() {
     );
     std::fs::write(home.pairing_file(&paired.id), doubled).unwrap();
     assert_eq!(machine.service(&paired.id).unwrap().pairing, None);
-    let problems = machine.problems();
-    let problem = problem_at(&problems, &format!("{folder}/pairing.json"));
+    let found = problems(dir.path());
+    let problem = problem_at(&found, &format!("{folder}/pairing.json"));
     assert!(problem.message.contains("duplicate key"), "{problem:?}");
     std::fs::write(home.pairing_file(&paired.id), pairing).unwrap();
     assert!(machine.service(&paired.id).unwrap().pairing.is_some());
@@ -1311,7 +1310,7 @@ async fn service_and_pairing_files_are_strict() {
             && err.to_string().contains("unknown field `approvls`"),
         "{err}"
     );
-    let problems = machine.problems();
-    let problem = problem_at(&problems, &format!("{folder}/service.json"));
+    let found = problems(dir.path());
+    let problem = problem_at(&found, &format!("{folder}/service.json"));
     assert!(problem.message.contains("approvls"), "{problem:?}");
 }

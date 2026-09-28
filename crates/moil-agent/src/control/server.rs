@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use moil_proto::BundleHash;
 use serde::Serialize;
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -257,15 +256,14 @@ impl Shared {
     async fn answer(&self, request: Request) -> Result<serde_json::Value, String> {
         let agent = &self.agent;
         match request {
-            Request::Status => json(status::from_agent(agent, &self.info).await),
+            Request::Status => value(status::from_agent(agent, &self.info)),
             Request::Pause | Request::Resume => {
                 let paused = matches!(request, Request::Pause);
-                agent.set_paused(paused);
-                agent.settled().await;
+                agent.set_paused(paused).await.map_err(|e| e.to_string())?;
                 value(agent.snapshot().paused)
             }
             Request::Stop => {
-                let stopped = agent.stop_running_job().await;
+                let stopped = agent.stop_job().await;
                 value(stopped.map(|job| status::running_job(&job, &Clock::now())))
             }
             Request::Unpair { service } => {
@@ -301,7 +299,7 @@ impl Shared {
             }
             Request::Revoke { service, hash } => {
                 let service = self.find(service).await?;
-                self.revoke(&service, hash).await
+                json(agent.revoke(&service.id, hash).await)
             }
             Request::LoginItem { set } => json(self.host.login_item(set).await),
             Request::Watch | Request::Pair { .. } | Request::Quit => {
@@ -310,26 +308,8 @@ impl Shared {
         }
     }
 
-    async fn revoke(
-        &self,
-        service: &Service,
-        hash: BundleHash,
-    ) -> Result<serde_json::Value, String> {
-        // An approval that doesn't count is the owner's to remove too.
-        let id = service.id.clone();
-        let listed = self
-            .agent
-            .machine()
-            .blocking(move |machine| machine.lists_approval(&id, &hash))
-            .await
-            .map_err(|e| e.to_string())?;
-        if !listed {
-            return Err(format!("{hash} isn't approved for {}", service.id));
-        }
-        json(self.agent.revoke(&service.id, hash).await)
-    }
-
-    /// The paired service `query` names.
+    /// The service `query` names, among all the home knows, paired or
+    /// not.
     async fn find(&self, query: String) -> Result<Service, String> {
         self.agent
             .machine()
@@ -341,17 +321,11 @@ impl Shared {
     /// Sends the status now, then whenever it changes, until the client
     /// leaves or the agent stops.
     async fn watch(&self, mut reader: BufReader<OwnedReadHalf>, mut writer: OwnedWriteHalf) {
-        let mut changes = self.agent.changes();
+        let mut changes = self.agent.subscribe();
         let mut sent = None;
         loop {
             changes.borrow_and_update();
-            let status = match status::from_agent(&self.agent, &self.info).await {
-                Ok(status) => status,
-                Err(e) => {
-                    let _ = socket::write(&mut writer, &Reply::<()>::Error(e.to_string())).await;
-                    return;
-                }
-            };
+            let status = status::from_agent(&self.agent, &self.info);
             if sent.as_ref() != Some(&status) {
                 if socket::write(&mut writer, &Reply::Ok(&status))
                     .await
@@ -380,21 +354,14 @@ impl Shared {
         mut reader: BufReader<OwnedReadHalf>,
         mut writer: OwnedWriteHalf,
     ) {
-        let (session, machine_name) = match self.start_pairing(&target, name).await {
+        let agent = &self.agent;
+        let started = PairingCode::start(agent.machine(), name, async || agent.pair(&target).await);
+        let (session, code) = match started.await {
             Ok(started) => started,
             Err(e) => {
                 let _ = socket::write(&mut writer, &Reply::<()>::Error(e.to_string())).await;
                 return;
             }
-        };
-        let code = PairingCode {
-            user_code: session.user_code.clone(),
-            verification_uri: session.verification_uri.clone(),
-            verification_uri_complete: session.verification_uri_complete.clone(),
-            service_name: session.service_name.clone(),
-            base_url: session.base_url().clone(),
-            machine_name,
-            expires_at: Clock::now().wall(session.expires_at),
         };
         if socket::write(&mut writer, &Reply::Ok(PairStep::Code(code)))
             .await
@@ -413,23 +380,6 @@ impl Shared {
             Err(e) => Reply::Error(e.to_string()),
         };
         let _ = socket::write(&mut writer, &reply).await;
-    }
-
-    async fn start_pairing(
-        &self,
-        target: &str,
-        name: Option<String>,
-    ) -> Result<(crate::PairingSession, String), Error> {
-        let machine = self.agent.machine();
-        if let Some(name) = name {
-            machine
-                .blocking(|machine| machine.update_settings(|s| s.machine_name = Some(name)))
-                .await?;
-        }
-        let session = self.agent.pair(target).await?;
-        // The computer's name may take detecting.
-        let machine_name = machine.blocking(|machine| Ok(machine.info().name)).await?;
-        Ok((session, machine_name))
     }
 }
 

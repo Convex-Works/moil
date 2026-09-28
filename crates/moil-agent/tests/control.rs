@@ -300,7 +300,7 @@ async fn the_status_is_the_same_whether_or_not_an_agent_runs() {
         )),
         app_version: "0.1.0-test".into(),
     };
-    let from_home = status::from_home(&Machine::open_read_only(config).unwrap()).unwrap();
+    let from_home = status::from_home(&Machine::open_read_only(config).unwrap());
     assert_eq!((from_home.agent.as_ref(), from_home.paused), (None, true));
     assert_eq!((&from_home.job, &from_home.last_job), (&None, &None));
     let [service] = &from_home.services[..] else {
@@ -313,7 +313,7 @@ async fn the_status_is_the_same_whether_or_not_an_agent_runs() {
     let (executor, _runs) = fake_executor();
     let agent = Agent::start_with(open_machine(dir.path()), executor, fast());
     let info = agent_info(Host::Agent);
-    let from_agent = status::from_agent(&agent, &info).await.unwrap();
+    let from_agent = status::from_agent(&agent, &info);
     assert_eq!(from_agent.agent, Some(info));
     let mut only_the_homes = from_agent.clone();
     only_the_homes.agent = None;
@@ -331,10 +331,13 @@ async fn pausing_resuming_and_stopping_over_the_socket() {
     let mut conn = setup.connect(&[&setup.bundle]).await;
     let mut client = setup.client().await;
 
+    let saved = || std::fs::read_to_string(setup.home.settings_file()).unwrap();
     assert!(client.set_paused(true).await.unwrap());
+    assert!(saved().contains("\"paused\": true"), "{}", saved());
     assert_eq!(conn.recv().await, state(MachineState::Paused));
     assert!(client.status().await.unwrap().paused, "at once");
     assert!(!client.set_paused(false).await.unwrap());
+    assert!(saved().contains("\"paused\": false"), "{}", saved());
     assert_eq!(conn.recv().await, state(MachineState::Idle));
     assert!(!client.status().await.unwrap().paused);
 
@@ -354,6 +357,36 @@ async fn pausing_resuming_and_stopping_over_the_socket() {
         .job
         .expect("still winding down");
     assert!(job.stopping);
+}
+
+#[tokio::test]
+async fn a_pause_moil_cant_keep_fails_and_changes_nothing() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect(&[&setup.bundle]).await;
+    let mut client = setup.client().await;
+    let settings = setup.home.settings_file();
+    std::fs::write(&settings, "{\"paused\": maybe}").unwrap();
+
+    // As without an agent, which won't open the home.
+    let error = client.set_paused(true).await.unwrap_err().to_string();
+    let invalid = format!("{} isn't valid (", settings.display());
+    assert!(
+        error.starts_with(&invalid) && error.ends_with("; fix it or move it out of the way"),
+        "{error}"
+    );
+    assert!(!client.status().await.unwrap().paused);
+    conn.send(offer("j1", setup.bundle.hash()));
+    let bid = MachineMessage::Bid {
+        job_id: "j1".parse().unwrap(),
+    };
+    assert_eq!(conn.recv().await, bid, "still taking jobs");
+
+    // Once the file is fixed, pausing works, and lasts.
+    std::fs::write(&settings, "{}").unwrap();
+    assert!(client.set_paused(true).await.unwrap());
+    assert_eq!(conn.recv().await, state(MachineState::Paused));
+    let saved = std::fs::read_to_string(&settings).unwrap();
+    assert!(saved.contains("\"paused\": true"), "{saved}");
 }
 
 #[tokio::test]
@@ -548,9 +581,9 @@ async fn watching_sends_each_change_until_the_agent_stops() {
     assert!(!first.paused && first.job.is_none());
 
     // Changes made in the app...
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     next_where(&mut watch, "the pause", |s| s.paused).await;
-    setup.agent.set_paused(false);
+    setup.agent.set_paused(false).await.unwrap();
     next_where(&mut watch, "the resumption", |s| !s.paused).await;
 
     // ...by services...
@@ -568,8 +601,8 @@ async fn watching_sends_each_change_until_the_agent_stops() {
     while !matches!(conn.recv().await, MachineMessage::Done(_)) {}
     conn.send(ServiceMessage::Ack(attempt("j1", 1)));
 
-    // ...by other commands, even those the agent's snapshot doesn't show,
-    // such as approving a bundle the service doesn't offer...
+    // ...by other commands, such as approving a bundle the service doesn't
+    // offer...
     let unlisted = bundle("transcribe", "2.0.0", "print('two')");
     setup
         .service
