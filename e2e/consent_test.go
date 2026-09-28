@@ -17,7 +17,7 @@ import (
 // A machine runs only the bundles its owner approved. A job for another
 // bundle waits, and the machine never even hears of it, though it takes
 // the service's other jobs meanwhile. Once the owner has read the bundle
-// and approved it, the waiting job runs.
+// and approved it, while the agent runs, the waiting job runs.
 func TestMachinesRunOnlyWhatTheirOwnerApproved(t *testing.T) {
 	t.Parallel()
 	svc := newService(t)
@@ -38,17 +38,16 @@ func TestMachinesRunOnlyWhatTheirOwnerApproved(t *testing.T) {
 		t.Fatalf("the job for a bundle the owner never approved reached the machine; it is %s", waiting.State())
 	}
 
-	// The owner does as the agent said: stops it, runs the command it
-	// gave, reads the bundle in full and approves it. Then they start the
-	// agent again.
-	command := regexp.MustCompile("stop the agent and run `moil ([^`]+)`").FindStringSubmatch(hint)
+	// The owner does as the agent said, while it runs: the command it
+	// gave shows the bundle in full, and approves it with --yes, since
+	// nobody answers at a terminal here.
+	command := regexp.MustCompile("approve it with `moil ([^`]+)`").FindStringSubmatch(hint)
 	if command == nil {
 		t.Fatalf("the agent didn't say how to approve the bundle: %s", hint)
 	}
-	m.Stop()
-	review, stderr, err := m.tryAnswering("y\n", strings.Fields(command[1])...)
+	review, stderr, err := m.try(append(strings.Fields(command[1]), "--yes")...)
 	if err != nil {
-		t.Fatalf("moil %s: %v\n%s", command[1], err, stderr)
+		t.Fatalf("moil %s --yes: %v\n%s", command[1], err, stderr)
 	}
 	for _, want := range []string{
 		"Status: not approved",
@@ -62,7 +61,7 @@ func TestMachinesRunOnlyWhatTheirOwnerApproved(t *testing.T) {
 			t.Fatalf("moil %s didn't show %q:\n%s", command[1], want, review)
 		}
 	}
-	m.Start()
+	// The running agent tells the service at once, and takes the job.
 	if res := succeed(t, waiting); res.Machine != m.ID() {
 		t.Errorf("the job ran on %s, not on alice's machine %s", res.Machine, m.ID())
 	}

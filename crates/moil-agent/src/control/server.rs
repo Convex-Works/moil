@@ -315,7 +315,15 @@ impl Shared {
         service: &Service,
         hash: BundleHash,
     ) -> Result<serde_json::Value, String> {
-        if !service.is_approved(&hash) {
+        // An approval that doesn't count is the owner's to remove too.
+        let id = service.id.clone();
+        let listed = self
+            .agent
+            .machine()
+            .blocking(move |machine| machine.lists_approval(&id, &hash))
+            .await
+            .map_err(|e| e.to_string())?;
+        if !listed {
             return Err(format!("{hash} isn't approved for {}", service.id));
         }
         json(self.agent.revoke(&service.id, hash).await)

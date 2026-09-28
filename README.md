@@ -111,13 +111,14 @@ cargo run -p moil-app             # or: packaging/macos/build.sh && open target/
 
 Confirm the code on the page that opens, review and approve `echo` from
 the tray menu, and submit a job from http://127.0.0.1:8787. The same works
-from a terminal:
+from a terminal, while the app runs or without it:
 
 ```sh
 moil pair http://127.0.0.1:8787/moil
 moil review 127.0.0.1-8787                # list the service's bundles
 moil approve 127.0.0.1-8787 <hash>        # read it in full, then approve
-moil agent                                # take jobs until Ctrl-C
+moil status                               # what moil is doing; --json for scripts
+moil agent                                # without the app: take jobs until Ctrl-C
 ```
 
 `cargo run -p moil-app -- --demo` shows the app with a simulated agent.

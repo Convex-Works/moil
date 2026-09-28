@@ -23,7 +23,7 @@ what must hold afterwards:
 | Test | Story |
 |---|---|
 | `TestAJobRunsOnAPairedMachine` | Pair, approve, run: phases, progress and data arrive in order and intact, the input comes down and the output goes up with the headers the job gave, and the result describes the uploaded bytes |
-| `TestMachinesRunOnlyWhatTheirOwnerApproved` | A job for an unapproved bundle never reaches the machine; the owner follows the agent's hint, approves, and the job runs |
+| `TestMachinesRunOnlyWhatTheirOwnerApproved` | A job for an unapproved bundle never reaches the machine; the owner follows the agent's hint and approves while the agent runs, and the job runs |
 | `TestTamperedBundlesAreRefused` | A bundle altered on its way is refused by `moil review` and `moil approve`, and never runs |
 | `TestScriptsSeeOnlyTheirJob` | The script sees its files, but not the machine's token, the service's URLs or the agent's settings |
 | `TestFailuresReachTheService` | Script errors (retried up to the limit, or not), exiting without a result, a nonzero exit, the time limit |

@@ -843,6 +843,14 @@ impl Machine {
         self.service(id)
     }
 
+    /// Whether the `service.json` of service `id` lists an approval of
+    /// `hash`, whether or not it counts (spec/machine.md §1.2): what
+    /// [`revoke`](Self::revoke) would remove.
+    pub fn lists_approval(&self, id: &ServiceId, hash: &BundleHash) -> Result<bool, Error> {
+        let file = self.read_service_file(id)?;
+        Ok(file.approvals.iter().any(|a| a.hash == *hash))
+    }
+
     /// The bundle with this hash approved for a service, read from the
     /// service's folder and verified against the approval, or `None` if the
     /// service approves no such bundle. Fails if the approval doesn't

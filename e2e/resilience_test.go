@@ -38,7 +38,7 @@ func TestAJobSurvivesItsMachineCrashing(t *testing.T) {
 
 	m.Start()
 	awaitGone(t, "the processes the crash left behind", p.all()...)
-	m.Logged("cleaned up 1 attempts left over from a crash")
+	m.Logged("cleaned up 1 attempts left over from an earlier run")
 	if res := succeed(t, run); res.Attempt != 2 || res.Machine != m.ID() {
 		t.Errorf("the job succeeded on attempt %d on %s, want attempt 2 on %s", res.Attempt, res.Machine, m.ID())
 	}
