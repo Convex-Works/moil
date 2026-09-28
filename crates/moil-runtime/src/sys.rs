@@ -78,8 +78,37 @@ pub(crate) fn start_token(pid: i32) -> Option<String> {
     platform::start_token(pid)
 }
 
+/// A token that names the current boot of the computer and differs after
+/// every restart. `None` if the platform can't tell.
+pub(crate) fn boot_id() -> Option<String> {
+    platform::boot_id().filter(|id| !id.is_empty())
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
+    pub(super) fn boot_id() -> Option<String> {
+        let name = c"kern.bootsessionuuid";
+        let mut buffer = [0u8; 64];
+        let mut size = buffer.len();
+        // SAFETY: `name` is a C string, and `buffer` is valid for writes of
+        // `size` bytes, which sysctlbyname updates to what it wrote.
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        let text = buffer.get(..size)?;
+        let text = text.strip_suffix(&[0]).unwrap_or(text);
+        String::from_utf8(text.to_vec()).ok()
+    }
+
     pub(super) fn start_token(pid: i32) -> Option<String> {
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -108,6 +137,11 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
+    pub(super) fn boot_id() -> Option<String> {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(id.trim().to_owned())
+    }
+
     pub(super) fn start_token(pid: i32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // Field 2 is the command name in parentheses, which may itself hold
@@ -115,13 +149,16 @@ mod platform {
         // is the start time in clock ticks since boot.
         let rest = stat.get(stat.rfind(')')? + 2..)?;
         let ticks = rest.split(' ').nth(19)?;
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        Some(format!("{}:{ticks}", boot.trim()))
+        Some(format!("{}:{ticks}", boot_id()?))
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
+    pub(super) fn boot_id() -> Option<String> {
+        None
+    }
+
     pub(super) fn start_token(_pid: i32) -> Option<String> {
         None
     }
@@ -146,5 +183,12 @@ mod tests {
         child.wait().unwrap();
         // Its pid is either free or already someone else's.
         assert_ne!(start_token(child.id() as i32), Some(theirs));
+    }
+
+    #[test]
+    fn the_boot_is_named_the_same_until_a_restart() {
+        let boot = boot_id().expect("this platform names its boots");
+        assert!(boot.len() >= 16, "{boot:?}");
+        assert_eq!(boot_id(), Some(boot));
     }
 }

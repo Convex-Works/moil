@@ -63,6 +63,7 @@ impl Group {
             // process: the group is then treated like one whose leader is
             // gone.
             started: sys::start_token(self.pgid).unwrap_or_default(),
+            boot: sys::boot_id(),
         }
     }
 
@@ -120,6 +121,11 @@ impl Drop for Group {
 pub struct Process {
     pub(crate) pid: i32,
     pub(crate) started: String,
+    /// The boot the process ran in, if the platform can tell. A record
+    /// without one, such as one an earlier moil wrote, never leads to
+    /// killing anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot: Option<String>,
 }
 
 impl Process {
@@ -132,6 +138,7 @@ impl Process {
         Some(Self {
             pid,
             started: sys::start_token(pid)?,
+            boot: sys::boot_id(),
         })
     }
 
@@ -146,8 +153,17 @@ impl Process {
 
     /// Kills what's left of the process group this process led, as
     /// [`Group::leader`] names it: all of it if the leader still runs or is
-    /// gone, nothing if its pid now belongs to an unrelated process.
+    /// gone, nothing if its pid now belongs to an unrelated process. Kills
+    /// nothing either if the computer has restarted since, which ends every
+    /// group, or if it can't tell whether it has, or if the pid is one no
+    /// group of moil's can have.
     pub fn kill_group(&self) -> io::Result<()> {
+        // After a restart, a group with this ID is someone else's, even
+        // with its leader gone. Signalling group 0 or 1 would reach moil's
+        // own group or every process.
+        if self.pid <= 1 || self.boot.is_none() || self.boot != sys::boot_id() {
+            return Ok(());
+        }
         match sys::start_token(self.pid) {
             // The leader still runs: the group is certainly this one.
             Some(started) if started == self.started => sys::signal_group(self.pid, SIGKILL),
@@ -155,7 +171,8 @@ impl Process {
             Some(_) => Ok(()),
             // The leader is gone. The OS doesn't reuse a group ID while any
             // process is still in the group, so whatever is in it is left
-            // over from this one.
+            // over from this one, unless all of it ended and the ID went to
+            // a new group whose own leader has ended since too.
             None => sys::signal_group(self.pid, SIGKILL),
         }
     }
