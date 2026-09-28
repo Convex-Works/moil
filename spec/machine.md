@@ -134,15 +134,20 @@ approved for it:
 ```
 
 `machine_id` is the service's ID for this machine. The token that goes
-with it is kept in the keychain on macOS, and in `.machine/` elsewhere.
-It is never kept in the service's folder.
+with it is kept in the keychain on macOS, and in `.machine/` elsewhere,
+together with the base URL it was issued for. It is never kept in the
+service's folder.
 
 A service is **paired** on this machine when its folder has a
 `pairing.json` whose `base_url` is the one in `service.json`, and moil
-holds its token. A folder without them, such as one cloned from git, is a
-service the machine knows but isn't paired with. Pairing it (§3.2) keeps
-its approvals and hooks. moil sends a service's token only to the base URL
-it was paired with: if `service.json` names another, the service isn't
+holds a token issued for that URL. A folder without them, such as one
+cloned from git, is a service the machine knows but isn't paired with.
+Pairing it (§3.2) keeps its approvals and hooks.
+
+moil MUST send a token only to the base URL it was issued for, as the
+keychain (or `.machine/`) records it, whatever the service's files say:
+`pairing.json` and `service.json` are plain files, and a `git pull` can
+change both. If `service.json` names another URL, the service isn't
 paired, and moil reports it as a problem (§3.3). To move a service to
 another URL, pair with the new one.
 
@@ -256,12 +261,15 @@ end-of-file.
 
 The hook runs:
 
-- **In `output_dir`**, which it may change as it likes. moil deletes the
-  directory once the hook exits, so a hook that wants to keep an output
-  copies or moves it elsewhere.
+- **In an empty directory**, which is also its `TMPDIR`, and which moil
+  removes afterwards. The outputs are in `output_dir`, which the hook may
+  change as it likes; moil deletes it once the hook exits, so a hook that
+  wants to keep an output copies or moves it elsewhere. The outputs' names
+  come from the service, so moil doesn't run the hook among them, where a
+  file such as `uv.toml` could change what the hook runs.
 - **With only these environment variables:** `HOME`, `USER`, `LANG`
-  (moil's own, else `C.UTF-8`), `MOIL_HOME`; `TMPDIR`, a fresh directory that moil removes afterwards;
-  and `PATH`, which is `<home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+  (moil's own, else `C.UTF-8`), `MOIL_HOME`, `TMPDIR`, and `PATH`, which
+  is `<home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
   `.machine/bin` holds the `moil` and `uv` this machine runs, so a hook
   starting `#!/usr/bin/env -S uv run --script` can declare its Python
   dependencies inline, as a bundle does. A hook names anything else it
@@ -307,7 +315,7 @@ A hook is the owner's own code. moil doesn't ask anyone to approve it and
 doesn't sandbox it, and it can do whatever the owner can.
 
 Some of what a hook gets comes from the service: `title`, `params`,
-`meta`, `job_id`, and the contents of the outputs, which the approved
+`meta`, `job_id`, and the outputs' names and contents, which the approved
 bundle made from the service's inputs. A hook SHOULD treat them as
 untrusted. For example, it shouldn't build a file path from `title`
 without checking it, or hand the outputs to a program that acts on
