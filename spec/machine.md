@@ -171,12 +171,16 @@ make to `settings.json` or under `services/`, within five seconds, and
 apply them as if the owner had made them through moil:
 
 - An approval added or removed is announced to its service (protocol
-  §6.2). A removed approval stops a running attempt of its bundle, which
-  fails as `interrupted`. A new approval's bundle is prepared.
-- A service that becomes paired is connected. A service that is no longer
-  paired, or whose folder is gone, is disconnected, and moil deletes its
-  token. The service still lists the machine until the owner removes it
-  there. `moil unpair` tells the service.
+  §6.2). An approval that stops counting (§1.2), say because its bundle's
+  files were edited, is removed as far as the service can tell. A removed
+  approval stops a running attempt of its bundle, which fails as
+  `interrupted`. A new approval's bundle is prepared.
+- A service that becomes paired is connected, and one that is no longer
+  paired is disconnected. When its `pairing.json`, its `service.json` or
+  its whole folder is gone, moil also deletes its token; when its
+  `service.json` names another URL, moil keeps the token, so that putting
+  the URL back pairs it again. The service still lists the machine until
+  the owner removes it there. `moil unpair` tells the service.
 - A change to `paused` takes effect.
 
 When a file becomes unreadable or invalid, moil reports it as a problem
