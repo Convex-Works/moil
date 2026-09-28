@@ -114,7 +114,9 @@ fn write_service(service: &ServiceReport, out: &mut impl Write) -> io::Result<()
                 rfc3339::format(*retry_at)
             ),
             ConnectionReport::Unpaired => {
-                "unpaired: the service removed this machine; pair again".into()
+                "unpaired: the service removed this machine, or moil has no token for it; \
+                 pair again"
+                    .into()
             }
             ConnectionReport::Replaced => {
                 "replaced: another connection with this machine's token took over".into()

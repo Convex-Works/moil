@@ -210,18 +210,19 @@ pub(crate) fn read(home: &Home, id: &ServiceId) -> Folder {
             None
         }
     };
-    // The token was issued for the base URL the machine paired with, and
-    // is never sent anywhere else.
+    // Both files are plain files, which git can change, so neither says
+    // where the token goes: only the URL kept with the token does.
     let pairing = pairing.filter(|pairing| {
         let same = pairing.base_url == file.base_url;
         if !same {
             folder.problems.push(Problem {
                 path: relative.join("pairing.json"),
                 message: format!(
-                    "This machine paired with {}, but service.json names {}, so moil connects to \
-                     neither. To use {}, pair with it; to go back, set base_url in service.json \
-                     to {}.",
-                    pairing.base_url, file.base_url, file.base_url, pairing.base_url
+                    "This file names {}, but service.json names {}, so this machine isn't paired \
+                     with the service and moil doesn't connect to it. To use {}, pair with it \
+                     with `moil pair {id}`. moil sends this machine's token only to the address \
+                     it was issued for, whatever these files say.",
+                    pairing.base_url, file.base_url, file.base_url
                 ),
             });
         }

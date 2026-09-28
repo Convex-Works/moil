@@ -138,11 +138,29 @@ pub fn config(dir: &Path) -> MachineConfig {
 
 /// The tokens of the machine whose home is `dir`, by key.
 pub fn tokens(dir: &Path) -> std::collections::BTreeMap<String, String> {
-    match std::fs::read_to_string(Home::new(dir).secrets_file()) {
-        Ok(text) => serde_json::from_str(&text).unwrap(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-        Err(e) => panic!("{e}"),
-    }
+    issued_tokens(dir)
+        .into_iter()
+        .map(|(key, (_, token))| (key, token))
+        .collect()
+}
+
+/// The tokens of the machine whose home is `dir`, by key, each with the
+/// base URL it was issued for.
+pub fn issued_tokens(dir: &Path) -> std::collections::BTreeMap<String, (String, String)> {
+    let stored: std::collections::BTreeMap<String, String> =
+        match std::fs::read_to_string(Home::new(dir).secrets_file()) {
+            Ok(text) => serde_json::from_str(&text).unwrap(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => panic!("{e}"),
+        };
+    stored
+        .into_iter()
+        .map(|(key, value)| {
+            let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+            let field = |name: &str| value[name].as_str().unwrap().to_owned();
+            (key, (field("base_url"), field("token")))
+        })
+        .collect()
 }
 
 /// Pairs `machine` with `service`, the owner confirming at once.

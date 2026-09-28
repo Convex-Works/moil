@@ -8,8 +8,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use moil_agent::report::{AgentInfo, HookReport, Host, Problem, Status};
-use moil_agent::{Agent, AgentHandle, Connection, Home, Machine, Service, status};
+use moil_agent::report::{AgentInfo, ConnectionReport, HookReport, Host, Problem, Status};
+use moil_agent::{Agent, AgentHandle, Connection, Home, Machine, Service, ServiceId, status};
 use moil_bundle::Bundle;
 use moil_proto::{
     DeclineReason, ErrorCode, JobError, MachineMessage, MachineState, Outcome, ServiceMessage,
@@ -502,6 +502,72 @@ async fn a_service_pointed_elsewhere_is_disconnected_and_connected_again_once_po
     .await;
 }
 
+/// Points both of a service's files at `url`, as a `git pull` could: they
+/// are plain files, and whoever can push to the folder's repository can
+/// commit both.
+fn point_files_at(home: &Home, id: &ServiceId, url: &str) {
+    for file in [home.service_file(id), home.pairing_file(id)] {
+        edit_json(&file, |file| file["base_url"] = url.into());
+    }
+}
+
+/// The token goes only to the base URL it was issued for, whatever the
+/// home's files say (spec/machine.md §1.2).
+#[tokio::test]
+async fn files_pulled_from_git_never_send_the_token_elsewhere() {
+    let setup = Setup::new().await;
+    let mut conn = setup.connect().await;
+    let elsewhere = FakeService::start("klisi").await;
+    let id = setup.paired.id.clone();
+
+    point_files_at(&setup.home(), &id, &elsewhere.base_url);
+    assert_eq!(conn.closed().await, Some(1000));
+    snapshot_where(&setup.agent, "the service to need pairing again", |s| {
+        s.service(&id)
+            .is_some_and(|s| s.connection == Connection::Unpaired)
+    })
+    .await;
+    let status = setup.status().await;
+    assert_eq!(
+        status.services[0].connection,
+        Some(ConnectionReport::Unpaired)
+    );
+    let err = setup.agent.review(&id, setup.hash()).await.unwrap_err();
+    assert!(matches!(err, moil_agent::Error::NotPaired(_)), "{err}");
+
+    // Unpairing tells the service that issued the token, and only it.
+    setup.agent.unpair(&id).await.unwrap();
+    assert_eq!(setup.service.forgotten(), ["moil_token_1"]);
+    assert_eq!(elsewhere.presented(), [] as [String; 0]);
+    assert!(!elsewhere.has_pending_connection());
+}
+
+#[tokio::test]
+async fn files_pulled_from_git_while_moil_was_off_never_send_the_token_elsewhere() {
+    let setup = Setup::new().await;
+    within("the agent to shut down", setup.agent.shutdown()).await;
+    drop(setup.agent);
+    let elsewhere = FakeService::start("klisi").await;
+    let id = setup.paired.id.clone();
+    point_files_at(&Home::new(setup.dir.path()), &id, &elsewhere.base_url);
+
+    let (agent, _runs) = start(open_machine(setup.dir.path()));
+    snapshot_where(&agent, "the service to need pairing again", |s| {
+        s.service(&id)
+            .is_some_and(|s| s.connection == Connection::Unpaired)
+    })
+    .await;
+    assert_eq!(elsewhere.presented(), [] as [String; 0]);
+    assert!(!elsewhere.has_pending_connection());
+    assert!(!setup.service.has_pending_connection());
+
+    // Putting the files back pairs it again, with the token kept.
+    point_files_at(&Home::new(setup.dir.path()), &id, &setup.service.base_url);
+    let conn = setup.service.accept().await;
+    assert_eq!(conn.token, "moil_token_1");
+    assert_eq!(elsewhere.presented(), [] as [String; 0]);
+}
+
 #[tokio::test]
 async fn pausing_in_settings_json_takes_effect() {
     let setup = Setup::new().await;
@@ -673,7 +739,7 @@ async fn a_damaged_settings_json_is_a_problem_in_status_not_a_failure() {
 }
 
 #[tokio::test]
-async fn a_service_whose_token_is_gone_isnt_paired() {
+async fn a_service_whose_token_is_gone_is_to_be_paired_again() {
     let setup = Setup::new().await;
     let secrets = setup.home().secrets_file();
     within("the agent to shut down", setup.agent.shutdown()).await;
@@ -691,9 +757,12 @@ async fn a_service_whose_token_is_gone_isnt_paired() {
         host: Host::Agent,
         version: "test".into(),
     };
+    // `paired` is the files' word; the connection tells of the token
+    // (spec/machine.md §3.3).
     let status = status::from_agent(&agent, &info).await.unwrap();
-    assert!(!status.services[0].paired, "{status:?}");
-    // Without an agent, only the files are looked at.
+    let service = &status.services[0];
+    assert!(service.paired, "{status:?}");
+    assert_eq!(service.connection, Some(ConnectionReport::Unpaired));
     within("the agent to shut down", agent.shutdown()).await;
     let reader = Machine::open_read_only(config(setup.dir.path())).unwrap();
     assert!(status::from_home(&reader).unwrap().services[0].paired);

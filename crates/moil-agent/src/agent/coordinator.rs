@@ -783,22 +783,8 @@ impl Coordinator {
                 service.connection = Connection::Disconnected { error, retry_at };
             }
             LinkEvent::Unpaired => {
-                tracing::warn!(
-                    "{} removed this machine; pair it again",
-                    service.paired.name
-                );
                 service.link = None;
                 service.connection = Connection::Unpaired;
-                self.drop_attempts(id);
-            }
-            LinkEvent::NoToken => {
-                tracing::warn!(
-                    "moil has no token for {}, so it can't connect to it; pair with it again",
-                    service.paired.name
-                );
-                service.link = None;
-                service.connection = Connection::Unpaired;
-                self.tokenless.insert(id.clone());
                 self.drop_attempts(id);
             }
             LinkEvent::Replaced => {

@@ -148,7 +148,8 @@ pub enum ConnectionReport {
         #[serde(with = "crate::rfc3339")]
         retry_at: SystemTime,
     },
-    /// The service removed this machine: pair again.
+    /// Pair again: the service removed this machine, or moil has no token
+    /// for it.
     Unpaired,
     /// Another connection with this machine's token took over.
     Replaced,

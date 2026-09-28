@@ -441,8 +441,12 @@ async fn pairing_stores_the_service_and_its_token() {
     let machine = open_machine(dir.path());
     assert_eq!(machine.services().unwrap(), std::slice::from_ref(&paired));
     assert!(machine.is_paired(&paired).unwrap());
-    let tokens = tokens(dir.path());
-    assert_eq!(tokens.values().collect::<Vec<_>>(), ["moil_token_1"]);
+    let tokens = issued_tokens(dir.path());
+    assert_eq!(
+        tokens.values().collect::<Vec<_>>(),
+        [&(service.base_url.clone(), "moil_token_1".to_owned())],
+        "the token is kept with the URL it was issued for"
+    );
     for file in std::fs::read_dir(&folder).unwrap() {
         let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
         assert!(!text.contains("moil_token_1"), "{text}");
@@ -1276,6 +1280,78 @@ async fn a_pairing_for_another_base_url_doesnt_count() {
             .all(|token| new.tokens().contains(token))
     );
     assert!(machine.problems().is_empty(), "{:?}", machine.problems());
+}
+
+/// Points both of a service's files at `url`, as a `git pull` could, or
+/// a folder cloned in place of one that was deleted: they are plain files.
+fn point_files_at(machine: &Machine, service: &Service, url: &str) {
+    let home = machine.home();
+    for file in [
+        home.service_file(&service.id),
+        home.pairing_file(&service.id),
+    ] {
+        edit_json(&file, |file| file["base_url"] = url.into());
+    }
+}
+
+/// The token goes only to the base URL it was issued for, whatever the
+/// home's files say (spec/machine.md §1.2).
+#[tokio::test]
+async fn files_naming_another_url_never_get_the_token_sent_there() {
+    let klisi = FakeService::start("klisi").await;
+    let elsewhere = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    let paired = pair(&machine, &klisi).await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    klisi.host(&bundle);
+    elsewhere.host(&bundle);
+
+    point_files_at(&machine, &paired, &elsewhere.base_url);
+    let pointed = machine.service(&paired.id).unwrap();
+    assert!(pointed.pairing.is_some(), "the files agree with each other");
+    assert!(!machine.is_paired(&pointed).unwrap());
+    for err in [
+        machine.bundles(&paired.id).await.unwrap_err(),
+        machine.review(&paired.id, bundle.hash()).await.unwrap_err(),
+    ] {
+        assert!(matches!(err, Error::NotPaired(_)), "{err}");
+    }
+
+    // Unpairing tells the service that issued the token, and only it.
+    machine.unpair(&paired.id).await.unwrap();
+    assert_eq!(klisi.forgotten(), ["moil_token_1"]);
+    assert_eq!(elsewhere.presented(), [] as [String; 0]);
+    assert!(tokens(dir.path()).is_empty());
+}
+
+#[tokio::test]
+async fn pairing_again_tells_only_the_service_that_issued_the_old_token() {
+    let klisi = FakeService::start("klisi").await;
+    let elsewhere = FakeService::start("klisi").await;
+    let dir = tempfile::tempdir().unwrap();
+    let machine = open_machine(dir.path());
+    pair(&machine, &klisi).await;
+    // So that the token kept, moil_token_2, is one `elsewhere` never issues.
+    let paired = pair(&machine, &klisi).await;
+    until("klisi to forget the first token", || {
+        klisi.forgotten() == ["moil_token_1"]
+    })
+    .await;
+
+    point_files_at(&machine, &paired, &elsewhere.base_url);
+    let adopted = pair(&machine, &elsewhere).await;
+    assert_eq!(adopted.id, paired.id);
+    until("klisi to forget the token it issued", || {
+        klisi.forgotten() == ["moil_token_1", "moil_token_2"]
+    })
+    .await;
+    assert!(!elsewhere.presented().contains(&"moil_token_2".to_owned()));
+    assert_eq!(elsewhere.forgotten(), [] as [String; 0]);
+    assert_eq!(
+        issued_tokens(dir.path()).into_values().collect::<Vec<_>>(),
+        [(elsewhere.base_url.clone(), "moil_token_1".to_owned())]
+    );
 }
 
 #[tokio::test]

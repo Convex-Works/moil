@@ -208,11 +208,16 @@ impl PairingSession {
                 // Pairing again made the service a new machine record; the
                 // old one would otherwise linger there, offline forever.
                 // Nothing waits for the service to answer.
-                if let Some((paired_with, old_token)) = replaced {
+                if let Some(old) = replaced {
                     let machine = machine.clone();
-                    tokio::spawn(
-                        async move { machine.forget_token_on(&paired_with, &old_token).await },
-                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = machine.forget_token_on(&old).await {
+                            tracing::warn!(
+                                "couldn't tell {} to forget this machine's old token: {e}",
+                                old.base_url
+                            );
+                        }
+                    });
                 }
                 Ok(service)
             })
