@@ -174,7 +174,26 @@ impl AgentHandle {
     /// [`stopping`](JobStatus::stopping) until it has. The service may give
     /// it to another machine.
     pub fn stop_job(&self) {
-        self.send(Command::StopJob);
+        self.send(Command::StopJob(None));
+    }
+
+    /// Like [`stop_job`](Self::stop_job), and says which job it stopped,
+    /// once the snapshot shows it stopping: `None` if no job was running.
+    pub async fn stop_running_job(&self) -> Option<JobStatus> {
+        let (reply, stopped) = oneshot::channel();
+        self.send(Command::StopJob(Some(reply)));
+        stopped.await.ok().flatten()
+    }
+
+    /// Waits until the agent has carried out everything asked of it
+    /// before, such as [`set_paused`](Self::set_paused), and its snapshot
+    /// shows it.
+    pub async fn settled(&self) {
+        let (done, settled) = oneshot::channel();
+        // Fails only once the agent has shut down, when nothing is left to
+        // carry out.
+        let _ = self.inputs.send(Input::Reply(done));
+        let _ = settled.await;
     }
 
     /// Stops the running job, reports it, and closes every connection.
