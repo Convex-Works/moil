@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use moil_proto::http::{PairResponse, TokenRequest, TokenResponse, token_error};
 use url::Url;
 
-use crate::{Error, Machine, PairedService, net};
+use crate::{Error, Machine, Service, net};
 
 /// Called with the service once a pairing completes.
-pub(crate) type OnPaired = Box<dyn FnOnce(&PairedService) + Send + Sync>;
+pub(crate) type OnPaired = Box<dyn FnOnce(&Service) + Send + Sync>;
 
 /// Fails unless `page`, a confirmation page from the service at
 /// `base_url`, is a web page on the service's own origin, with no user
@@ -111,14 +111,16 @@ impl PairingSession {
     }
 
     /// Polls the service until the owner confirms or rejects the pairing, or
-    /// the code expires. On confirmation, stores the service and its token.
+    /// the code expires. On confirmation, records the pairing and its token,
+    /// in the folder of the service with this base URL if the home knows
+    /// one (keeping its approvals and hooks), else in a new one.
     ///
     /// Dropping the future abandons the pairing until the service has sent
     /// the token. From then on the pairing completes (the service and token
     /// are stored, and an agent pairing through
     /// [`AgentHandle::pair`](crate::AgentHandle::pair) connects) whether
     /// the future is polled to the end or not.
-    pub async fn wait(mut self) -> Result<PairedService, Error> {
+    pub async fn wait(mut self) -> Result<Service, Error> {
         loop {
             tokio::time::sleep(self.interval).await;
             if Instant::now() >= self.expires_at {
@@ -179,7 +181,7 @@ impl PairingSession {
         }
     }
 
-    async fn complete(self, granted: TokenResponse) -> Result<PairedService, Error> {
+    async fn complete(self, granted: TokenResponse) -> Result<Service, Error> {
         if !moil_proto::ids::is_machine_id(&granted.machine_id) {
             return Err(Error::Http(format!(
                 "{} gave this machine an invalid ID ({:?})",
@@ -206,10 +208,10 @@ impl PairingSession {
                 // Pairing again made the service a new machine record; the
                 // old one would otherwise linger there, offline forever.
                 // Nothing waits for the service to answer.
-                if let Some(old_token) = replaced {
+                if let Some((paired_with, old_token)) = replaced {
                     let machine = machine.clone();
                     tokio::spawn(
-                        async move { machine.forget_token_on(&base_url, &old_token).await },
+                        async move { machine.forget_token_on(&paired_with, &old_token).await },
                     );
                 }
                 Ok(service)

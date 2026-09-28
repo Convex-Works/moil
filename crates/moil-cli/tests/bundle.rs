@@ -426,7 +426,7 @@ fn ctrl_c_stops_the_job_and_cleans_up() {
 
     assert_eq!(status.code(), Some(130), "{seen}");
     assert!(seen.contains("failed: interrupted"), "{seen}");
-    let jobs: Vec<_> = std::fs::read_dir(home.join("jobs"))
+    let jobs: Vec<_> = std::fs::read_dir(home.join(".machine/jobs"))
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .filter(|name| !name.to_string_lossy().starts_with('.'))
@@ -457,5 +457,8 @@ fn keep_leaves_the_working_directory_for_debugging() {
         std::fs::read_to_string(kept.join("out/echo.txt")).unwrap(),
         "hello from moil\n"
     );
-    std::fs::remove_dir_all(kept.parent().unwrap().parent().unwrap()).unwrap();
+    // The run's temporary home: <home>/.machine/jobs/<attempt>.
+    let home = kept.ancestors().nth(3).unwrap();
+    assert!(home.join(".machine").is_dir(), "{}", kept.display());
+    std::fs::remove_dir_all(home).unwrap();
 }

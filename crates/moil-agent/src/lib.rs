@@ -1,7 +1,9 @@
 //! The machine side of moil.
 //!
-//! - [`Machine`] is this computer's moil state: settings, paired services,
-//!   approved bundles and tokens. The command line uses it directly.
+//! - [`Machine`] is this computer's moil state, kept in its [`Home`]:
+//!   settings, the services the home knows and this machine's pairings
+//!   with them, approved bundles and tokens. The command line uses it
+//!   directly.
 //! - [`Agent`] runs on top of a [`Machine`]: it keeps a control channel
 //!   open to every paired service, bids on offers, runs assigned attempts
 //!   through an [`Executor`](moil_runtime::Executor) and reports back. The
@@ -18,6 +20,7 @@ mod agent;
 pub mod control;
 pub mod display;
 mod error;
+mod folders;
 mod fs;
 mod hardware;
 pub mod home;
@@ -44,4 +47,4 @@ pub use review::Review;
 #[cfg(target_os = "macos")]
 pub use secrets::KeychainSecrets;
 pub use secrets::{FileSecrets, MemorySecrets, SecretStore, default_secrets};
-pub use services::{Approval, InvalidServiceId, PairedService, ServiceId};
+pub use services::{Approval, InvalidServiceId, Pairing, Service, ServiceId};

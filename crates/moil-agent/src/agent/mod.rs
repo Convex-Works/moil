@@ -18,7 +18,7 @@ use moil_runtime::Executor;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
 
-use crate::{Error, Machine, PairedService, PairingSession, Review, ServiceId};
+use crate::{Error, Machine, PairingSession, Review, Service, ServiceId};
 use coordinator::{Command, Coordinator, Input};
 
 /// Starts agents.
@@ -111,18 +111,22 @@ impl AgentHandle {
     }
 
     /// Like [`Machine::pair`]; once the pairing completes, the agent
-    /// connects to the new service (to the same one again, with the new
-    /// token, if it was paired before).
+    /// connects to the service (to the same one again, with the new token,
+    /// if it was paired before), ready to take the jobs of the bundles its
+    /// folder already approves.
     pub async fn pair(&self, base_url: &str) -> Result<PairingSession, Error> {
         let session = self.machine.pair(base_url).await?;
-        let inputs = self.inputs.clone();
-        Ok(session.on_paired(Box::new(move |service: &PairedService| {
-            let _ = inputs.send(Input::Command(Command::Paired(Box::new(service.clone()))));
+        let (machine, inputs) = (self.machine.clone(), self.inputs.clone());
+        Ok(session.on_paired(Box::new(move |service: &Service| {
+            // Called where reading the service's folder is fine.
+            let bundles = machine.approved_bundles(service);
+            let paired = Command::Paired(Box::new(service.clone()), bundles);
+            let _ = inputs.send(Input::Command(paired));
         })))
     }
 
-    /// Disconnects from a service and forgets it, stopping its running
-    /// attempt, if any.
+    /// Disconnects from a service and unpairs from it, stopping its running
+    /// attempt, if any. Its folder stays (spec/machine.md §3.2).
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
         let known = id.clone();
         self.machine

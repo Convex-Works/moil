@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use moil_bundle::{Bundle, PackageSource};
 use moil_proto::{FileName, JobEvent, JobId, LogLevel, Outcome, Phase, UrlPolicy};
-use moil_runtime::{Executor, Job, Runtime, RuntimeConfig, StopReason, Uv, stop_signal};
+use moil_runtime::{Executor, Job, Runtime, StopReason, Uv, stop_signal};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -371,10 +371,11 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("couldn't create {}", args.out_dir.display()))?;
 
-    // A throwaway home unless one is given. Bundles, environments and assets
-    // are kept by hash, and bundles and assets verified, so they can be kept
-    // between runs all the same: a bundle's environment is then reused, and
-    // big assets fetched once.
+    // A throwaway home unless one is given, in whose .machine/ the run
+    // keeps what the agent would. Bundles, environments and assets are kept
+    // by hash, and bundles and assets verified, so they can be kept between
+    // runs all the same: a bundle's environment is then reused, and big
+    // assets fetched once.
     let mut temporary = None;
     let home = match &globals.home {
         Some(home) => home.clone(),
@@ -383,7 +384,7 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
             temporary.insert(dir).path().to_owned()
         }
     };
-    let mut config = RuntimeConfig::new(uv()?.program().to_owned(), &home);
+    let mut config = moil_agent::Home::new(&home).runtime_config(uv()?.program().to_owned());
     if globals.home.is_none()
         && let Some(cache) = cache_dir()
     {

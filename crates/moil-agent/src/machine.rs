@@ -1,5 +1,6 @@
 //! This computer's moil state.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
@@ -10,15 +11,19 @@ use moil_bundle::Bundle;
 use moil_proto::BundleHash;
 use moil_proto::control::{BundleInfo, MachineInfo};
 use moil_proto::http::{BundleResponse, BundlesResponse, InfoResponse, PairRequest, PairResponse};
+use moil_proto::ids::is_bundle_name;
 use url::Url;
 
-use crate::fs::{PUBLIC, read_json, with_path, write_json};
+use crate::folders::{self, NotCounted};
+use crate::fs::{PUBLIC, read_strict_json, with_path, write_json};
 use crate::hardware::Hardware;
 use crate::net::{self, Net};
 use crate::pairing::check_confirmation_page;
-use crate::services;
+use crate::report::Problem;
+use crate::services::{self, ServiceFile};
 use crate::{
-    Approval, Error, Home, PairedService, PairingSession, Review, SecretStore, ServiceId, Settings,
+    Approval, Error, Home, Pairing, PairingSession, Review, SecretStore, Service, ServiceId,
+    Settings,
 };
 
 #[derive(Debug, Clone)]
@@ -29,9 +34,9 @@ pub struct MachineConfig {
     pub app_version: String,
 }
 
-/// This computer's moil state: settings, paired services, approvals and
-/// tokens. Opening it takes the home's lock, released when the last clone
-/// is dropped. Cheap to clone.
+/// This computer's moil state: settings, the services its home knows and
+/// its pairings with them, approvals and tokens. Opening it takes the
+/// home's lock, released when the last clone is dropped. Cheap to clone.
 ///
 /// While an [`Agent`](crate::Agent) runs on a machine, pair, unpair,
 /// approve and revoke through its [`AgentHandle`](crate::AgentHandle),
@@ -47,7 +52,7 @@ struct Inner {
     secrets: Arc<dyn SecretStore>,
     app_version: String,
     settings: Mutex<Settings>,
-    /// Held while a service's file is read, changed and written back.
+    /// Held while a service's files are read, changed and written back.
     services: Mutex<()>,
     net: Net,
     /// Makes token keys unique to this home: the keychain is shared by
@@ -68,9 +73,10 @@ impl fmt::Debug for Inner {
 }
 
 /// This computer's moil state, opened without taking the home's lock, for
-/// looking at while an agent runs: the paired services, and the bundles
-/// they offer. It changes nothing, and reads each file afresh, so it sees
-/// what the agent has written. Cheap to clone.
+/// looking at while an agent runs: the services the home knows, what's
+/// wrong with it, and the bundles services offer. It changes nothing, and
+/// reads each file afresh, so it sees what the agent has written. Cheap to
+/// clone.
 #[derive(Debug, Clone)]
 pub struct ReadOnlyMachine(Machine);
 
@@ -79,14 +85,36 @@ impl ReadOnlyMachine {
         self.0.home()
     }
 
+    /// The settings as they were when the machine was opened: the
+    /// defaults if `settings.json` isn't valid, which is then one of the
+    /// [`problems`](Self::problems).
+    pub fn settings(&self) -> Settings {
+        self.0.settings()
+    }
+
     /// Like [`Machine::services`].
-    pub fn services(&self) -> Result<Vec<PairedService>, Error> {
+    pub fn services(&self) -> Result<Vec<Service>, Error> {
         self.0.services()
     }
 
+    /// Like [`Machine::service`].
+    pub fn service(&self, id: &ServiceId) -> Result<Service, Error> {
+        self.0.service(id)
+    }
+
     /// Like [`Machine::find_service`].
-    pub fn find_service(&self, query: &str) -> Result<PairedService, Error> {
+    pub fn find_service(&self, query: &str) -> Result<Service, Error> {
         self.0.find_service(query)
+    }
+
+    /// Like [`Machine::is_paired`].
+    pub fn is_paired(&self, service: &Service) -> Result<bool, Error> {
+        self.0.is_paired(service)
+    }
+
+    /// Like [`Machine::problems`].
+    pub fn problems(&self) -> Vec<Problem> {
+        self.0.problems()
     }
 
     /// Like [`Machine::bundles`].
@@ -102,7 +130,9 @@ impl ReadOnlyMachine {
 
 /// A paired service and the token that proves this machine to it.
 struct Credentials {
-    service: PairedService,
+    service: Service,
+    /// The base URL the token was issued for: the only one it goes to.
+    base_url: Url,
     token: String,
 }
 
@@ -119,27 +149,46 @@ fn bounded(text: &str) -> String {
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Machine {
-    /// Opens the machine's home, creating it if needed. Fails with
-    /// [`Error::AlreadyRunning`] if another process has it open.
+    /// Opens the machine's home, creating it if needed, and writes what
+    /// the home's readers go by (`README.md` and the `.gitignore` files).
+    /// Fails with [`Error::AlreadyRunning`] if another process has it open,
+    /// and with [`Error::Invalid`] if `settings.json` isn't valid: a guess
+    /// could take jobs the owner meant to pause (spec/machine.md §1.1).
     pub fn open(config: MachineConfig) -> Result<Self, Error> {
         let lock = config.home.lock()?;
-        Self::with_lock(config, Some(lock))
+        let settings = config.home.load_settings()?;
+        let machine = Self::with_lock(config, settings, Some(lock))?;
+        // Nothing moil does depends on them.
+        if let Err(e) = machine.inner.home.write_guides() {
+            tracing::warn!("couldn't write the home's README.md and .gitignore files: {e}");
+        }
+        machine.prune_bundle_store();
+        Ok(machine)
     }
 
     /// Opens the machine's home to read it, even while another process has
-    /// it open. Nothing is created or changed.
+    /// it open. Nothing is created or changed. An invalid `settings.json`
+    /// reads as the defaults, and is one of the
+    /// [`problems`](ReadOnlyMachine::problems).
     pub fn open_read_only(config: MachineConfig) -> Result<ReadOnlyMachine, Error> {
-        Self::with_lock(config, None).map(ReadOnlyMachine)
+        let settings = config.home.load_settings().unwrap_or_else(|e| {
+            tracing::warn!("reading the home with the default settings: {e}");
+            Settings::default()
+        });
+        Self::with_lock(config, settings, None).map(ReadOnlyMachine)
     }
 
-    fn with_lock(config: MachineConfig, lock: Option<File>) -> Result<Self, Error> {
+    fn with_lock(
+        config: MachineConfig,
+        settings: Settings,
+        lock: Option<File>,
+    ) -> Result<Self, Error> {
         let MachineConfig {
             home,
             secrets,
             app_version,
         } = config;
         let app_version = bounded(&app_version);
-        let settings = home.load_settings()?;
         let token_scope = match home.root().canonicalize() {
             Ok(root) => root.display().to_string(),
             // A home that doesn't exist yet has no tokens to find.
@@ -234,44 +283,28 @@ impl Machine {
         bounded(name.trim())
     }
 
-    /// Every paired service, by ID.
-    pub fn services(&self) -> Result<Vec<PairedService>, Error> {
-        let dir = self.inner.home.services_dir();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(with_path(e, &dir).into()),
-        };
-        let mut services = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(|e| with_path(e, &dir))?.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if name.starts_with('.') || !name.ends_with(".json") {
-                continue;
-            }
-            match read_json::<PairedService>(&path) {
-                Ok(Some(service)) => services.push(service),
-                Ok(None) => {}
-                // One damaged file shouldn't cut the machine off from every
-                // other service.
-                Err(e) => tracing::warn!("skipping a service: {e}"),
+    /// Every service the home knows, paired or not, by ID. Folders moil
+    /// can't make sense of are left out; they are among the
+    /// [`problems`](Self::problems).
+    pub fn services(&self) -> Result<Vec<Service>, Error> {
+        Ok(folders::scan(&self.inner.home)?.services)
+    }
+
+    /// The service with this ID. Fails with [`Error::Invalid`] if its
+    /// `service.json` isn't valid.
+    pub fn service(&self, id: &ServiceId) -> Result<Service, Error> {
+        match folders::read(&self.inner.home, id).service {
+            Some(service) => Ok(service),
+            None => {
+                // Says what's wrong, if the file is there.
+                self.read_service_file(id)?;
+                Err(Error::UnknownService(id.to_string()))
             }
         }
-        services.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(services)
     }
 
-    /// The paired service with this ID.
-    pub fn service(&self, id: &ServiceId) -> Result<PairedService, Error> {
-        read_json(&self.inner.home.service_file(id))?
-            .ok_or_else(|| Error::UnknownService(id.to_string()))
-    }
-
-    /// The paired service `query` names: its ID, host, base URL or name.
-    pub fn find_service(&self, query: &str) -> Result<PairedService, Error> {
+    /// The service `query` names: its ID, host, base URL or name.
+    pub fn find_service(&self, query: &str) -> Result<Service, Error> {
         let query = query.trim();
         let services = self.services()?;
         if let Some(service) = services.iter().find(|s| s.id.as_str() == query) {
@@ -281,7 +314,7 @@ impl Machine {
             .contains("://")
             .then(|| services::parse_base_url(query).ok())
             .flatten();
-        let matches: Vec<&PairedService> = services
+        let matches: Vec<&Service> = services
             .iter()
             .filter(|s| {
                 let host = s.base_url.host_str().unwrap_or_default();
@@ -307,6 +340,46 @@ impl Machine {
                     .join(", "),
             }),
         }
+    }
+
+    /// Whether this machine is paired with `service` (spec/machine.md
+    /// §1.2): its `pairing.json` names the base URL in its `service.json`,
+    /// and moil holds its token. Reads the token's store, which may be the
+    /// keychain.
+    pub fn is_paired(&self, service: &Service) -> Result<bool, Error> {
+        Ok(service.pairing.is_some() && self.token(&service.id)?.is_some())
+    }
+
+    /// What's wrong with the home, for the owner to fix: files that aren't
+    /// valid, pairings that don't match their service, approvals that
+    /// don't count, and whatever else moil ignores. Paths are relative to
+    /// the home. Whether moil holds each paired service's token isn't
+    /// checked: see [`is_paired`](Self::is_paired).
+    pub fn problems(&self) -> Vec<Problem> {
+        let home = &self.inner.home;
+        let mut problems = Vec::new();
+        match home.load_settings() {
+            Ok(_) => {}
+            Err(Error::Invalid { reason, .. }) => problems.push(Problem {
+                path: "settings.json".into(),
+                message: format!(
+                    "This file isn't valid ({reason}), and moil won't start until it is. Fix it, \
+                     or remove it to go back to the defaults."
+                ),
+            }),
+            Err(e) => problems.push(Problem {
+                path: "settings.json".into(),
+                message: format!("moil can't read this file ({e})."),
+            }),
+        }
+        match folders::scan(home) {
+            Ok(scan) => problems.extend(scan.problems),
+            Err(e) => problems.push(Problem {
+                path: "services".into(),
+                message: format!("moil can't read this folder ({e})."),
+            }),
+        }
+        problems
     }
 
     /// Starts pairing with the service at `base_url`, after checking that it
@@ -374,73 +447,114 @@ impl Machine {
         ))
     }
 
-    /// Records a confirmed pairing: stores the token and the service. Pairing
-    /// a base URL again keeps its ID and approvals and replaces its token,
-    /// which is returned so the caller can let the service forget it.
+    /// Records a confirmed pairing: stores the token and `pairing.json`.
+    /// Pairing with a base URL that a folder's `service.json` names adopts
+    /// that folder, paired or not, keeping its approvals and hooks; else
+    /// the service gets a new folder, under an ID no folder uses. Returns
+    /// the service, and the token the new one replaced with the base URL it
+    /// was issued for, so that the caller can let that service forget it.
     pub(crate) fn record_pairing(
         &self,
         base_url: &Url,
         name: String,
         machine_id: String,
         token: &str,
-    ) -> Result<(PairedService, Option<String>), Error> {
+    ) -> Result<(Service, Option<(Url, String)>), Error> {
         let _services = self.lock_services();
-        let services = self.services()?;
-        let existing = services.iter().find(|s| s.base_url == *base_url);
-        let (id, approvals, old_token) = match existing {
-            Some(service) => (
-                service.id.clone(),
-                service.approvals.clone(),
-                self.token(&service.id)?,
-            ),
+        let home = &self.inner.home;
+        // A folder this machine is paired through comes first, then the
+        // first by ID.
+        let adopted = self
+            .services()?
+            .into_iter()
+            .filter(|s| s.base_url == *base_url)
+            .min_by_key(|s| s.pairing.is_none());
+        let (id, mut file) = match adopted {
+            Some(service) => {
+                let file = self.read_service_file(&service.id)?;
+                (service.id, file)
+            }
             None => {
-                let taken = |id: &str| services.iter().any(|s| s.id.as_str() == id);
-                (ServiceId::derive(base_url, taken), Vec::new(), None)
+                let taken = self.folder_names()?;
+                let id = ServiceId::derive(base_url, |id| taken.contains(id));
+                let file = ServiceFile {
+                    base_url: base_url.clone(),
+                    name: name.clone(),
+                    approvals: Vec::new(),
+                };
+                self.save_service_file(&id, &file)?;
+                (id, file)
             }
         };
+        if let Err(e) = home.write_service_gitignore(&id) {
+            tracing::warn!("couldn't write {id}'s .gitignore: {e}");
+        }
+        if file.name != name {
+            file.name = name;
+            self.save_service_file(&id, &file)?;
+        }
+
+        // The token this one replaces goes back only to where it was
+        // issued, if that's known.
+        let paired_with = read_strict_json::<Pairing>(&home.pairing_file(&id))
+            .ok()
+            .flatten()
+            .map(|pairing| pairing.base_url);
+        let replaced = match (self.token(&id)?, paired_with) {
+            (Some(old), Some(url)) if old != token || url != *base_url => Some((url, old)),
+            _ => None,
+        };
         self.inner.secrets.set(&self.token_key(&id), token)?;
-        let service = PairedService {
-            id,
+        let pairing = Pairing {
             base_url: base_url.clone(),
-            name,
             machine_id,
             paired_at: crate::rfc3339::now(),
-            approvals,
         };
-        self.save_service(&service)?;
-        Ok((service, old_token.filter(|old| old != token)))
+        write_json(&home.pairing_file(&id), &pairing, PUBLIC)?;
+        Ok((self.service(&id)?, replaced))
     }
 
-    /// Forgets a service: tells it to remove this machine
-    /// (`DELETE /v1/machine`, best effort), then deletes its token and
-    /// approvals here.
+    /// Unpairs from a service (spec/machine.md §3.2): tells it to remove
+    /// this machine (`DELETE /v1/machine`, best effort, and only at the
+    /// base URL the machine paired with), then deletes the token and
+    /// `pairing.json`. The folder stays, with its approvals and hooks.
     pub async fn unpair(&self, id: &ServiceId) -> Result<(), Error> {
         let found = id.clone();
-        let (service, token) = self
-            .blocking(move |machine| Ok((machine.service(&found)?, machine.token(&found)?)))
+        let (pairing, token) = self
+            .blocking(move |machine| {
+                let home = &machine.inner.home;
+                let pairing_file = home.pairing_file(&found);
+                let pairing = read_strict_json::<Pairing>(&pairing_file).ok().flatten();
+                let token = machine.token(&found)?;
+                if !pairing_file.exists() && token.is_none() {
+                    return Err(match home.service_dir(&found).is_dir() {
+                        true => Error::NotPaired(found),
+                        false => Error::UnknownService(found.to_string()),
+                    });
+                }
+                Ok((pairing, token))
+            })
             .await?;
-        if let Some(token) = token {
-            self.forget_token_on(&service.base_url, &token).await;
+        if let (Some(pairing), Some(token)) = (pairing, token) {
+            self.forget_token_on(&pairing.base_url, &token).await;
         }
         let id = id.clone();
-        self.blocking(move |machine| machine.forget(&id, &service))
-            .await
+        self.blocking(move |machine| machine.forget(&id)).await
     }
 
-    /// Deletes a service's token and approvals here.
-    fn forget(&self, id: &ServiceId, service: &PairedService) -> Result<(), Error> {
+    /// Deletes this machine's pairing with a service: its token and
+    /// `pairing.json`.
+    fn forget(&self, id: &ServiceId) -> Result<(), Error> {
         let _services = self.lock_services();
         self.inner.secrets.delete(&self.token_key(id))?;
-        let path = self.inner.home.service_file(id);
+        let path = self.inner.home.pairing_file(id);
         match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(with_path(e, &path).into());
             }
             _ => {}
         }
-        for approval in &service.approvals {
-            self.drop_unused_bundle(&approval.hash)?;
-        }
+        self.prune_bundle_store();
         Ok(())
     }
 
@@ -500,75 +614,152 @@ impl Machine {
 
     /// The most recently approved bundle from `service` with `bundle`'s
     /// name, other than `bundle` itself.
-    fn previous_version(&self, service: &PairedService, bundle: &Bundle) -> Option<Bundle> {
-        let store = self.inner.home.bundles();
+    fn previous_version(&self, service: &Service, bundle: &Bundle) -> Option<Bundle> {
         service
             .approvals
             .iter()
             .rev()
             .filter(|a| a.name == bundle.manifest().name && a.hash != bundle.hash())
-            .find_map(|a| match store.get(&a.hash) {
-                Ok(stored) => stored,
+            .find_map(|a| match folders::check(&self.inner.home, &service.id, a) {
+                Ok(approved) => Some(approved),
                 Err(e) => {
-                    tracing::warn!("the stored copy of {} is damaged: {e}", a.hash);
+                    tracing::warn!("the approved copy of {} is damaged: {e}", a.hash);
                     None
                 }
             })
     }
 
-    /// Approves exactly the reviewed bundle for the reviewed service and
-    /// stores it.
-    pub fn approve(&self, review: &Review) -> Result<PairedService, Error> {
+    /// Approves exactly the reviewed bundle for the reviewed service: writes
+    /// its three files, read-only, into the service's folder, and adds the
+    /// approval to `service.json`. Approving a bundle again restores its
+    /// files if they changed.
+    pub fn approve(&self, review: &Review) -> Result<Service, Error> {
         let _services = self.lock_services();
-        let mut service = self.service(&review.service.id)?;
-        if service.base_url != review.service.base_url {
+        let id = &review.service.id;
+        let mut file = self.read_service_file(id)?;
+        if file.base_url != review.service.base_url {
             return Err(Error::UnknownService(format!(
-                "{} at {}",
-                review.service.id, review.service.base_url
+                "{id} at {}",
+                review.service.base_url
             )));
         }
         let bundle = &review.bundle;
-        self.inner
+        let manifest = bundle.manifest();
+        let dir = self
+            .inner
             .home
-            .bundles()
-            .put(bundle)
-            .map_err(|e| with_path(e, &self.inner.home.bundles().dir(&bundle.hash())))?;
-        if !service.is_approved(&bundle.hash()) {
-            service.approvals.push(Approval {
-                hash: bundle.hash(),
-                name: bundle.manifest().name.clone(),
-                version: bundle.manifest().version.clone(),
-                approved_at: crate::rfc3339::now(),
-            });
-            self.save_service(&service)?;
+            .approved_bundle_dir(id, &manifest.name, &bundle.hash());
+        folders::write_bundle(&dir, bundle).map_err(|e| with_path(e, &dir))?;
+        let approval = Approval {
+            hash: bundle.hash(),
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            approved_at: crate::rfc3339::now(),
+        };
+        let existing = file.approvals.iter_mut().find(|a| a.hash == approval.hash);
+        let changed = match existing {
+            Some(existing)
+                if (&existing.name, &existing.version) == (&approval.name, &approval.version) =>
+            {
+                false
+            }
+            // It named the bundle wrongly, so it didn't count.
+            Some(existing) => {
+                *existing = approval;
+                true
+            }
+            None => {
+                file.approvals.push(approval);
+                true
+            }
+        };
+        if changed {
+            self.save_service_file(id, &file)?;
         }
-        Ok(service)
+        self.service(id)
     }
 
-    /// Withdraws an approval. The stored copy of the bundle is deleted once
-    /// no service's approval needs it. Revoking a bundle that isn't approved
-    /// changes nothing.
-    pub fn revoke(&self, id: &ServiceId, hash: BundleHash) -> Result<PairedService, Error> {
+    /// Withdraws an approval: removes it from `service.json`, and the
+    /// bundle's files from the service's folder. The runtime's copy goes
+    /// once no paired service approves the bundle. Revoking a bundle that
+    /// isn't approved changes nothing.
+    pub fn revoke(&self, id: &ServiceId, hash: BundleHash) -> Result<Service, Error> {
         let _services = self.lock_services();
-        let mut service = self.service(id)?;
-        if service.is_approved(&hash) {
-            service.approvals.retain(|a| a.hash != hash);
-            self.save_service(&service)?;
-            self.drop_unused_bundle(&hash)?;
+        let mut file = self.read_service_file(id)?;
+        let (revoked, kept) = std::mem::take(&mut file.approvals)
+            .into_iter()
+            .partition::<Vec<_>, _>(|a| a.hash == hash);
+        file.approvals = kept;
+        if !revoked.is_empty() {
+            self.save_service_file(id, &file)?;
+            for approval in revoked.iter().filter(|a| is_bundle_name(&a.name)) {
+                let dir = self
+                    .inner
+                    .home
+                    .approved_bundle_dir(id, &approval.name, &hash);
+                folders::remove_bundle(&dir).map_err(|e| with_path(e, &dir))?;
+                if let Some(name_dir) = dir.parent() {
+                    folders::remove_if_empty(name_dir);
+                }
+            }
+            self.prune_bundle_store();
         }
-        Ok(service)
+        self.service(id)
     }
 
-    /// The stored copy of a bundle approved for a service, verified.
+    /// The bundle with this hash approved for a service, read from the
+    /// service's folder and verified against the approval, or `None` if the
+    /// service approves no such bundle. Fails if the approval doesn't
+    /// count (spec/machine.md §1.2).
     pub fn approved_bundle(
         &self,
         id: &ServiceId,
         hash: BundleHash,
     ) -> Result<Option<Bundle>, Error> {
-        if !self.service(id)?.is_approved(&hash) {
+        let file = self.read_service_file(id)?;
+        let Some(approval) = file.approvals.iter().find(|a| a.hash == hash) else {
             return Ok(None);
+        };
+        match folders::check(&self.inner.home, id, approval) {
+            Ok(bundle) => Ok(Some(bundle)),
+            Err(NotCounted::Invalid(e)) => Err(Error::BundleLoad(e)),
+            Err(why) => Err(Error::Damaged {
+                path: match is_bundle_name(&approval.name) {
+                    true => self
+                        .inner
+                        .home
+                        .approved_bundle_dir(id, &approval.name, &hash),
+                    false => self.inner.home.service_file(id),
+                },
+                reason: why.to_string(),
+            }),
         }
-        Ok(self.inner.home.bundles().get(&hash)?)
+    }
+
+    /// Verified copies of the bundles approved for `service` that it is
+    /// told about ([`Service::approved_hashes`]), read from its folder. A
+    /// copy that fails verification is left out and logged, so that the
+    /// machine declines its jobs.
+    pub(crate) fn approved_bundles(&self, service: &Service) -> Vec<Bundle> {
+        let announced: HashSet<BundleHash> = service.approved_hashes().into_iter().collect();
+        service
+            .approvals
+            .iter()
+            .filter(|a| announced.contains(&a.hash))
+            .filter_map(
+                |approval| match folders::check(&self.inner.home, &service.id, approval) {
+                    Ok(bundle) => Some(bundle),
+                    Err(why) => {
+                        tracing::error!(
+                            "{} doesn't take jobs for bundle {} ({why}); approve it again to take them",
+                            service.id,
+                            approval.hash
+                        );
+                        None
+                    }
+                },
+            )
+            .collect()
     }
 
     /// The machine token for a service, if it has one.
@@ -608,33 +799,71 @@ impl Machine {
         }
     }
 
-    /// Service `id` and this machine's token for it.
+    /// Service `id`, if this machine is paired with it, and its token.
     async fn credentials(&self, id: &ServiceId) -> Result<Credentials, Error> {
         let id = id.clone();
         self.blocking(move |machine| {
             let service = machine.service(&id)?;
-            let token = machine.token(&id)?.ok_or(Error::Unauthorized)?;
-            Ok(Credentials { service, token })
+            let not_paired = || Error::NotPaired(id.clone());
+            let base_url = service
+                .pairing
+                .as_ref()
+                .ok_or_else(not_paired)?
+                .base_url
+                .clone();
+            let token = machine.token(&id)?.ok_or_else(not_paired)?;
+            Ok(Credentials {
+                service,
+                base_url,
+                token,
+            })
         })
         .await
     }
 
     /// `GET`s a machine-authenticated endpoint of a service.
     async fn get(&self, to: &Credentials, path: &str) -> Result<reqwest::Response, Error> {
-        let service = &to.service;
-        self.check_url(&service.base_url)?;
-        let url = net::endpoint(&service.base_url, path);
+        self.check_url(&to.base_url)?;
+        let url = net::endpoint(&to.base_url, path);
         self.net()
             .http
             .get(&url)
             .bearer_auth(&to.token)
             .send()
             .await
-            .map_err(|e| net::unreachable(service.base_url.as_str(), &e))
+            .map_err(|e| net::unreachable(to.base_url.as_str(), &e))
     }
 
-    fn save_service(&self, service: &PairedService) -> Result<(), Error> {
-        write_json(&self.inner.home.service_file(&service.id), service, PUBLIC)
+    /// A service's `service.json` as it is, approvals that don't count
+    /// included.
+    fn read_service_file(&self, id: &ServiceId) -> Result<ServiceFile, Error> {
+        let path = self.inner.home.service_file(id);
+        let file = read_strict_json::<ServiceFile>(&path)?
+            .ok_or_else(|| Error::UnknownService(id.to_string()))?;
+        file.check()
+            .map_err(|reason| Error::Invalid { path, reason })?;
+        Ok(file)
+    }
+
+    fn save_service_file(&self, id: &ServiceId, file: &ServiceFile) -> Result<(), Error> {
+        write_json(&self.inner.home.service_file(id), file, PUBLIC)
+    }
+
+    /// The names in `services/`, lowercased: IDs that a new service can't
+    /// take, even on a file system that ignores case.
+    fn folder_names(&self) -> Result<HashSet<String>, Error> {
+        let dir = self.inner.home.services_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(e) => return Err(with_path(e, &dir).into()),
+        };
+        let mut names = HashSet::new();
+        for entry in entries {
+            let name = entry.map_err(|e| with_path(e, &dir))?.file_name();
+            names.insert(name.to_string_lossy().to_lowercase());
+        }
+        Ok(names)
     }
 
     fn lock_services(&self) -> MutexGuard<'_, ()> {
@@ -644,15 +873,42 @@ impl Machine {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Deletes a stored bundle unless some service still approves it.
-    fn drop_unused_bundle(&self, hash: &BundleHash) -> Result<(), Error> {
-        if !self.services()?.iter().any(|s| s.is_approved(hash)) {
-            let store = self.inner.home.bundles();
-            store
-                .remove(hash)
-                .map_err(|e| with_path(e, &store.dir(hash)))?;
+    /// Removes from the runtime's store the bundles that no paired service
+    /// approves, so that it holds only what may run; the runtime then
+    /// removes their environments. Best effort: what it can't remove is
+    /// logged, and left for next time.
+    fn prune_bundle_store(&self) {
+        let keep: HashSet<BundleHash> = match self.services() {
+            Ok(services) => services
+                .iter()
+                .filter(|s| s.pairing.is_some())
+                .flat_map(|s| s.approvals.iter().map(|a| a.hash))
+                .collect(),
+            Err(e) => {
+                tracing::warn!("couldn't tell which stored bundles are still approved: {e}");
+                return;
+            }
+        };
+        let store = self.inner.home.bundle_store();
+        let entries = match std::fs::read_dir(store.root()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!("couldn't look through {}: {e}", store.root().display());
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(hash) = name.to_str().and_then(|n| n.parse::<BundleHash>().ok()) else {
+                continue;
+            };
+            if !keep.contains(&hash)
+                && let Err(e) = store.remove(&hash)
+            {
+                tracing::warn!("couldn't remove {}: {e}", store.dir(&hash).display());
+            }
         }
-        Ok(())
     }
 }
 

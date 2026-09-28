@@ -19,8 +19,8 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use moil_agent::services::parse_base_url;
 use moil_agent::{
-    Approval, BundleStatus, Connection, Error, JobOutcome, JobReport, JobStatus, PairedService,
-    Review, ServiceId, ServiceStatus, Snapshot,
+    Approval, BundleStatus, Connection, Error, JobOutcome, JobReport, JobStatus, Review, Service,
+    ServiceId, ServiceStatus, Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::{BundleHash, BundleInfo, ErrorCode, JobId, Phase, UrlPolicy};
@@ -98,7 +98,7 @@ pub struct Demo(Arc<State>);
 struct State {
     snapshot: watch::Sender<Snapshot>,
     /// What the demo's owner paired with and approved.
-    paired: Mutex<Vec<PairedService>>,
+    paired: Mutex<Vec<Service>>,
     /// Set to stop the running job.
     stop: watch::Sender<bool>,
     /// The bundle the running job runs.
@@ -119,22 +119,28 @@ impl Demo {
             approved_at: days_ago(days),
         };
         let klisi_url: Url = "https://klisi.example.com/moil".parse().expect("a URL");
-        let klisi = PairedService {
+        let klisi = Service {
             id: ServiceId::derive(&klisi_url, |_| false),
-            base_url: klisi_url,
+            base_url: klisi_url.clone(),
             name: "klisi".into(),
-            machine_id: "m_7Hq2Xk9Lw3".into(),
-            paired_at: days_ago(64),
             approvals: vec![approval(&v2, 23)],
+            pairing: Some(moil_agent::Pairing {
+                base_url: klisi_url,
+                machine_id: "m_7Hq2Xk9Lw3".into(),
+                paired_at: days_ago(64),
+            }),
         };
         let lab_url: Url = "https://lab.example.org/moil".parse().expect("a URL");
-        let lab = PairedService {
+        let lab = Service {
             id: ServiceId::derive(&lab_url, |_| false),
-            base_url: lab_url,
+            base_url: lab_url.clone(),
             name: "lab".into(),
-            machine_id: "m_Qe2wBv0V8i".into(),
-            paired_at: days_ago(9),
             approvals: vec![approval(&minimal, 9)],
+            pairing: Some(moil_agent::Pairing {
+                base_url: lab_url,
+                machine_id: "m_Qe2wBv0V8i".into(),
+                paired_at: days_ago(9),
+            }),
         };
         let snapshot = Snapshot {
             paused: false,
@@ -313,7 +319,7 @@ impl State {
         found
     }
 
-    fn service(&self, id: &ServiceId) -> Result<PairedService> {
+    fn service(&self, id: &ServiceId) -> Result<Service> {
         let paired = self.paired.lock().expect("the demo's state");
         paired
             .iter()
@@ -349,15 +355,18 @@ impl State {
         });
     }
 
-    fn add_service(&self, url: &Url, name: &str) -> PairedService {
+    fn add_service(&self, url: &Url, name: &str) -> Service {
         let mut paired = self.paired.lock().expect("the demo's state");
-        let service = PairedService {
+        let service = Service {
             id: ServiceId::derive(url, |id| paired.iter().any(|s| s.id.as_str() == id)),
             base_url: url.clone(),
             name: name.to_owned(),
-            machine_id: "m_demo".into(),
-            paired_at: SystemTime::now(),
             approvals: Vec::new(),
+            pairing: Some(moil_agent::Pairing {
+                base_url: url.clone(),
+                machine_id: "m_demo".into(),
+                paired_at: SystemTime::now(),
+            }),
         };
         paired.push(service.clone());
         self.update(|s| {
@@ -430,11 +439,7 @@ impl State {
         self.update(|s| s.services.retain(|s| s.id != *id));
     }
 
-    fn change_service(
-        &self,
-        id: &ServiceId,
-        change: impl FnOnce(&mut PairedService),
-    ) -> Result<()> {
+    fn change_service(&self, id: &ServiceId, change: impl FnOnce(&mut Service)) -> Result<()> {
         let mut paired = self.paired.lock().expect("the demo's state");
         let service = paired
             .iter_mut()
@@ -446,7 +451,7 @@ impl State {
 }
 
 /// A service as the snapshot shows it, offering `bundles`.
-fn status(service: &PairedService, connection: Connection, bundles: &[&Bundle]) -> ServiceStatus {
+fn status(service: &Service, connection: Connection, bundles: &[&Bundle]) -> ServiceStatus {
     ServiceStatus {
         id: service.id.clone(),
         name: service.name.clone(),

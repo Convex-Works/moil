@@ -9,7 +9,7 @@ platform-specific parts are small and live behind `cfg` in `platform.rs` and
 
 ```sh
 cargo run -p moil-app -- --demo    # a simulated agent; touches nothing on this machine
-cargo run -p moil-app              # the real agent, on $MOIL_HOME or ~/Library/Application Support/moil
+cargo run -p moil-app              # the real agent, on $MOIL_HOME or ~/.moil
 ```
 
 The demo has two services: klisi, connected, offering `transcribe 0.3.0` to

@@ -201,7 +201,7 @@ func (m *machine) ApproveHash(hash string) {
 // tokens returns the machine tokens the machine keeps.
 func (m *machine) tokens() []string {
 	m.t.Helper()
-	data, err := os.ReadFile(filepath.Join(m.home, "secrets.json"))
+	data, err := os.ReadFile(filepath.Join(m.home, ".machine", "secrets.json"))
 	if err != nil {
 		m.t.Fatalf("reading the machine's tokens: %v", err)
 	}

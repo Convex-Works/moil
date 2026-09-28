@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use moil_agent::{Approval, BundleStatus, Connection, PairedService, Review, ServiceStatus};
+use moil_agent::{Approval, BundleStatus, Connection, Pairing, Review, Service, ServiceStatus};
 use moil_bundle::Bundle;
 use moil_proto::BundleInfo;
 
@@ -62,14 +62,17 @@ fn icons() -> String {
     format!("<!DOCTYPE html><html><body style=\"margin:8px\">{cells}</body></html>")
 }
 
-fn klisi(approved: &[&Bundle]) -> PairedService {
+fn klisi(approved: &[&Bundle]) -> Service {
     let now = SystemTime::now();
-    PairedService {
+    Service {
         id: "klisi.example.com".parse().unwrap(),
         base_url: "https://klisi.example.com/moil".parse().unwrap(),
         name: "klisi".into(),
-        machine_id: "m_7Hq2Xk9Lw3".into(),
-        paired_at: now - Duration::from_secs(64 * 86400),
+        pairing: Some(Pairing {
+            base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            machine_id: "m_7Hq2Xk9Lw3".into(),
+            paired_at: now - Duration::from_secs(64 * 86400),
+        }),
         approvals: approved
             .iter()
             .map(|b| Approval {
@@ -256,7 +259,7 @@ fn gallery() {
         "notice",
         page::notice(
             "moil couldn't start",
-            "moil is already running for /Users/ada/Library/Application Support/moil; quit it first",
+            "moil is already running for /Users/ada/.moil; quit it first",
             "Quit",
         ),
     );

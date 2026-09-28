@@ -1,5 +1,6 @@
-//! The window that asks the owner to confirm unpairing a service, which
-//! can't be undone: pairing again means reviewing its bundles again.
+//! The window that asks the owner to confirm unpairing a service. The
+//! service forgets this machine, so using it again means pairing again;
+//! the service's folder stays, approvals and all (spec/machine.md §3.2).
 
 use maud::html;
 use moil_agent::{ServiceId, ServiceStatus};
@@ -90,15 +91,20 @@ impl UnpairWindow {
                 p {
                     (name) " at " (link(self.base_url.as_str(), visible(self.base_url.as_str())))
                     " will no longer be able to send jobs to this Mac. moil tells " (name)
-                    ", then forgets its token"
+                    ", then forgets its token."
                     @match self.approvals {
                         0 => {},
-                        1 => " and the bundle you approved for it",
-                        n => { " and the " (format::count(n, "bundle")) " you approved for it" },
+                        1 => " The bundle you approved for it stays approved, for when you pair again.",
+                        n => {
+                            " The " (format::count(n, "bundle")) " you approved for it stay \
+                             approved, for when you pair again."
+                        },
                     }
-                    "."
                 }
-                p.hint { "To use " (name) " again, pair again and review its bundles again." }
+                p.hint {
+                    "To forget " (name) " altogether, delete its folder in moil's home once it's \
+                     unpaired."
+                }
                 @if let Some(error) = &self.error {
                     div.callout.bad { (page::icon::error()) div { p.message { (visible(error)) } } }
                 }
@@ -148,12 +154,13 @@ mod tests {
     }
 
     #[test]
-    fn says_what_unpairing_forgets() {
+    fn says_what_unpairing_forgets_and_what_it_keeps() {
         let page = UnpairWindow::new(&klisi()).render();
         assert_locked_down(&page);
         assert!(page.contains("Unpair klisi?"));
         assert!(page.contains(r#"<a href="https://klisi.example.com/moil">"#));
-        assert!(page.contains("forgets its token and the 2 bundles you approved for it."));
+        assert!(page.contains("forgets its token."));
+        assert!(page.contains("The 2 bundles you approved for it stay approved"));
     }
 
     #[test]
