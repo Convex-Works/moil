@@ -333,7 +333,9 @@ context carries no token, and no URL other than the service's base URL.
 - **The same whether or not an agent runs.** When an agent runs on the
   home, in the app or as `moil agent`, a command asks it through the
   control socket (§4): the agent pairs, fetches bundles, approves and
-  holds the tokens, and the change takes effect at once. When no agent
+  holds the tokens, and the change takes effect at once. What a command
+  reports is the home as it is when the command asks, so a change just
+  made from outside (§1.3) shows at once. When no agent
   runs, the command works on the home itself. Only `stop`, `quit`,
   `login-item` and `status --watch` need a running agent. Without one they
   say so and exit with status 3.

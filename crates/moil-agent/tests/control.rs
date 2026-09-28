@@ -86,7 +86,29 @@ impl Setup {
         Self::build(dir, &root, false, Host::App).await
     }
 
+    /// Paired, with an agent that looks at the home only once an hour, so
+    /// that it sees a change there only when asked to read it.
+    async fn slow_to_notice() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        let options = AgentOptions {
+            home_poll: Duration::from_secs(3600),
+            ..fast()
+        };
+        Self::build_with(dir, &root, true, Host::App, options).await
+    }
+
     async fn build(dir: TempDir, root: &Path, paired: bool, host: Host) -> Self {
+        Self::build_with(dir, root, paired, host, fast()).await
+    }
+
+    async fn build_with(
+        dir: TempDir,
+        root: &Path,
+        paired: bool,
+        host: Host,
+        options: AgentOptions,
+    ) -> Self {
         let machine = open_machine(root);
         let service = FakeService::start("klisi").await;
         let bundle = bundle("transcribe", "1.0.0", "print('hi')");
@@ -103,7 +125,7 @@ impl Setup {
         // so what a watcher sees is what the test did.
         let options = AgentOptions {
             channel_timeout: PATIENCE * 2,
-            ..fast()
+            ..options
         };
         let agent = Agent::start_with(machine, executor, options);
         let (sender, quits) = mpsc::unbounded_channel();
@@ -278,6 +300,24 @@ async fn the_status_over_the_socket_is_the_agents() {
         (error.code, error.message.as_str()),
         (ErrorCode::ScriptError, "CUDA out of memory")
     );
+}
+
+#[tokio::test]
+async fn the_status_over_the_socket_shows_the_home_as_it_is_now() {
+    let setup = Setup::slow_to_notice().await;
+    let mut client = setup.client().await;
+    let id = &setup.paired().id;
+    assert!(client.status().await.unwrap().services[0].hooks.is_empty());
+
+    // What an owner, or their agent, writes and then asks moil about.
+    let hook = setup.home.hook(id, "transcribe");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = client.status().await.unwrap();
+    let hooks = &status.services[0].hooks;
+    assert_eq!(hooks.len(), 1, "{status:?}");
+    assert!(hooks[0].runnable && hooks[0].bundle == "transcribe");
 }
 
 #[tokio::test]

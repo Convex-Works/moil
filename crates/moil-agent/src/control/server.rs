@@ -256,7 +256,12 @@ impl Shared {
     async fn answer(&self, request: Request) -> Result<serde_json::Value, String> {
         let agent = &self.agent;
         match request {
-            Request::Status => value(status::from_agent(agent, &self.info)),
+            Request::Status => {
+                // What a command asks about is what's on disk now, not what
+                // the watcher saw last.
+                agent.read_home().await;
+                value(status::from_agent(agent, &self.info))
+            }
             Request::Pause | Request::Resume => {
                 let paused = matches!(request, Request::Pause);
                 agent.set_paused(paused).await.map_err(|e| e.to_string())?;

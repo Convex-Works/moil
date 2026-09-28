@@ -314,9 +314,6 @@ func TestAnOwnersAgentDrivesMoilThroughItsCommandLine(t *testing.T) {
 // until the agent next starts.
 func TestAPauseMoilCantKeepFailsWithAnAgentToo(t *testing.T) {
 	t.Parallel()
-	t.Skip("bug: with settings.json invalid, `moil pause` through a running agent exits 0 and pauses the agent, " +
-		"but coordinator.rs remember_paused only logs that it couldn't save the choice, even once the file is fixed, " +
-		"so the next start takes jobs again; without an agent, it exits 1")
 	_, m := lentMachine(t)
 	if err := os.WriteFile(filepath.Join(m.home, "settings.json"), []byte(`{"pasued": true}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)

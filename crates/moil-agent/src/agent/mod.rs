@@ -230,6 +230,14 @@ impl AgentHandle {
     }
 
     /// Has the home read again at once, and waits until the agent goes by
+    /// what it says, so that a status taken next shows what is on disk now,
+    /// changes from outside included: what an owner or their agent just
+    /// wrote, then asks moil about (spec/machine.md §3.1).
+    pub async fn read_home(&self) {
+        self.refresh(None).await;
+    }
+
+    /// Has the home read again at once, and waits until the agent goes by
     /// what it says, as it does with any change to the home: after the
     /// owner changed it through the handle. `left` is a service the agent
     /// disconnected from to unpair it, which it may connect to again.
