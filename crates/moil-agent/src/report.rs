@@ -3,17 +3,18 @@
 //! and the app share these types, so that there is one shape to learn.
 //!
 //! Optional fields are left out when absent, as on the wire (spec §2).
-//! Print a report with [`json_line`], which also escapes the characters
-//! text output would reveal.
+//! Paths that aren't UTF-8 are shown with U+FFFD for what isn't. Print a
+//! report with [`json_line`], which also escapes the characters text
+//! output would reveal.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use moil_proto::control::BundleInfo;
 use moil_proto::{BundleHash, ErrorCode, JobId, Phase};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use url::Url;
 
 use crate::display::is_hidden;
@@ -23,6 +24,7 @@ use crate::{Approval, ServiceId};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Status {
     /// The home's absolute path.
+    #[serde(serialize_with = "lossy")]
     pub home: PathBuf,
     /// The running agent, if one runs on the home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,7 +173,9 @@ pub struct OfferedBundle {
 pub struct HookReport {
     /// The bundle whose attempts it follows.
     pub bundle: String,
+    #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
+    #[serde(serialize_with = "lossy")]
     pub log: PathBuf,
     /// Whether moil can run it: a regular file the owner can execute, that
     /// starts with a `#!` line or is a program.
@@ -190,6 +194,7 @@ pub struct HookListing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
     /// The file or directory concerned, relative to the home.
+    #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
     /// A sentence the owner can act on.
     pub message: String,
@@ -279,6 +284,12 @@ pub struct PreviousVersion {
     pub changes: BTreeMap<String, String>,
 }
 
+/// `path` as a string, even if it isn't UTF-8: a report is for reading, and
+/// a path shown nearly is better than no report at all.
+fn lossy<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
 /// `value` as one line of JSON, with every character that text output
 /// would reveal (spec §5.5) written as a `\u` escape, so that nothing in
 /// it can make the JSON read differently from what it is.
@@ -321,6 +332,33 @@ mod tests {
         );
         let read: Problem = serde_json::from_str(&line).unwrap();
         assert_eq!(read.message, message);
+    }
+
+    #[test]
+    fn paths_that_arent_utf8_are_shown_nearly() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // As a Linux file system allows.
+        let home = PathBuf::from(OsStr::from_bytes(b"/home/ada/caf\xe9"));
+        let line = json_line(&Status {
+            home: home.clone(),
+            agent: None,
+            paused: false,
+            job: None,
+            last_job: None,
+            services: Vec::new(),
+            problems: vec![Problem {
+                path: home.join("hooks"),
+                message: "moil can't read this folder".into(),
+            }],
+        });
+        let read: Status = serde_json::from_str(&line).unwrap();
+        assert_eq!(read.home, Path::new("/home/ada/caf\u{fffd}"));
+        assert_eq!(
+            read.problems[0].path,
+            Path::new("/home/ada/caf\u{fffd}/hooks")
+        );
     }
 
     #[test]

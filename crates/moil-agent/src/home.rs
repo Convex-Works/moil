@@ -9,7 +9,9 @@ use moil_bundle::BundleStore;
 use moil_proto::BundleHash;
 use serde::{Deserialize, Serialize};
 
-use crate::fs::{PUBLIC, read_strict_json, with_path, write_atomic, write_json};
+use crate::fs::{
+    PUBLIC, create_private, read_strict_json, replace_symlink, with_path, write_atomic, write_json,
+};
 use crate::report::Problem;
 use crate::{Error, ServiceId};
 
@@ -335,6 +337,41 @@ impl Home {
     pub(crate) fn write_service_gitignore(&self, id: &ServiceId) -> Result<(), Error> {
         write_if_missing(&self.service_gitignore_file(id), SERVICE_GITIGNORE)
     }
+
+    /// Links `.machine/bin/moil` and `.machine/bin/uv` to `moil` and `uv`,
+    /// replacing whatever is there, so that hooks find this machine's own
+    /// first on their `PATH` (spec/machine.md §2.2) and a command can point
+    /// to the agent's own moil (§4).
+    ///
+    /// The process running the agent calls it when it starts, with its own
+    /// `moil` and the uv it runs jobs with. The links point to where the
+    /// files really are, whatever links lead there.
+    pub fn link_bin(&self, moil: &Path, uv: &Path) -> io::Result<()> {
+        let bin = self.bin_dir();
+        fs::create_dir_all(&bin).map_err(|e| with_path(e, &bin))?;
+        for (name, target) in [("moil", moil), ("uv", uv)] {
+            let target = target.canonicalize().map_err(|e| with_path(e, target))?;
+            let link = bin.join(name);
+            if fs::read_link(&link).is_ok_and(|current| current == target) {
+                continue;
+            }
+            let linked = (|| {
+                // A link can't take a folder's place in one step.
+                if fs::symlink_metadata(&link).is_ok_and(|m| m.is_dir()) {
+                    moil_runtime::remove_tree(&link)?;
+                }
+                replace_symlink(&target, &link)
+            })();
+            linked.map_err(|error| {
+                let (link, target) = (link.display(), target.display());
+                io::Error::new(
+                    error.kind(),
+                    format!("couldn't link {link} to {target}: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Writes `text` to `path` if nothing is there: once written, the file is
@@ -349,24 +386,4 @@ fn write_if_missing(path: &Path, text: &str) -> Result<(), Error> {
 /// Whether `name` names a file right in a directory, not a path.
 fn is_file_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
-}
-
-/// Creates `dir`, and any missing parents, readable only by the owner, and
-/// takes other users' access to it if it already exists.
-fn create_private(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        let mode = fs::metadata(dir)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(mode & !0o077))?;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    fs::create_dir_all(dir)
 }

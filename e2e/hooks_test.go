@@ -20,9 +20,10 @@ import (
 
 // After an attempt of a bundle succeeds, the owner's hook for that bundle
 // runs with its outputs: here a shell script that keeps the transcript
-// the job made. It reads the attempt's context on stdin, runs in a folder
-// that holds the outputs and nothing else, with only the environment the
-// spec lists, and what it prints goes to its log. The service has heard
+// the job made. It reads the attempt's context on stdin, runs in an empty
+// folder that is also its TMPDIR, finds the outputs and nothing else in
+// output_dir, has only the environment the spec lists, and what it prints
+// goes to its log. The service has heard
 // that the job succeeded while the hook still runs, and hears nothing of
 // the hook.
 func TestAHookTurnsAJobsOutputIntoTheOwners(t *testing.T) {
@@ -87,8 +88,13 @@ func TestAHookTurnsAJobsOutputIntoTheOwners(t *testing.T) {
 	if c.EndedAt.Before(submitted) || c.EndedAt.After(time.Now()) {
 		t.Errorf("the hook was told the attempt ended at %v, before it was submitted or after now", c.EndedAt)
 	}
-	if !filepath.IsAbs(c.OutputDir) || ran.cwd != c.OutputDir {
-		t.Errorf("the hook ran in %s, with the output directory %s", ran.cwd, c.OutputDir)
+	// The outputs' names are the service's, so the hook doesn't run
+	// among them.
+	if ran.cwd != ran.tmpdirPhysical || len(ran.cwdListing) != 0 {
+		t.Errorf("the hook ran in %s, which held %v, not in its empty TMPDIR %s", ran.cwd, ran.cwdListing, ran.tmpdirPhysical)
+	}
+	if !filepath.IsAbs(c.OutputDir) || strings.HasPrefix(ran.tmpdir, c.OutputDir) {
+		t.Errorf("the output directory %s isn't a directory of its own", c.OutputDir)
 	}
 	if want := map[string]string{"transcript.txt": filepath.Join(c.OutputDir, "transcript.txt")}; !maps.Equal(c.Outputs, want) {
 		t.Errorf("the hook was told of the outputs %v, want %v", c.Outputs, want)
@@ -441,12 +447,15 @@ echo "started $$" >> "$saved/runs"
 run="$saved/$$"
 mkdir "$run"
 cat > "$run/context.json"
+out=$(sed -n 's/.*"output_dir":"\([^"]*\)".*/\1/p' "$run/context.json")
 pwd -P > "$run/cwd"
+ls -A > "$run/cwd-listing"
 /usr/bin/env > "$run/env"
-ls -A > "$run/listing"
+ls -A "$out" > "$run/listing"
 mkdir "$run/outputs"
-cp -R ./ "$run/outputs/"
+cp -R "$out/" "$run/outputs/"
 ls -A "$TMPDIR" > "$run/tmp-listing"
+(cd "$TMPDIR" && pwd -P) > "$run/tmpdir-physical"
 touch "$TMPDIR/scratch"
 echo "$TMPDIR" > "$run/tmpdir"
 moil home --json > "$run/moil-home"
@@ -483,12 +492,16 @@ type hookRun struct {
 	raw        []byte
 	context    hookContextJSON
 	cwd        string
+	cwdListing []string // what its working directory held as it started
 	env        map[string]string
-	listing    []string // what its working directory held
+	listing    []string // what its output directory held
 	tmpdir     string
-	tmpListing []string // what its TMPDIR held as it started
-	moilHome   homeJSON // `moil home --json`, run by the hook
-	child      int      // the child it left, with leaveAChild
+	// tmpdirPhysical is tmpdir with symbolic links resolved, as pwd -P
+	// shows the working directory.
+	tmpdirPhysical string
+	tmpListing     []string // what its TMPDIR held as it started
+	moilHome       homeJSON // `moil home --json`, run by the hook
+	child          int      // the child it left, with leaveAChild
 	// said and complained are what it printed to stdout and stderr.
 	said, complained string
 }
@@ -583,6 +596,7 @@ func (h *shellHook) load(name string) hookRun {
 		h.t.Fatalf("the hook context isn't in the spec's shape: %v\n%s", err, r.raw)
 	}
 	r.cwd = strings.TrimSpace(read("cwd"))
+	r.cwdListing = strings.Fields(read("cwd-listing"))
 	r.env = map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(read("env")), "\n") {
 		name, value, _ := strings.Cut(line, "=")
@@ -590,6 +604,7 @@ func (h *shellHook) load(name string) hookRun {
 	}
 	r.listing = strings.Fields(read("listing"))
 	r.tmpdir = strings.TrimSpace(read("tmpdir"))
+	r.tmpdirPhysical = strings.TrimSpace(read("tmpdir-physical"))
 	r.tmpListing = strings.Fields(read("tmp-listing"))
 	if err := decodeStrict([]byte(read("moil-home")), &r.moilHome); err != nil {
 		h.t.Errorf("`moil home --json` printed JSON that isn't in the spec's shape: %v", err)

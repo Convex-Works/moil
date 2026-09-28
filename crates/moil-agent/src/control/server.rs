@@ -20,7 +20,7 @@ use super::VERSION;
 use super::messages::{
     ClientHello, PairStep, PairingCode, Reply, Request, ReviewFiles, ServerHello, ServiceBundles,
 };
-use super::socket::{self, ShortPath, private_dir, remove_if_present, user_id};
+use super::socket::{self, ShortPath, remove_if_present, user_id};
 use crate::report::{AgentInfo, ListedBundle, ServiceRef};
 use crate::status::{self, Clock};
 use crate::{AgentHandle, Error, Service};
@@ -144,7 +144,7 @@ pub fn serve(
 /// Binds the socket, readable only by the owner, in its private directory.
 fn listen(socket: &Path) -> io::Result<(UnixListener, (u64, u64))> {
     if let Some(dir) = socket.parent() {
-        private_dir(dir)?;
+        crate::fs::create_private(dir)?;
     }
     remove_if_present(socket)?;
     let listener = UnixListener::bind(ShortPath::to(socket)?.path())?;
@@ -393,5 +393,5 @@ fn json<T: Serialize, E: fmt::Display>(result: Result<T, E>) -> Result<serde_jso
 }
 
 fn value(value: impl Serialize) -> Result<serde_json::Value, String> {
-    Ok(serde_json::to_value(value).expect("control messages serialize to JSON"))
+    serde_json::to_value(value).map_err(|e| format!("moil couldn't put its answer in JSON: {e}"))
 }

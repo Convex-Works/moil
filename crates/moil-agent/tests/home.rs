@@ -224,9 +224,10 @@ async fn a_hook_runs_after_a_succeeded_attempt_with_its_context_and_outputs() {
     setup.hook(
         r#"#!/bin/sh
 cat > REPORT/context.json
-ls > REPORT/listing
-cat transcript.txt > REPORT/transcript.txt
-echo "transcribed $(wc -c < transcript.txt | tr -d ' ') bytes"
+out=$(sed -E 's/.*"output_dir":"([^"]*)".*/\1/' REPORT/context.json)
+ls "$out" > REPORT/listing
+cat "$out/transcript.txt" > REPORT/transcript.txt
+echo "transcribed $(wc -c < "$out/transcript.txt" | tr -d ' ') bytes"
 "#,
     );
     let mut conn = setup.connect().await;
@@ -318,13 +319,31 @@ async fn no_hook_runs_after_an_attempt_that_didnt_succeed() {
 }
 
 #[tokio::test]
-async fn a_hook_moil_quits_during_runs_again_when_it_next_starts() {
+async fn hooks_run_while_the_machine_is_paused() {
     let mut setup = Setup::new().await;
-    // It waits to be stopped the first time, and keeps its output.
+    setup.hook("#!/bin/sh\necho ran\n");
+    let mut conn = setup.connect().await;
+    let run = setup.run(&mut conn, "j1").await;
+    // The running job carries on, and its hook runs.
+    setup.agent.set_paused(true).await.unwrap();
+    run.succeed_with(None, &[]);
+    done(&mut conn).await;
+    assert_eq!(conn.recv().await, state(MachineState::Paused));
+    let closing = setup.closed(1).await;
+    assert!(closing[0].starts_with("exited 0 after "), "{closing:?}");
+    assert!(setup.agent.snapshot().paused);
+}
+
+#[tokio::test]
+async fn a_hook_moil_quits_during_runs_again_with_the_same_outputs() {
+    let mut setup = Setup::new().await;
+    // It moves its output away, as a hook may, and waits to be stopped the
+    // first time.
     setup.hook(
         r#"#!/bin/sh
 echo run >> REPORT/runs
-cp transcript.txt REPORT/transcript.txt
+out=$(sed -E 's/.*"output_dir":"([^"]*)".*/\1/')
+mv "$out/transcript.txt" REPORT/transcript.txt
 if [ "$(wc -l < REPORT/runs)" -eq 1 ]; then
   touch REPORT/started
   exec sleep 30
@@ -340,6 +359,21 @@ fi
         setup.report.path().join("started").exists()
     })
     .await;
+    fs::remove_file(setup.report.path().join("transcript.txt")).unwrap();
+
+    within("the agent to shut down", setup.agent.shutdown()).await;
+    assert_eq!(closing_lines(&setup.log()), ["stopped: moil quit"]);
+    // Its entry keeps only what the next run needs.
+    let entries = fs::read_dir(setup.home().hooks_queue_dir()).unwrap();
+    let [entry] = &entries.map(|e| e.unwrap().path()).collect::<Vec<_>>()[..] else {
+        panic!("the entry is kept");
+    };
+    let mut kept: Vec<_> = fs::read_dir(entry)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["hook.json", "outputs"]);
 
     let setup = setup.restart().await;
     // The service's channel closed with the first agent.

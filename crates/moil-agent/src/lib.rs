@@ -21,7 +21,7 @@ pub mod control;
 pub mod display;
 mod error;
 mod folders;
-mod fs;
+pub mod fs;
 mod hardware;
 pub mod home;
 pub mod hooks;

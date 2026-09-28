@@ -71,6 +71,14 @@ impl Home {
         }
     }
 
+    /// A home whose folder's name starts with `name`, or `None` where the
+    /// file system refuses it, as APFS refuses names that aren't UTF-8.
+    pub fn named(name: &std::ffi::OsStr) -> Option<Self> {
+        let dir = tempfile::Builder::new().prefix(name).tempdir().ok()?;
+        let uv = "/usr/bin/false".into();
+        Some(Self { dir, uv })
+    }
+
     /// A home whose agent runs jobs with real uv.
     pub fn with_uv() -> Self {
         Self {

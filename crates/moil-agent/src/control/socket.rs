@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -97,20 +97,6 @@ fn links_dir() -> io::Result<PathBuf> {
         ));
     }
     Ok(dir)
-}
-
-/// Creates `dir` readable only by the owner, or takes other users' access
-/// to it if it exists.
-pub(super) fn private_dir(dir: &Path) -> io::Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let mode = fs::metadata(dir)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(mode & !0o077))?;
-    }
-    Ok(())
 }
 
 pub(super) fn remove_if_present(path: &Path) -> io::Result<()> {
