@@ -6,11 +6,16 @@
 //!   open to every paired service, bids on offers, runs assigned attempts
 //!   through an [`Executor`](moil_runtime::Executor) and reports back. The
 //!   tray app and `moil agent` run one, and watch it through a [`Snapshot`].
+//! - [`control`] is the socket through which commands reach a running
+//!   agent, and [`status`] builds what `moil status` reports, whether or
+//!   not an agent runs.
 //!
 //! Only one process at a time may open a machine's [`Home`]; the second
 //! gets [`Error::AlreadyRunning`].
 
 mod agent;
+#[cfg(unix)]
+pub mod control;
 pub mod display;
 mod error;
 mod fs;
@@ -25,6 +30,7 @@ pub mod review;
 pub mod rfc3339;
 pub mod secrets;
 pub mod services;
+pub mod status;
 
 pub use agent::{
     Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobOutcome, JobReport, JobStatus,

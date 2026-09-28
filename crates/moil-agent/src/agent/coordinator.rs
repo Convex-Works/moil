@@ -73,8 +73,9 @@ pub(super) enum Command {
     /// bundle is no longer approved, and prepare the bundle if one was.
     Approvals(Box<PairedService>, Option<Box<Bundle>>, oneshot::Sender<()>),
     SetPaused(bool),
-    /// The owner stopped the running job.
-    StopJob,
+    /// The owner stopped the running job. The sender, if any, gets the job
+    /// that was running.
+    StopJob(Option<oneshot::Sender<Option<JobStatus>>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -489,10 +490,21 @@ impl Coordinator {
                     self.remember_paused();
                 }
             }
-            Command::StopJob => {
-                if let Some(running) = &mut self.running {
+            Command::StopJob(reply) => {
+                let stopped = self.running.as_mut().map(|running| {
                     tracing::info!("stopping {}", running.key);
                     running.stop(StopReason::Interrupted);
+                    running.status.clone()
+                });
+                if let Some(reply) = reply {
+                    // Answered, like the other commands, once the snapshot
+                    // shows it.
+                    let (done, shown) = oneshot::channel();
+                    self.replies.push(done);
+                    tokio::spawn(async move {
+                        let _ = shown.await;
+                        let _ = reply.send(stopped);
+                    });
                 }
             }
             Command::Shutdown(reply) => {

@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use moil_proto::control::BundleInfo;
 use moil_proto::{BundleHash, ErrorCode, JobId, Phase};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -207,6 +208,35 @@ pub struct ListedBundle {
     pub offered: bool,
 }
 
+impl ListedBundle {
+    /// A service's bundles: those it offers, as it describes them, then
+    /// those approved for it that it no longer offers, oldest first.
+    pub fn listing(offered: &[BundleInfo], approvals: &[Approval]) -> Vec<Self> {
+        let approved = |hash: &BundleHash| approvals.iter().any(|a| a.hash == *hash);
+        let is_offered = |hash: &BundleHash| offered.iter().any(|b| b.hash == *hash);
+        let offered = offered.iter().map(|b| Self {
+            hash: b.hash,
+            name: b.name.clone(),
+            version: b.version.clone(),
+            description: b.description.clone(),
+            approved: approved(&b.hash),
+            offered: true,
+        });
+        let withdrawn = approvals
+            .iter()
+            .filter(|a| !is_offered(&a.hash))
+            .map(|a| Self {
+                hash: a.hash,
+                name: a.name.clone(),
+                version: a.version.clone(),
+                description: None,
+                approved: true,
+                offered: false,
+            });
+        offered.chain(withdrawn).collect()
+    }
+}
+
 /// `moil review SERVICE HASH --json`: one bundle in full.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleReview {
@@ -300,5 +330,40 @@ mod tests {
             line,
             r#"{"home":"/h","paused":false,"services":[],"problems":[]}"#
         );
+    }
+
+    #[test]
+    fn a_listing_keeps_approved_bundles_the_service_withdrew() {
+        let hash = |byte| BundleHash::from_bytes([byte; 32]);
+        let offered = |byte, version: &str| BundleInfo {
+            hash: hash(byte),
+            name: "transcribe".into(),
+            version: version.into(),
+            description: Some(format!("version {version}")),
+        };
+        let approval = |byte, version: &str| Approval {
+            hash: hash(byte),
+            name: "transcribe".into(),
+            version: version.into(),
+            approved_at: SystemTime::UNIX_EPOCH,
+        };
+        let listing = ListedBundle::listing(
+            &[offered(3, "3.0.0"), offered(2, "2.0.0")],
+            &[approval(1, "1.0.0"), approval(2, "2.0.0")],
+        );
+        let summary: Vec<_> = listing
+            .iter()
+            .map(|b| (b.version.as_str(), b.approved, b.offered))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("3.0.0", false, true),
+                ("2.0.0", true, true),
+                ("1.0.0", true, false)
+            ]
+        );
+        assert_eq!(listing[1].description.as_deref(), Some("version 2.0.0"));
+        assert_eq!(listing[2].description, None, "the service no longer says");
     }
 }

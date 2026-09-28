@@ -26,6 +26,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rustls-platform-verifier = "0.7"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = "4"
 
