@@ -246,7 +246,8 @@ the end-to-end suite.
 - The app on Linux and Windows; a signed and notarized macOS build.
 - Trusting a publisher's signing key instead of approving each hash.
 - Sandboxing: `sandbox-exec` on macOS, Landlock or bubblewrap on Linux, Job
-  Objects on Windows.
+  Objects on Windows. A sandboxed script must also lose the reach it has
+  today into `~/.moil` and moil's control socket.
 - Jobs that survive a service restart; server SDKs in other languages.
 - Bundles in languages other than Python.
 
