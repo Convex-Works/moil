@@ -165,7 +165,8 @@ pub struct HookReport {
     pub bundle: String,
     pub path: PathBuf,
     pub log: PathBuf,
-    /// Whether moil can run it: a regular file the owner can execute.
+    /// Whether moil can run it: a regular file the owner can execute, that
+    /// starts with a `#!` line or is a program.
     pub runnable: bool,
 }
 
