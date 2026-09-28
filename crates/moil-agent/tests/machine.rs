@@ -216,6 +216,10 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
             false,
         ),
         ("services/klisi.example.com/hooks/transcribe", false),
+        // A bundle's name may be one of those the file names.
+        ("services/klisi.example.com/bundles/logs/abc/job.py", false),
+        ("services/klisi.example.com/hooks/logs", false),
+        ("services/klisi.example.com/logs/logs.log", true),
     ] {
         assert_eq!(
             ignored(root, path),
@@ -229,6 +233,8 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
         ("logs/transcribe.log", true),
         ("service.json", false),
         ("hooks/transcribe", false),
+        ("bundles/logs/abc/job.py", false),
+        ("hooks/logs", false),
     ] {
         assert_eq!(
             ignored(&klisi, path),

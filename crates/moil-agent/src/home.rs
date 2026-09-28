@@ -75,8 +75,9 @@ pub const GITIGNORE: &str = "\
 # What belongs to this machine alone:
 /.machine/
 /settings.json
-pairing.json
-logs/
+/logs/
+/services/*/logs/
+/services/*/pairing.json
 ";
 
 /// The `.gitignore` moil writes in a service's folder when there is none,
