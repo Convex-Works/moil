@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use moil_agent::report::{HookReport, Problem, Status};
-use moil_agent::{Error, ServiceId, Snapshot};
+use moil_agent::{Error, ServiceId};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -51,7 +51,7 @@ impl HomeReport {
 /// the report differs from the one before. Building stops once the
 /// receiver is dropped or the agent is gone.
 pub fn watch<F>(
-    mut changes: watch::Receiver<Snapshot>,
+    mut changes: watch::Receiver<()>,
     runtime: &Handle,
     status: F,
 ) -> watch::Receiver<HomeReport>
@@ -150,7 +150,7 @@ mod tests {
     impl FakeHome {
         fn watch(
             status: Status,
-            changes: watch::Receiver<Snapshot>,
+            changes: watch::Receiver<()>,
         ) -> (Self, watch::Receiver<HomeReport>) {
             let status = Arc::new(Mutex::new(Ok(status)));
             let (built, built_at) = mpsc::unbounded_channel();
@@ -178,7 +178,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_report_follows_the_home_as_the_agent_changes() {
-        let (agent, changes) = watch::channel(Snapshot::default());
+        let (agent, changes) = watch::channel(());
         let problem = Problem {
             path: "services/klisi.example.com/hooks/summarize".into(),
             message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
@@ -196,7 +196,7 @@ mod tests {
             vec![hook("summarize", false), hook("transcribe", true)],
             vec![problem.clone()],
         )));
-        agent.send_modify(|s| s.paused = true);
+        agent.send_replace(());
         reports.changed().await.unwrap();
         let report = reports.borrow_and_update().clone();
         assert_eq!(report.hooks(&klisi()).len(), 2);
@@ -206,7 +206,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn only_a_different_report_is_shown() {
-        let (agent, changes) = watch::channel(Snapshot::default());
+        let (agent, changes) = watch::channel(());
         let (mut home, mut reports) =
             FakeHome::watch(status(vec![hook("transcribe", true)], Vec::new()), changes);
         home.next_build().await;
@@ -214,14 +214,14 @@ mod tests {
         reports.borrow_and_update();
 
         // The agent's state changes, but not the hooks.
-        agent.send_modify(|s| s.paused = true);
+        agent.send_replace(());
         home.next_build().await;
         tokio::task::yield_now().await;
         assert!(!reports.has_changed().unwrap());
 
         // Failing to read the home keeps what was shown.
         home.set(Err("services/ is unreadable".into()));
-        agent.send_modify(|s| s.paused = false);
+        agent.send_replace(());
         home.next_build().await;
         tokio::task::yield_now().await;
         assert!(!reports.has_changed().unwrap());
@@ -230,14 +230,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_burst_of_changes_builds_a_report_once_a_second() {
-        let (agent, changes) = watch::channel(Snapshot::default());
+        let (agent, changes) = watch::channel(());
         let (mut home, _reports) = FakeHome::watch(status(Vec::new(), Vec::new()), changes);
         let first = home.next_build().await;
 
         // A job reports progress every 10 ms for 3 seconds.
         let progress = tokio::spawn(async move {
-            for i in 0..300 {
-                agent.send_modify(|s| s.paused = i % 2 == 0);
+            for _ in 0..300 {
+                agent.send_replace(());
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             agent

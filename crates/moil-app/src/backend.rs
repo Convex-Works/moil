@@ -28,6 +28,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Watches the agent's state; the receiver holds the current snapshot.
     fn subscribe(&self) -> watch::Receiver<Snapshot>;
 
+    /// Marked whenever what [`status`](Self::status) reports may have
+    /// changed: the snapshot, or the home as the agent goes by it.
+    fn changes(&self) -> watch::Receiver<()>;
+
     /// The home the agent runs on, as an absolute path.
     fn home(&self) -> PathBuf;
 
@@ -106,6 +110,10 @@ fn app_info() -> AgentInfo {
 impl Backend for Hosted {
     fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.agent().subscribe()
+    }
+
+    fn changes(&self) -> watch::Receiver<()> {
+        self.agent().changes()
     }
 
     fn home(&self) -> PathBuf {

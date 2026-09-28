@@ -108,6 +108,8 @@ pub struct Demo(Arc<State>);
 #[derive(Debug)]
 struct State {
     snapshot: watch::Sender<Snapshot>,
+    /// Marked whenever what `status` shows may have changed.
+    changes: watch::Sender<()>,
     /// What the demo's owner paired with and approved.
     paired: Mutex<Vec<Service>>,
     /// Set to stop the running job.
@@ -198,6 +200,7 @@ impl Demo {
         ];
         let state = Arc::new(State {
             snapshot: watch::Sender::new(snapshot),
+            changes: watch::Sender::new(()),
             paired: Mutex::new(vec![klisi, lab]),
             stop: watch::Sender::new(false),
             running: Mutex::new(None),
@@ -214,6 +217,7 @@ impl Demo {
 impl State {
     fn update(&self, change: impl FnOnce(&mut Snapshot)) {
         self.snapshot.send_modify(change);
+        self.changes.send_replace(());
     }
 
     fn update_job(&self, change: impl FnOnce(&mut JobStatus)) {
@@ -556,6 +560,10 @@ fn status(service: &Service, connection: Connection, bundles: &[&Bundle]) -> Ser
 impl Backend for Demo {
     fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.0.snapshot.subscribe()
+    }
+
+    fn changes(&self) -> watch::Receiver<()> {
+        self.0.changes.subscribe()
     }
 
     fn home(&self) -> PathBuf {

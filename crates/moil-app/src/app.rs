@@ -308,7 +308,7 @@ impl App {
         self.snapshot = snapshots.take();
         self.snapshots = Some(snapshots);
 
-        let changes = backend.subscribe();
+        let changes = backend.changes();
         let status = move || {
             let backend = backend.clone();
             async move { backend.status().await }.boxed()
