@@ -65,8 +65,8 @@ typo is reported rather than ignored.
 The owner, an editor or git MAY change `settings.json`, each
 `service.json`, anything under `hooks/`, and the `.gitignore` files once
 moil has written them. The rest is moil's: `pairing.json`, `bundles/`,
-`logs/` and `README.md`, which moil rewrites whenever its text differs
-from what this version of moil writes.
+`logs/` and `README.md`, which moil rewrites when it opens the home, if
+its text differs from what this version of moil writes.
 
 ### 1.1 Settings
 
@@ -177,7 +177,8 @@ apply them as if the owner had made them through moil:
   `interrupted`. A new approval's bundle is prepared.
 - A service that becomes paired is connected, and one that is no longer
   paired is disconnected. When its `pairing.json`, its `service.json` or
-  its whole folder is gone, moil also deletes its token; when its
+  its whole folder is gone, moil also deletes its token, and a
+  `pairing.json` left without its `service.json`; when its
   `service.json` names another URL, moil keeps the token, so that putting
   the URL back pairs it again. The service still lists the machine until
   the owner removes it there. `moil unpair` tells the service.
@@ -191,7 +192,7 @@ When a file becomes unreadable or invalid, moil reports it as a problem
 A hook is an executable the owner puts at
 `services/<service>/hooks/<bundle name>`. After an attempt of that bundle
 for that service succeeds on this machine, moil runs the hook with the
-attempt's outputs. The file is the whole setup: there is nothing to
+attempt's outputs, if the hook's file is there when the attempt ends. The file is the whole setup: there is nothing to
 register, and removing the file turns the hook off.
 
 ### 2.1 When a hook runs
@@ -258,8 +259,8 @@ The hook runs:
 - **In `output_dir`**, which it may change as it likes. moil deletes the
   directory once the hook exits, so a hook that wants to keep an output
   copies or moves it elsewhere.
-- **With only these environment variables:** `HOME`, `USER`, `LANG`,
-  `MOIL_HOME`; `TMPDIR`, a fresh directory that moil removes afterwards;
+- **With only these environment variables:** `HOME`, `USER`, `LANG`
+  (moil's own, else `C.UTF-8`), `MOIL_HOME`; `TMPDIR`, a fresh directory that moil removes afterwards;
   and `PATH`, which is `<home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
   `.machine/bin` holds the `moil` and `uv` this machine runs, so a hook
   starting `#!/usr/bin/env -S uv run --script` can declare its Python
@@ -284,14 +285,15 @@ The closing line is one of:
 
 - `== exited <status> after <duration>`
 - `== killed by signal <number> after <duration>`
+- `== exited after <duration>, but moil couldn't tell how`
 - `== stopped after an hour`
 - `== stopped: moil quit`
 - `== stopped: moil stopped unexpectedly`, written when moil next starts,
   before the hook runs again
 - `== not run: <reason>`
 
-Once a log passes 1 MiB, moil renames it to `<bundle name>.log.1`,
-replacing any older one, and starts a new log.
+Before a hook runs, if its log has passed 1 MiB, moil renames it to
+`<bundle name>.log.1`, replacing any older one, and starts a new log.
 
 moil records a hook's exit status and doesn't retry a hook that failed.
 But a hook that didn't get to exit, because moil quit or crashed, runs
@@ -338,7 +340,7 @@ context carries no token, and no URL other than the service's base URL.
   are the labels in lowercase, with underscores for spaces: `Approved:
   <hash>` becomes `{"approved": "<hash>"}`. §3.3 gives the other shapes.
   Optional fields are omitted when absent, as on the wire (protocol §2).
-  Every character that text output would reveal is written as a `\u`
+  Every character that text output would reveal is written as a JSON
   escape.
 - **Exit status.** `0` when the command did what it was asked. `1` when it
   failed, with a sentence on stderr saying why and what to do. `2` when the
@@ -357,16 +359,16 @@ context carries no token, and no URL other than the service's base URL.
 | `moil status [--watch]` | Whether an agent runs and in what; whether the machine is paused; the running job and its progress; the last job; each service's connection, and the bundles waiting for review; the hooks; and any problem with the home. `--watch` prints it again whenever it changes. | The tray menu |
 | `moil pause`, `moil resume` | Stop or resume taking new jobs. A running job carries on. | Pause, Resume |
 | `moil stop` | Stop the running job. Its service may give it to another machine. | Stop Current Job |
-| `moil pair SERVICE [--name NAME] [--no-browser]` | Pair with the service at a URL, with a service the home knows but isn't paired with (§1.2), or again with a paired one. Prints the code and the confirmation page's URL, opens the page, and waits for the owner to confirm there. | Pair with a Service…, Pair Again |
+| `moil pair SERVICE [--name NAME] [--no-browser]` | Pair with the service at a URL, with a service the home knows but isn't paired with (§1.2), or again with a paired one. Prints the code and the confirmation page's URL, opens the page, and waits for the owner to confirm there. `--name` sets `machine_name` (§1.1), for every service. Without an agent, the command holds the home until the pairing ends, so no agent can start meanwhile. | Pair with a Service…, Pair Again |
 | `moil unpair SERVICE` | Tell the service to forget this machine, and delete this machine's pairing and token. The folder, with its approvals and hooks, stays; delete it to forget those too. | Unpair |
 | `moil services` | The services the home knows, paired or not, with their approvals. | The services in the menu |
 | `moil review SERVICE [HASH]` | The bundles a service offers and whether each is approved. With a hash, that bundle in full (protocol §5.5). | Review |
 | `moil approve SERVICE HASH [--yes]` | Show the bundle in full, then approve it. | Approve |
-| `moil revoke SERVICE HASH` | Withdraw an approval, stopping a running attempt of that bundle. | Revoke Approval |
+| `moil revoke SERVICE HASH` | Withdraw an approval, stopping a running attempt of that bundle, and delete the bundle's files. It also removes an approval that doesn't count (§1.2). | Revoke Approval |
 | `moil hooks` | Each hook: its service and bundle, its path and log, and whether moil can run it. | The hooks in the menu |
-| `moil logs [SERVICE BUNDLE] [-f] [-n LINES]` | The agent's log or, given a service and bundle, that hook's log. `-f` follows it. | Show Log |
+| `moil logs [SERVICE BUNDLE] [-f] [-n LINES]` | The agent's log or, given a service and bundle, that hook's log: all of it, or its last `LINES`. `-f` follows it, starting from the last 10 lines unless `-n` says otherwise. | Show Log |
 | `moil home` | The home's path. | Open moil Folder |
-| `moil login-item [on\|off]` | Whether the app opens at login. Needs the app to be running. | Open at Login |
+| `moil login-item [on\|off]` | Whether the app opens at login. Needs the app to be running; under `moil agent` it fails. | Open at Login |
 | `moil quit` | Stop the agent. The running job is interrupted and reported, and the app quits, or `moil agent` exits. | Quit moil |
 | `moil agent` | Run the agent in this terminal until interrupted. | — |
 | `moil init`, `check`, `hash`, `run` | Bundle authoring, as before. | — |
@@ -374,8 +376,9 @@ context carries no token, and no URL other than the service's base URL.
 `moil home` prints `Home: <path>`. The other commands' `Label: value`
 lines are as they are today: `Code:`, `URL:` and `Paired:` for `pair`,
 `Approved:`, `Revoked:`, `Unpaired:`, and `Paused:` (`true` or `false`)
-for `pause` and `resume`. `stop` prints `Stopping:` with the job's ID and
-attempt, or nothing if no job runs. `login-item` prints `Open at login:`
+for `pause` and `resume`, which answer once `settings.json` says so.
+`stop` prints `Stopping:` with the job's ID and attempt, or nothing if no
+job runs; `stop --json` then prints `{}`, as `quit --json` does. `login-item` prints `Open at login:`
 (`true` or `false`).
 
 ### 3.3 JSON shapes
@@ -423,8 +426,8 @@ attempt, or nothing if no job runs. `login-item` prints `Open at login:`
 - `job` is the running attempt, if any. `phase` is as in protocol §8.3,
   and `fraction` and `message` are the script's latest progress.
 - `last_job` is the attempt that ran here last since the agent started.
-  `outcome` is `succeeded`, `failed`, `cancelled` or `interrupted`, and
-  `error` comes with `failed`.
+  It has a `title` when the job had one. `outcome` is `succeeded`,
+  `failed`, `cancelled` or `interrupted`, and `error` comes with `failed`.
 - `services` lists every service the home knows, in the shape below.
 - `problems` lists what moil found wrong with the home, each with the path
   concerned (relative to the home) and a sentence the owner can act on.
@@ -455,8 +458,13 @@ A service, in `status` and as each element of `moil services --json`:
 }
 ```
 
+- `paired` is true when the folder's `pairing.json` names its URL
+  (§1.2). Whether moil also holds the token only an agent checks, since
+  reading the keychain may ask the owner first: while an agent runs, a
+  paired service without its token has no `connection` or `offered`, and
+  shows as a problem.
 - `connection` and `offered` are present while an agent runs and the
-  service is paired. `connection.state` is `connecting`, `connected`,
+  service is paired, with its token. `connection.state` is `connecting`, `connected`,
   `offline` (with `error` and `retry_at`), `unpaired` (the service removed
   this machine: pair again) or `replaced` (another connection with this
   machine's token took over).
@@ -517,7 +525,7 @@ lets go. Commands use it to reach the agent (§3.1).
   is at that path, or a link into a `Moil.app` is. It never replaces
   anything else.
 - Its menu has **Open moil Folder**, which opens the home, and lists each
-  service's hooks and any problems (§3.3).
+  paired service's hooks and any problems (§3.3).
 - It logs to `logs/moil.log` in the home.
 
 ## 6. Coming from moil 0.1
