@@ -562,6 +562,32 @@ fn hooks_are_listed_from_the_home_alone() {
     );
 }
 
+/// A problem's path names whatever someone put in the home, such as a
+/// file pushed to a service folder's repository.
+#[test]
+fn problem_paths_are_shown_with_hidden_characters_revealed() {
+    let home = Home::new();
+    home.service_folder(
+        "klisi",
+        "https://klisi.example.com/moil",
+        "klisi",
+        json!([]),
+    );
+    let sneaky = "fine\u{1b}[2K\rProblem: none\u{202e}";
+    std::fs::write(home.path().join("services").join(sneaky), "").unwrap();
+    home.hook("klisi", sneaky, "#!/bin/sh\n");
+
+    let shown = |dir: &str| format!("Problem: {dir}/fine␛[2K␍Problem: none\\u{{202e}}: ");
+    let status = home.run(&["status"]).success().stdout();
+    let hooks = home.run(&["hooks"]).success().stdout();
+    for text in [&status, &hooks] {
+        assert!(!text.contains(['\u{1b}', '\r', '\u{202e}']), "{text:?}");
+    }
+    assert!(status.contains(&shown("services")), "{status}");
+    assert!(status.contains(&shown("services/klisi/hooks")), "{status}");
+    assert!(hooks.contains(&shown("services/klisi/hooks")), "{hooks}");
+}
+
 #[test]
 fn logs_prints_the_last_lines_and_follows_across_rotation() {
     let home = Home::new();

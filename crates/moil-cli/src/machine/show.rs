@@ -5,7 +5,7 @@ use std::io::{self, Write};
 
 use moil_agent::display::reveal;
 use moil_agent::hooks::HookScan;
-use moil_agent::report::{ConnectionReport, Host, ServiceReport, Status};
+use moil_agent::report::{ConnectionReport, Host, Problem, ServiceReport, Status};
 use moil_agent::rfc3339;
 
 use super::output::{print_json, table, word};
@@ -89,14 +89,21 @@ fn write_status(status: &Status, out: &mut impl Write) -> io::Result<()> {
         write_service(service, out)?;
     }
     for problem in &status.problems {
-        writeln!(
-            out,
-            "Problem: {}: {}",
-            problem.path.display(),
-            reveal(&problem.message)
-        )?;
+        write_problem(problem, out)?;
     }
     Ok(())
+}
+
+/// A problem, with hidden characters revealed in its path too: it names
+/// whatever someone put in the home, such as a file pushed to a service
+/// folder's repository.
+fn write_problem(problem: &Problem, out: &mut impl Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "Problem: {}: {}",
+        reveal(&problem.path.to_string_lossy()),
+        reveal(&problem.message)
+    )
 }
 
 fn write_service(service: &ServiceReport, out: &mut impl Write) -> io::Result<()> {
@@ -193,12 +200,7 @@ pub fn hooks(scan: &HookScan, json: bool) -> anyhow::Result<()> {
         writeln!(out, "  Runnable: {}", hook.runnable)?;
     }
     for problem in &scan.problems {
-        writeln!(
-            out,
-            "Problem: {}: {}",
-            problem.path.display(),
-            reveal(&problem.message)
-        )?;
+        write_problem(problem, &mut out)?;
     }
     if scan.hooks.is_empty() {
         eprintln!(
