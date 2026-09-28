@@ -737,14 +737,24 @@ async fn a_hook_left_running_by_a_crash_is_killed_and_runs_again() {
 
     let _hooks = t.start();
     until("the leftover hook to be killed", || !is_running(&pid)).await;
-    let log = t.closed("transcribe", 1).await;
-    // The crashed run never got its closing line.
-    let headers = log.lines().filter(|l| l.starts_with("== 20")).count();
-    assert_eq!(headers, 2, "{log}");
-    let [closing] = closing_lines(&log)[..] else {
+    let log = t.closed("transcribe", 2).await;
+    // The crashed run gets its closing line before the next one starts.
+    let lines: Vec<&str> = log.lines().collect();
+    let [
+        first,
+        "== stopped: moil stopped unexpectedly",
+        second,
+        ..,
+        last,
+    ] = lines[..]
+    else {
         panic!("{log}");
     };
-    assert!(exited(closing, 0), "{log}");
+    assert!(
+        first.starts_with("== 20") && second.starts_with("== 20"),
+        "{log}"
+    );
+    assert!(exited(last.strip_prefix("== ").unwrap(), 0), "{log}");
     assert_eq!(t.reported("runs"), "run\nrun\n");
     assert_eq!(t.reported("kept.txt"), "hello");
     until("the entry to go", || t.queued().is_empty()).await;

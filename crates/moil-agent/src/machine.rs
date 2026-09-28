@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -17,9 +18,10 @@ use url::Url;
 use crate::folders::{self, NotCounted};
 use crate::fs::{PUBLIC, read_strict_json, with_path, write_json};
 use crate::hardware::Hardware;
+use crate::hooks;
 use crate::net::{self, Net};
 use crate::pairing::check_confirmation_page;
-use crate::report::Problem;
+use crate::report::{HookListing, Problem};
 use crate::services::{self, ServiceFile};
 use crate::{
     Approval, Error, Home, Pairing, PairingSession, Review, SecretStore, Service, ServiceId,
@@ -40,8 +42,9 @@ pub struct MachineConfig {
 ///
 /// While an [`Agent`](crate::Agent) runs on a machine, pair, unpair,
 /// approve and revoke through its [`AgentHandle`](crate::AgentHandle),
-/// which also tells the services; changing them here alone leaves the
-/// agent unaware until it restarts.
+/// which tells the services at once. The agent notices a change made here
+/// alone as it notices one made from outside, within a few seconds, but
+/// unpairing here alone doesn't tell the service.
 #[derive(Debug, Clone)]
 pub struct Machine {
     inner: Arc<Inner>,
@@ -51,7 +54,15 @@ struct Inner {
     home: Home,
     secrets: Arc<dyn SecretStore>,
     app_version: String,
+    /// The settings moil goes by: as read when the machine was opened,
+    /// changed through [`Machine::update_settings`], or read again once an
+    /// agent noticed they changed.
     settings: Mutex<Settings>,
+    /// Whether plain `http` is allowed: as `settings.json` said when the
+    /// machine was opened, or as [`Machine::update_settings`] set it since.
+    /// A change made from outside takes effect when moil next starts
+    /// (spec/machine.md §1.1).
+    allow_insecure_http: AtomicBool,
     /// Held while a service's files are read, changed and written back.
     services: Mutex<()>,
     net: Net,
@@ -117,6 +128,11 @@ impl ReadOnlyMachine {
         self.0.problems()
     }
 
+    /// Like [`Machine::survey`].
+    pub(crate) fn survey(&self) -> Survey {
+        self.0.survey()
+    }
+
     /// Like [`Machine::bundles`].
     pub async fn bundles(&self, id: &ServiceId) -> Result<Vec<BundleInfo>, Error> {
         self.0.bundles(id).await
@@ -147,6 +163,49 @@ fn bounded(text: &str) -> String {
 
 /// How long unpairing waits for the service before forgetting it anyway.
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Everything a home's files say, as [`Machine::survey`] reads them.
+pub(crate) struct Survey {
+    pub settings: Settings,
+    /// Every service the home knows, by ID.
+    pub services: Vec<Service>,
+    /// Every hook, by service and then bundle.
+    pub hooks: Vec<HookListing>,
+    pub problems: Vec<Problem>,
+}
+
+/// A change made to `settings.json` from outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettingsChange {
+    /// The settings moil went by.
+    pub before: Settings,
+    /// What the file says now. Only the fields that differ from `before`
+    /// changed: moil may yet write the others as it last chose them.
+    pub after: Settings,
+}
+
+/// Makes the fields that differ between `before` and `after` the same in
+/// `target`, leaving the others as they are.
+fn carry_changes(before: &Settings, after: &Settings, target: &mut Settings) {
+    let Settings {
+        paused,
+        machine_name,
+        allow_insecure_http,
+        keep_work_dirs,
+    } = after;
+    if before.paused != *paused {
+        target.paused = *paused;
+    }
+    if before.machine_name != *machine_name {
+        target.machine_name.clone_from(machine_name);
+    }
+    if before.allow_insecure_http != *allow_insecure_http {
+        target.allow_insecure_http = *allow_insecure_http;
+    }
+    if before.keep_work_dirs != *keep_work_dirs {
+        target.keep_work_dirs = *keep_work_dirs;
+    }
+}
 
 impl Machine {
     /// Opens the machine's home, creating it if needed, and writes what
@@ -203,6 +262,7 @@ impl Machine {
                 home,
                 secrets,
                 app_version,
+                allow_insecure_http: AtomicBool::new(settings.allow_insecure_http),
                 settings: Mutex::new(settings),
                 services: Mutex::new(()),
                 token_scope,
@@ -221,20 +281,58 @@ impl Machine {
         &self.inner.app_version
     }
 
+    /// The settings moil goes by. While an agent runs, they follow the
+    /// changes it notices in `settings.json` (spec/machine.md §1.3).
     pub fn settings(&self) -> Settings {
         self.lock_settings().clone()
     }
 
-    /// Changes the settings and saves them, returning the new ones.
+    /// Changes the settings and saves them, returning the new ones. Only
+    /// the fields `change` changes are written: whatever else someone
+    /// changed in `settings.json` meanwhile stays, for an agent to notice.
+    /// Fails without writing if `settings.json` isn't valid, since it's
+    /// the owner's to fix.
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<Settings, Error> {
         let mut settings = self.lock_settings();
         let mut changed = settings.clone();
         change(&mut changed);
-        if changed != *settings {
-            self.inner.home.save_settings(&changed)?;
-            *settings = changed;
+        let on_disk = self.inner.home.load_settings()?;
+        let mut written = on_disk.clone();
+        carry_changes(&settings, &changed, &mut written);
+        if written != on_disk {
+            self.inner.home.save_settings(&written)?;
         }
+        if changed.allow_insecure_http != settings.allow_insecure_http {
+            self.inner
+                .allow_insecure_http
+                .store(changed.allow_insecure_http, Ordering::SeqCst);
+        }
+        *settings = changed;
         Ok(settings.clone())
+    }
+
+    /// Reads `settings.json` again, and goes by it if it changed since moil
+    /// last read or wrote it: returns the change then, and `None`
+    /// otherwise. `allow_insecure_http` and `keep_work_dirs` still take
+    /// effect only when moil next starts (spec/machine.md §1.1). Fails
+    /// with what's wrong with the file, keeping the settings as they were.
+    pub(crate) fn reload_settings(&self) -> Result<Option<SettingsChange>, Error> {
+        let mut settings = self.lock_settings();
+        let on_disk = self.inner.home.load_settings()?;
+        if on_disk == *settings {
+            return Ok(None);
+        }
+        let before = std::mem::replace(&mut *settings, on_disk.clone());
+        Ok(Some(SettingsChange {
+            before,
+            after: on_disk,
+        }))
+    }
+
+    /// Whether the owner allows plain `http` services, inputs and outputs
+    /// on any host (spec/machine.md §1.1).
+    pub(crate) fn allows_insecure_http(&self) -> bool {
+        self.inner.allow_insecure_http.load(Ordering::SeqCst)
     }
 
     /// The runtime's configuration for this machine: its home's
@@ -243,7 +341,7 @@ impl Machine {
     pub fn runtime_config(&self, uv: PathBuf) -> moil_runtime::RuntimeConfig {
         let settings = self.settings();
         let mut config = self.inner.home.runtime_config(uv);
-        config.allow_insecure_http = settings.allow_insecure_http;
+        config.allow_insecure_http = self.allows_insecure_http();
         config.keep_work_dirs = settings.keep_work_dirs;
         config
     }
@@ -352,34 +450,43 @@ impl Machine {
 
     /// What's wrong with the home, for the owner to fix: files that aren't
     /// valid, pairings that don't match their service, approvals that
-    /// don't count, and whatever else moil ignores. Paths are relative to
-    /// the home. Whether moil holds each paired service's token isn't
-    /// checked: see [`is_paired`](Self::is_paired).
+    /// don't count, hooks moil can't run, and whatever else moil ignores.
+    /// Paths are relative to the home. Whether moil holds each paired
+    /// service's token isn't checked: see [`is_paired`](Self::is_paired).
     pub fn problems(&self) -> Vec<Problem> {
+        self.survey().problems
+    }
+
+    /// Everything the home's files say, and what's wrong with them, read
+    /// afresh: settings that can't be used read as the defaults.
+    pub(crate) fn survey(&self) -> Survey {
         let home = &self.inner.home;
         let mut problems = Vec::new();
-        match home.load_settings() {
-            Ok(_) => {}
-            Err(Error::Invalid { reason, .. }) => problems.push(Problem {
-                path: "settings.json".into(),
-                message: format!(
-                    "This file isn't valid ({reason}), and moil won't start until it is. Fix it, \
-                     or remove it to go back to the defaults."
-                ),
-            }),
-            Err(e) => problems.push(Problem {
-                path: "settings.json".into(),
-                message: format!("moil can't read this file ({e})."),
-            }),
+        let settings = home.load_settings().unwrap_or_else(|e| {
+            problems.push(Home::settings_problem(&e, false));
+            Settings::default()
+        });
+        let services = match folders::scan(home) {
+            Ok(scan) => {
+                problems.extend(scan.problems);
+                scan.services
+            }
+            Err(e) => {
+                problems.push(Problem {
+                    path: "services".into(),
+                    message: format!("moil can't read this folder ({e})."),
+                });
+                Vec::new()
+            }
+        };
+        let hooks = hooks::scan(home);
+        problems.extend(hooks.problems);
+        Survey {
+            settings,
+            services,
+            hooks: hooks.hooks,
+            problems,
         }
-        match folders::scan(home) {
-            Ok(scan) => problems.extend(scan.problems),
-            Err(e) => problems.push(Problem {
-                path: "services".into(),
-                message: format!("moil can't read this folder ({e})."),
-            }),
-        }
-        problems
     }
 
     /// Starts pairing with the service at `base_url`, after checking that it
@@ -546,13 +653,42 @@ impl Machine {
     /// `pairing.json`.
     fn forget(&self, id: &ServiceId) -> Result<(), Error> {
         let _services = self.lock_services();
+        self.forget_locked(id, true)
+    }
+
+    /// Deletes this machine's pairing with service `id` if its folder no
+    /// longer has it (spec/machine.md §1.3): the token, once `pairing.json`
+    /// or `service.json` is gone, and `pairing.json` too once
+    /// `service.json` is. Returns whether it did. What it checks is read
+    /// afresh while no pairing is being recorded, so a pairing made
+    /// meanwhile stays.
+    pub(crate) fn forget_if_gone(&self, id: &ServiceId) -> Result<bool, Error> {
+        let _services = self.lock_services();
+        let home = &self.inner.home;
+        let absent = |path: &Path| match std::fs::symlink_metadata(path) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(_) => false,
+        };
+        let service_gone = absent(&home.service_file(id));
+        if !service_gone && !absent(&home.pairing_file(id)) {
+            return Ok(false);
+        }
+        self.forget_locked(id, service_gone)?;
+        Ok(true)
+    }
+
+    /// Deletes the token of service `id`, and its `pairing.json` if
+    /// `pairing_file` says to, while holding the services' lock.
+    fn forget_locked(&self, id: &ServiceId, pairing_file: bool) -> Result<(), Error> {
         self.inner.secrets.delete(&self.token_key(id))?;
         let path = self.inner.home.pairing_file(id);
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(with_path(e, &path).into());
+        if pairing_file {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(with_path(e, &path).into());
+                }
+                _ => {}
             }
-            _ => {}
         }
         self.prune_bundle_store();
         Ok(())
@@ -736,32 +872,6 @@ impl Machine {
         }
     }
 
-    /// Verified copies of the bundles approved for `service` that it is
-    /// told about ([`Service::approved_hashes`]), read from its folder. A
-    /// copy that fails verification is left out and logged, so that the
-    /// machine declines its jobs.
-    pub(crate) fn approved_bundles(&self, service: &Service) -> Vec<Bundle> {
-        let announced: HashSet<BundleHash> = service.approved_hashes().into_iter().collect();
-        service
-            .approvals
-            .iter()
-            .filter(|a| announced.contains(&a.hash))
-            .filter_map(
-                |approval| match folders::check(&self.inner.home, &service.id, approval) {
-                    Ok(bundle) => Some(bundle),
-                    Err(why) => {
-                        tracing::error!(
-                            "{} doesn't take jobs for bundle {} ({why}); approve it again to take them",
-                            service.id,
-                            approval.hash
-                        );
-                        None
-                    }
-                },
-            )
-            .collect()
-    }
-
     /// The machine token for a service, if it has one.
     pub(crate) fn token(&self, id: &ServiceId) -> Result<Option<String>, Error> {
         self.inner.secrets.get(&self.token_key(id))
@@ -779,7 +889,7 @@ impl Machine {
 
     /// Fails unless the owner's settings allow reaching `url`.
     pub(crate) fn check_url(&self, url: &Url) -> Result<(), Error> {
-        net::check_url(url, self.settings().allow_insecure_http)
+        net::check_url(url, self.allows_insecure_http())
     }
 
     /// Runs `work` where blocking is fine. State files take a moment to
@@ -866,7 +976,10 @@ impl Machine {
         Ok(names)
     }
 
-    fn lock_services(&self) -> MutexGuard<'_, ()> {
+    /// Held while a service's files are read, changed and written back,
+    /// so that whoever reads them while it's held sees none of moil's own
+    /// changes half done.
+    pub(crate) fn lock_services(&self) -> MutexGuard<'_, ()> {
         self.inner
             .services
             .lock()

@@ -32,6 +32,13 @@ working directories, caches, the tokens when there is no keychain, and
 the lock and socket of the running moil; its layout may change between
 versions, and nothing else should depend on it.
 
+A running moil notices changes to these files within a few seconds, and
+goes by them as if they were made through moil: an approval added or
+removed is announced to its service, and a removed one stops its running
+job; deleting a `pairing.json` disconnects the service and deletes the
+token; `paused` takes effect at once. If a file turns invalid, moil
+reports it and goes on with what it read from it before.
+
 moil writes JSON pretty-printed and replaces files whole, so a reader
 never sees half of one. Times are in UTC, such as `2026-09-27T22:41:07Z`.
 Its JSON files are strict: a file with a field moil doesn't know, or a key
@@ -64,7 +71,8 @@ holds the three files, they hash to the approval's hash, and the
 manifest's name and version are the approval's; moil ignores any other
 approval and reports it. moil runs a bundle only from a copy it verified
 against the approval, and checks that copy again before every run, so
-editing an approved bundle's files can't change what runs.
+editing an approved bundle's files can't change what runs: its jobs are
+refused until the files match again.
 
 `moil services` lists the services this home knows, `moil review` shows
 what a service offers, and `moil approve` and `moil revoke` change what is

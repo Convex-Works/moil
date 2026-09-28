@@ -73,6 +73,8 @@ pub(super) enum LinkEvent {
     },
     /// The service removed this machine (4401). The task has ended.
     Unpaired,
+    /// moil has no token for the service. The task has ended.
+    NoToken,
     /// Another connection with this machine's token took over (4409). The
     /// task has ended.
     Replaced,
@@ -169,6 +171,7 @@ enum End {
     /// The agent closed it.
     Stopped,
     Unpaired,
+    NoToken,
     Replaced,
     /// Anything else; worth trying again.
     Lost(String),
@@ -189,6 +192,7 @@ impl Channel {
             let error = match end {
                 End::Stopped => return,
                 End::Unpaired => return self.report(LinkEvent::Unpaired),
+                End::NoToken => return self.report(LinkEvent::NoToken),
                 End::Replaced => return self.report(LinkEvent::Replaced),
                 End::Lost(error) => error,
             };
@@ -215,7 +219,7 @@ impl Channel {
             () = self.stop.cancelled() => return Err(End::Stopped),
             token = token => match token {
                 Ok(Some(token)) => token,
-                Ok(None) => return Err(End::Unpaired),
+                Ok(None) => return Err(End::NoToken),
                 Err(e) => return Err(lost(e)),
             },
         };

@@ -14,7 +14,6 @@ use serde::Serialize;
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -132,12 +131,7 @@ pub fn serve(
             ),
         )
     })?;
-    let shared = Arc::new(Shared {
-        agent,
-        info,
-        host,
-        changes: watch::Sender::new(()),
-    });
+    let shared = Arc::new(Shared { agent, info, host });
     let stop = CancellationToken::new();
     let task = tokio::spawn(accept(listener, shared, stop.clone()));
     Ok(ServerHandle {
@@ -191,9 +185,6 @@ struct Shared {
     agent: AgentHandle,
     info: AgentInfo,
     host: Arc<dyn HostControls>,
-    /// Marked changed whenever a command changed what a status shows, for
-    /// watchers: not every such change shows in the agent's snapshot.
-    changes: watch::Sender<()>,
 }
 
 /// One client's conversation: the hellos, then its requests, one at a
@@ -280,7 +271,6 @@ impl Shared {
             Request::Unpair { service } => {
                 let service = self.find(service).await?;
                 let unpaired = agent.unpair(&service.id).await;
-                self.changed();
                 json(unpaired.map(|()| ServiceRef::from(&service)))
             }
             Request::Bundles { service } => {
@@ -307,9 +297,7 @@ impl Shared {
                     .review(&service.id, hash)
                     .await
                     .map_err(|e| e.to_string())?;
-                let approved = agent.approve(&review).await;
-                self.changed();
-                json(approved)
+                json(agent.approve(&review).await)
             }
             Request::Revoke { service, hash } => {
                 let service = self.find(service).await?;
@@ -330,9 +318,7 @@ impl Shared {
         if !service.is_approved(&hash) {
             return Err(format!("{hash} isn't approved for {}", service.id));
         }
-        let revoked = self.agent.revoke(&service.id, hash).await;
-        self.changed();
-        json(revoked)
+        json(self.agent.revoke(&service.id, hash).await)
     }
 
     /// The paired service `query` names.
@@ -344,18 +330,12 @@ impl Shared {
             .map_err(|e| e.to_string())
     }
 
-    fn changed(&self) {
-        self.changes.send_replace(());
-    }
-
     /// Sends the status now, then whenever it changes, until the client
     /// leaves or the agent stops.
     async fn watch(&self, mut reader: BufReader<OwnedReadHalf>, mut writer: OwnedWriteHalf) {
-        let mut snapshots = self.agent.subscribe();
-        let mut changes = self.changes.subscribe();
+        let mut changes = self.agent.changes();
         let mut sent = None;
         loop {
-            snapshots.borrow_and_update();
             changes.borrow_and_update();
             let status = match status::from_agent(&self.agent, &self.info).await {
                 Ok(status) => status,
@@ -374,10 +354,9 @@ impl Shared {
                 sent = Some(status);
             }
             tokio::select! {
-                changed = snapshots.changed() => if changed.is_err() {
+                changed = changes.changed() => if changed.is_err() {
                     return;
                 },
-                _ = changes.changed() => {}
                 () = socket::closed(&mut reader) => return,
             }
         }
@@ -420,13 +399,9 @@ impl Shared {
             () = socket::closed(&mut reader) => return,
         };
         let reply = match paired {
-            Ok(service) => {
-                // The agent learns of the pairing as it completes; once it
-                // has, a status shows the service connecting.
-                self.agent.settled().await;
-                self.changed();
-                Reply::Ok(PairStep::Paired(ServiceRef::from(&service)))
-            }
+            // The pairing completes once the agent goes by it, so a status
+            // shows the service connecting.
+            Ok(service) => Reply::Ok(PairStep::Paired(ServiceRef::from(&service))),
             Err(e) => Reply::Error(e.to_string()),
         };
         let _ = socket::write(&mut writer, &reply).await;

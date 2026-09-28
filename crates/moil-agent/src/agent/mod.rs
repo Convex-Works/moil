@@ -1,14 +1,19 @@
-//! The agent: control channels, offers, attempts.
+//! The agent: control channels, offers, attempts, hooks, and the home.
 //!
 //! One task per paired service keeps its control channel open
 //! ([`connection`]); one coordinator task owns everything machine-wide:
-//! whether the machine is paused or busy, the running attempt, and what
-//! each attempt still has to deliver ([`coordinator`]). They talk over
-//! channels, and the handle talks to the coordinator the same way.
+//! whether the machine is paused or busy, the services it goes by, the
+//! running attempt, and what each attempt still has to deliver
+//! ([`coordinator`]); one task reads the home again whenever it changes
+//! ([`watcher`]). They talk over channels, and the handle talks to the
+//! coordinator the same way. The owner's hooks run in a task of their own
+//! ([`Hooks`]).
 
 mod connection;
 mod coordinator;
+mod watcher;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,18 +21,25 @@ use moil_proto::control::BundleInfo;
 use moil_proto::{BundleHash, ErrorCode, JobId, Outcome, Phase};
 use moil_runtime::Executor;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::hooks::{HookOptions, Hooks};
+use crate::report::Problem;
 use crate::{Error, Machine, PairingSession, Review, Service, ServiceId};
-use coordinator::{Command, Coordinator, Input};
+use coordinator::{Command, Coordinator, Input, Outputs};
+pub(crate) use watcher::HomeState;
+use watcher::{Reading, Refresh, Watcher};
 
 /// Starts agents.
 #[derive(Debug)]
 pub struct Agent;
 
 impl Agent {
-    /// Connects to every paired service and starts taking jobs. Must be
-    /// called from within a Tokio runtime.
+    /// Starts the owner's hooks, connects to every paired service, starts
+    /// taking jobs, and follows the home as it changes. Must be called from
+    /// within a Tokio runtime, and before anything runs attempts on the
+    /// machine.
     pub fn start(machine: Machine, executor: Arc<dyn Executor>) -> AgentHandle {
         Self::start_with(machine, executor, AgentOptions::default())
     }
@@ -39,14 +51,60 @@ impl Agent {
         options: AgentOptions,
     ) -> AgentHandle {
         let (inputs, receiver) = mpsc::unbounded_channel();
+        let home = machine.home();
+        let hooks = Hooks::start(home, options.hooks.clone()).map_err(|e| {
+            tracing::error!("hooks won't run: {e}");
+            let queue = home.hooks_queue_dir();
+            Problem {
+                path: queue.strip_prefix(home.root()).unwrap_or(&queue).to_owned(),
+                message: format!(
+                    "moil can't run hooks ({e}). Check that moil can write to this folder, then \
+                     restart moil."
+                ),
+            }
+        });
+        // Taken first, so that a change made while reading is noticed.
+        let fingerprint = watcher::fingerprint(home);
+        let reading = Reading::take(&machine);
+        let (refreshes, refresh_receiver) = mpsc::unbounded_channel();
+        let stop = CancellationToken::new();
+        let watcher = tokio::spawn(
+            Watcher {
+                machine: machine.clone(),
+                interval: options.home_poll,
+                inputs: inputs.clone(),
+                refreshes: refresh_receiver,
+                stop: stop.clone(),
+                read: fingerprint,
+            }
+            .run(),
+        );
         let (snapshot, snapshot_receiver) = watch::channel(Snapshot::default());
-        let coordinator =
-            Coordinator::new(machine.clone(), executor, options, inputs.clone(), snapshot);
+        let (published, published_receiver) = watch::channel(Published::default());
+        let (changes, changes_receiver) = watch::channel(());
+        let outputs = Outputs {
+            snapshot,
+            published,
+            changes,
+        };
+        let coordinator = Coordinator::new(
+            machine.clone(),
+            executor,
+            options,
+            inputs.clone(),
+            outputs,
+            hooks,
+            (stop, watcher),
+        )
+        .starting_from(reading);
         tokio::spawn(coordinator.run(receiver));
         AgentHandle {
             machine,
             inputs,
             snapshot: snapshot_receiver,
+            published: published_receiver,
+            changes: changes_receiver,
+            refreshes,
         }
     }
 }
@@ -72,6 +130,12 @@ pub struct AgentOptions {
     /// that are out of reach. Older events are dropped first; the final
     /// `done` is always kept (spec §7.5).
     pub max_kept_bytes: usize,
+    /// How often the agent looks for changes that other programs made to
+    /// the home. It goes by one within three of these (spec/machine.md
+    /// §1.3: five seconds), once the files have stopped changing.
+    pub home_poll: Duration,
+    /// How the owner's hooks run (spec/machine.md §2).
+    pub hooks: HookOptions,
 }
 
 impl Default for AgentOptions {
@@ -82,6 +146,8 @@ impl Default for AgentOptions {
             channel_timeout: Duration::from_secs(45),
             shutdown_grace: Duration::from_secs(5),
             max_kept_bytes: 16 << 20,
+            home_poll: Duration::from_secs(1),
+            hooks: HookOptions::default(),
         }
     }
 }
@@ -92,6 +158,19 @@ pub struct AgentHandle {
     machine: Machine,
     inputs: mpsc::UnboundedSender<Input>,
     snapshot: watch::Receiver<Snapshot>,
+    published: watch::Receiver<Published>,
+    changes: watch::Receiver<()>,
+    refreshes: mpsc::UnboundedSender<Refresh>,
+}
+
+/// What the agent publishes after each round, for
+/// [`status`](crate::status): its snapshot, the home as it goes by it, and
+/// the services it found no token for, all as of the same moment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Published {
+    pub snapshot: Snapshot,
+    pub home: Arc<HomeState>,
+    pub tokenless: BTreeSet<ServiceId>,
 }
 
 impl AgentHandle {
@@ -105,9 +184,28 @@ impl AgentHandle {
     }
 
     /// Watches the agent's state; there's a new [`Snapshot`] whenever
-    /// anything the owner might see changes.
+    /// anything it holds changes. What else `moil status` shows, such as
+    /// hooks and problems, [`changes`](Self::changes) tells of.
     pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.snapshot.clone()
+    }
+
+    /// Tells when anything [`status`](crate::status) shows may have
+    /// changed: the snapshot, or the home as the agent goes by it (its
+    /// services, approvals and pairings, settings, hooks and problems),
+    /// whether through this handle, a command, a service or another
+    /// program. Each change is marked once the status shows it; changes
+    /// made before this was called aren't. `changed()` fails once the agent
+    /// has stopped.
+    pub fn changes(&self) -> watch::Receiver<()> {
+        let mut changes = self.changes.clone();
+        changes.mark_unchanged();
+        changes
+    }
+
+    /// What the agent published last.
+    pub(crate) fn published(&self) -> Published {
+        self.published.borrow().clone()
     }
 
     /// Like [`Machine::pair`]; once the pairing completes, the agent
@@ -116,12 +214,14 @@ impl AgentHandle {
     /// folder already approves.
     pub async fn pair(&self, base_url: &str) -> Result<PairingSession, Error> {
         let session = self.machine.pair(base_url).await?;
-        let (machine, inputs) = (self.machine.clone(), self.inputs.clone());
-        Ok(session.on_paired(Box::new(move |service: &Service| {
-            // Called where reading the service's folder is fine.
-            let bundles = machine.approved_bundles(service);
-            let paired = Command::Paired(Box::new(service.clone()), bundles);
-            let _ = inputs.send(Input::Command(paired));
+        let refreshes = self.refreshes.clone();
+        Ok(session.on_paired(Box::new(move |_: &Service| {
+            // Called where waiting is fine: the pairing completes once the
+            // agent goes by it.
+            let (done, applied) = oneshot::channel();
+            if refreshes.send(Refresh { left: None, done }).is_ok() {
+                let _ = applied.blocking_recv();
+            }
         })))
     }
 
@@ -134,7 +234,10 @@ impl AgentHandle {
             .await?;
         self.call(|done| Command::Disconnect(id.clone(), done))
             .await;
-        self.machine.unpair(id).await
+        let unpaired = self.machine.unpair(id).await;
+        // Still paired if unpairing failed, the service is connected again.
+        self.refresh(Some(id.clone())).await;
+        unpaired
     }
 
     pub async fn review(&self, id: &ServiceId, hash: BundleHash) -> Result<Review, Error> {
@@ -145,13 +248,10 @@ impl AgentHandle {
     /// bundle in the background.
     pub async fn approve(&self, review: &Review) -> Result<(), Error> {
         let reviewed = review.clone();
-        let service = self
-            .machine
+        self.machine
             .blocking(move |machine| machine.approve(&reviewed))
             .await?;
-        let (service, bundle) = (Box::new(service), Box::new(review.bundle.clone()));
-        self.call(|done| Command::Approvals(service, Some(bundle), done))
-            .await;
+        self.refresh(None).await;
         Ok(())
     }
 
@@ -160,13 +260,23 @@ impl AgentHandle {
     /// `interrupted`, which the service may retry elsewhere.
     pub async fn revoke(&self, id: &ServiceId, hash: BundleHash) -> Result<(), Error> {
         let revoked = id.clone();
-        let service = self
-            .machine
+        self.machine
             .blocking(move |machine| machine.revoke(&revoked, hash))
             .await?;
-        self.call(|done| Command::Approvals(Box::new(service), None, done))
-            .await;
+        self.refresh(None).await;
         Ok(())
+    }
+
+    /// Has the home read again at once, and waits until the agent goes by
+    /// what it says, as it does with any change to the home: after the
+    /// owner changed it through the handle. `left` is a service the agent
+    /// disconnected from to unpair it, which it may connect to again.
+    async fn refresh(&self, left: Option<ServiceId>) {
+        let (done, applied) = oneshot::channel();
+        // Fails only once the agent has shut down.
+        if self.refreshes.send(Refresh { left, done }).is_ok() {
+            let _ = applied.await;
+        }
     }
 
     /// Stops or resumes taking new jobs. A running job carries on.
@@ -200,12 +310,15 @@ impl AgentHandle {
         let _ = settled.await;
     }
 
-    /// Stops the running job, reports it, and closes every connection.
+    /// Stops the running job, reports it, closes every connection, and
+    /// stops the running hook, which runs again when the agent next starts
+    /// (spec/machine.md §2.3).
     ///
     /// Waits for the executor to return (which it must do promptly once
     /// stopped), then up to [`AgentOptions::shutdown_grace`] for services
-    /// to acknowledge what they were sent. Afterwards the handle's other
-    /// methods do nothing, or only what [`Machine`] does.
+    /// to acknowledge what they were sent, then for the hook to stop.
+    /// Afterwards the handle's other methods do nothing, or only what
+    /// [`Machine`] does.
     pub async fn shutdown(&self) {
         self.call(Command::Shutdown).await;
     }
@@ -385,5 +498,12 @@ mod tests {
         // renewal notices and connects again before the lease runs out.
         let lease = Duration::from_secs(90);
         assert!(lease / 3 + options.channel_timeout + options.reconnect_min < lease);
+        // Spec/machine.md §1.3: changes made from outside within five
+        // seconds, with a second to read them.
+        assert!(options.home_poll * 3 + Duration::from_secs(1) <= Duration::from_secs(5));
+        // Spec/machine.md §2.2: an hour, then stopped as a script is
+        // (spec §8.6).
+        assert_eq!(options.hooks.time_limit, Duration::from_secs(3600));
+        assert_eq!(options.hooks.kill_grace, Duration::from_secs(10));
     }
 }

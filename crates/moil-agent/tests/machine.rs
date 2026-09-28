@@ -1071,6 +1071,8 @@ async fn pairing_adopts_a_folder_cloned_from_another_machine() {
     let hook = laptop.home().hook(&paired.id, "transcribe");
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
     std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+    let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+    std::fs::set_permissions(&hook, executable).unwrap();
 
     let desktop = open_machine(second.path());
     clone_folder(

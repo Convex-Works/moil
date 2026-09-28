@@ -1,28 +1,31 @@
-//! The one owner of machine-wide state: paused or not, the running attempt,
-//! and everything each attempt still has to deliver.
+//! The one owner of machine-wide state: paused or not, the services it
+//! goes by and their connections, the running attempt, and everything each
+//! attempt still has to deliver.
 //!
 //! The coordinator handles one input at a time (a command from the handle,
-//! an event from a connection or from the running attempt), then
-//! reconciles: every welcomed service is told the machine's current state
-//! and approvals if they changed, gets the attempt messages it hasn't seen,
-//! and gets a `renew` when its running attempt has been quiet for a third
-//! of its lease. Deriving what to send from state, rather than sending as
-//! things happen, is what makes reconnecting and resuming (spec §7.5) fall
-//! out naturally. Inputs that arrive together make one round, after which
-//! the owner gets one new [`Snapshot`], however many there were.
+//! an event from a connection or from the running attempt, or a reading of
+//! the home), then reconciles: every welcomed service is told the
+//! machine's current state and approvals if they changed, gets the attempt
+//! messages it hasn't seen, and gets a `renew` when its running attempt has
+//! been quiet for a third of its lease. Deriving what to send from state,
+//! rather than sending as things happen, is what makes reconnecting and
+//! resuming (spec §7.5) fall out naturally, and what lets a reading of the
+//! home be applied however many times it's taken. Inputs that arrive
+//! together make one round, after which the owner gets one new
+//! [`Snapshot`], however many there were.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt;
 use moil_bundle::Bundle;
 use moil_proto::control::{BundleInfo, EventMessage, Hello, Welcome};
 use moil_proto::{
-    Assign, AttemptRef, BundleHash, DeclineReason, Done, ErrorCode, JobError, JobEvent,
+    Assign, AttemptRef, BundleHash, DeclineReason, Done, ErrorCode, JobError, JobEvent, JobResult,
     MachineMessage, MachineState, Offer, Outcome, PROTOCOL_VERSION, Phase, ServiceMessage,
     UrlPolicy,
 };
@@ -32,9 +35,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::connection::{self, LinkEvent, Outbox};
+use super::watcher::{HomeState, Merged, Reading};
 use super::{
-    AgentOptions, BundleStatus, Connection, JobReport, JobStatus, ServiceStatus, Snapshot,
+    AgentOptions, BundleStatus, Connection, JobReport, JobStatus, Published, ServiceStatus,
+    Snapshot,
 };
+use crate::hooks::{BundleRef, Hooks, PendingHook, Succeeded};
+use crate::report::{Problem, ServiceRef};
 use crate::{Machine, ServiceId, services};
 
 /// Everything the coordinator reacts to.
@@ -56,6 +63,15 @@ pub(super) enum Input {
         key: AttemptKey,
         outcome: Outcome,
     },
+    /// The home was read again, because it changed or the handle asked.
+    Home {
+        reading: Box<Reading>,
+        /// A service the handle disconnected from to unpair it, which the
+        /// agent may connect to again from now on.
+        left: Option<ServiceId>,
+        /// Answered once the agent goes by the reading.
+        done: Option<oneshot::Sender<()>>,
+    },
     /// Answer a caller, after everything that came before is visible.
     Reply(oneshot::Sender<()>),
 }
@@ -64,18 +80,10 @@ pub(super) enum Input {
 /// their effects show in the snapshot.
 #[derive(Debug)]
 pub(super) enum Command {
-    /// A pairing completed: connect to the service, again if it was paired
-    /// before, with verified copies of the bundles it approves.
-    Paired(Box<services::Service>, Vec<Bundle>),
-    /// Close the service's channel and forget its attempts.
+    /// Close the service's channel and forget its attempts, and don't
+    /// connect to it again until a reading of the home says it `left`:
+    /// the owner is unpairing it.
     Disconnect(ServiceId, oneshot::Sender<()>),
-    /// The service's approvals changed: stop its running attempt if its
-    /// bundle is no longer approved, and prepare the bundle if one was.
-    Approvals(
-        Box<services::Service>,
-        Option<Box<Bundle>>,
-        oneshot::Sender<()>,
-    ),
     SetPaused(bool),
     /// The owner stopped the running job. The sender, if any, gets the job
     /// that was running.
@@ -117,12 +125,27 @@ pub(super) struct Coordinator {
     options: AgentOptions,
     /// Handed to the tasks the coordinator starts, to report back.
     inputs: mpsc::UnboundedSender<Input>,
-    snapshot: watch::Sender<Snapshot>,
+    outputs: Outputs,
+    /// Runs the owner's hooks, unless they couldn't start: then why.
+    hooks: Result<Hooks, Problem>,
+    /// Queues the hook of the attempt that ended last, or removes its
+    /// entry, off the coordinator, once the one before has been.
+    settling: Option<JoinHandle<()>>,
+    /// The task that reads the home when it changes, and its stop.
+    watcher: Option<(CancellationToken, JoinHandle<()>)>,
     paused: bool,
     /// What the settings should say about pausing, for the writes that
     /// save it.
     paused_choice: Arc<AtomicBool>,
+    /// The home as the agent goes by it.
+    home: Arc<HomeState>,
+    /// The paired services, and their channels.
     services: BTreeMap<ServiceId, Service>,
+    /// Services the owner is unpairing: not connected to again meanwhile,
+    /// whatever the home says.
+    leaving: BTreeSet<ServiceId>,
+    /// Services whose channel found no token for them.
+    tokenless: BTreeSet<ServiceId>,
     /// Verified copies of the bundles some service's approval names, by
     /// hash: offers and assignments are answered from these, without
     /// reading the store.
@@ -281,6 +304,46 @@ struct Running {
     bundle: BundleHash,
     stopper: Stopper,
     status: JobStatus,
+    /// Where its outputs go for its hook, if it succeeds.
+    hook: Option<ForHook>,
+}
+
+/// What an attempt's hook is told of it, besides how it ended.
+struct ForHook {
+    pending: PendingHook,
+    service: ServiceRef,
+    bundle: BundleRef,
+    params: serde_json::Value,
+}
+
+impl ForHook {
+    /// Queues the hook of attempt `key`, which succeeded with `result`.
+    fn ready(
+        self,
+        key: &AttemptKey,
+        title: Option<String>,
+        result: JobResult,
+        ended_at: SystemTime,
+    ) {
+        self.pending.ready(Succeeded {
+            service: self.service,
+            bundle: self.bundle,
+            job_id: key.attempt.job_id.clone(),
+            attempt: key.attempt.attempt,
+            title,
+            params: self.params,
+            result,
+            ended_at,
+        });
+    }
+}
+
+/// Where the coordinator publishes what it does.
+pub(super) struct Outputs {
+    pub snapshot: watch::Sender<Snapshot>,
+    pub published: watch::Sender<Published>,
+    /// Marked changed whenever `published` changes.
+    pub changes: watch::Sender<()>,
 }
 
 impl Running {
@@ -321,23 +384,33 @@ impl From<Unavailable> for JobError {
 }
 
 impl Coordinator {
+    /// A coordinator going by nothing yet: see
+    /// [`starting_from`](Self::starting_from).
     pub(super) fn new(
         machine: Machine,
         executor: Arc<dyn Executor>,
         options: AgentOptions,
         inputs: mpsc::UnboundedSender<Input>,
-        snapshot: watch::Sender<Snapshot>,
+        outputs: Outputs,
+        hooks: Result<Hooks, Problem>,
+        watcher: (CancellationToken, JoinHandle<()>),
     ) -> Self {
         let paused = machine.settings().paused;
-        let mut coordinator = Self {
+        Self {
             paused,
             paused_choice: Arc::new(AtomicBool::new(paused)),
             machine,
             executor,
             options,
             inputs,
-            snapshot,
+            outputs,
+            hooks,
+            settling: None,
+            watcher: Some(watcher),
+            home: Arc::default(),
             services: BTreeMap::new(),
+            leaving: BTreeSet::new(),
+            tokenless: BTreeSet::new(),
             bundles: HashMap::new(),
             attempts: BTreeMap::new(),
             unsent: BTreeSet::new(),
@@ -346,22 +419,27 @@ impl Coordinator {
             next_task: 0,
             shutdown: None,
             replies: Vec::new(),
-        };
+        }
+    }
+
+    /// Goes by `reading`, the home as the agent starts, and publishes what
+    /// it makes of it.
+    pub(super) fn starting_from(mut self, reading: Reading) -> Self {
         // A service without its token is connected all the same, off the
         // coordinator: finding none, its channel ends before reaching out.
-        match coordinator.machine.services() {
-            Ok(services) => services
-                .into_iter()
-                .filter(|s| s.pairing.is_some())
-                .for_each(|s| coordinator.connect(s)),
-            Err(e) => tracing::error!("couldn't read the services: {e}"),
-        }
-        coordinator.publish();
-        coordinator
+        self.home_changed(reading, true, None);
+        self.publish();
+        self
     }
 
     pub(super) async fn run(mut self, mut inputs: mpsc::UnboundedReceiver<Input>) {
-        self.bundles = self.warm_up().await;
+        // `hello` describes the hardware, which may take a moment to
+        // detect.
+        let detected = self.machine.blocking(|machine| {
+            machine.info();
+            Ok(())
+        });
+        let _ = detected.await;
         while !self.shut_down() {
             let renew_at = self.renew_at();
             let deliver_by = self.shutdown.as_ref().and_then(|s| s.deliver_by);
@@ -388,28 +466,22 @@ impl Coordinator {
                 let _ = reply.send(());
             }
         }
+        if let Some((stop, watcher)) = self.watcher.take() {
+            stop.cancel();
+            let _ = watcher.await;
+        }
         self.close_all().await;
+        // The attempt that ended last gets its hook queued, to run now or
+        // when moil next starts.
+        if let Some(settling) = self.settling.take() {
+            let _ = settling.await;
+        }
+        if let Ok(hooks) = &self.hooks {
+            hooks.shutdown().await;
+        }
         for waiter in self.shutdown.take().into_iter().flat_map(|s| s.waiters) {
             let _ = waiter.send(());
         }
-    }
-
-    /// Gets ready, off the coordinator, what answering services takes: the
-    /// hardware `hello` describes, and verified copies of the approved
-    /// bundles, from the services' folders. A copy that fails verification
-    /// is left out, so the machine declines its jobs.
-    async fn warm_up(&self) -> HashMap<BundleHash, Bundle> {
-        let services: Vec<services::Service> =
-            self.services.values().map(|s| s.paired.clone()).collect();
-        let loaded = self.machine.blocking(move |machine| {
-            machine.info();
-            let verified = services.iter().flat_map(|s| machine.approved_bundles(s));
-            Ok(verified.map(|bundle| (bundle.hash(), bundle)).collect())
-        });
-        loaded.await.unwrap_or_else(|e| {
-            tracing::error!("couldn't read the approved bundles: {e}");
-            HashMap::new()
-        })
     }
 
     fn handle(&mut self, input: Input) {
@@ -427,62 +499,35 @@ impl Coordinator {
             }
             Input::Job { key, event } => self.job_event(&key, event),
             Input::Finished { key, outcome } => self.finished(key, outcome),
+            Input::Home {
+                reading,
+                left,
+                done,
+            } => {
+                // Shutting down, the agent connects to nothing new.
+                if self.shutdown.is_none() {
+                    self.home_changed(*reading, false, left);
+                }
+                self.replies.extend(done);
+            }
             Input::Reply(reply) => self.replies.push(reply),
         }
     }
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Paired(service, bundles) => {
-                tracing::info!("paired with {} ({})", service.name, service.base_url);
-                if let Some(old) = self.services.remove(&service.id) {
-                    old.stop.cancel();
-                }
-                self.connect(*service);
-                // Such as those of a folder cloned from git.
-                for bundle in bundles {
-                    if self.bundles.insert(bundle.hash(), bundle.clone()).is_none() {
-                        self.prepare(bundle);
-                    }
-                }
-            }
             Command::Disconnect(id, reply) => {
-                self.drop_attempts(&id);
-                let removed = self.services.remove(&id);
-                self.drop_unapproved_bundles();
-                match removed {
-                    Some(service) => {
-                        service.stop.cancel();
+                self.leaving.insert(id.clone());
+                match self.disconnect(&id) {
+                    Some(join) => {
                         let inputs = self.inputs.clone();
                         tokio::spawn(async move {
-                            let _ = tokio::time::timeout(CLOSE_WAIT, service.join).await;
+                            let _ = tokio::time::timeout(CLOSE_WAIT, join).await;
                             let _ = inputs.send(Input::Reply(reply));
                         });
                     }
                     None => self.replies.push(reply),
                 }
-            }
-            Command::Approvals(paired, approved, reply) => {
-                if let Some(running) = &mut self.running
-                    && running.key.service == paired.id
-                    && !paired.is_approved(&running.bundle)
-                {
-                    // The owner no longer consents to running it.
-                    tracing::info!(
-                        "stopping {}: its bundle's approval was revoked",
-                        running.key
-                    );
-                    running.stop(StopReason::Interrupted);
-                }
-                if let Some(service) = self.services.get_mut(&paired.id) {
-                    service.paired = *paired;
-                }
-                if let Some(bundle) = approved {
-                    self.bundles.insert(bundle.hash(), (*bundle).clone());
-                    self.prepare(*bundle);
-                }
-                self.drop_unapproved_bundles();
-                self.replies.push(reply);
             }
             Command::SetPaused(paused) => {
                 if paused != self.paused {
@@ -522,6 +567,195 @@ impl Coordinator {
         }
     }
 
+    /// Goes by `reading`, the home as it is now (spec/machine.md §1.3):
+    /// pauses or resumes as `settings.json` says, connects to the services
+    /// the home pairs this machine with and disconnects from the others,
+    /// follows their approvals, and deletes the tokens of the pairings the
+    /// home no longer has. Everything is compared with what the agent goes
+    /// by, so a change is applied once, however many readings show it.
+    /// The bundles already approved when the agent starts are prepared
+    /// only as their jobs come; others as they're approved. `left` is a
+    /// service the owner has just unpaired, which is no longer
+    /// [`leaving`](Self::leaving).
+    fn home_changed(&mut self, reading: Reading, starting: bool, left: Option<ServiceId>) {
+        let Merged {
+            mut home,
+            settings,
+            bundles,
+        } = self.home.merge(reading);
+        if let Err(problem) = &self.hooks {
+            home.problems.push(problem.clone());
+        }
+        if let Some(change) = settings
+            && change.after.paused != change.before.paused
+            && change.after.paused != self.paused
+        {
+            self.paused = change.after.paused;
+            // Any write still to come saves what the file says.
+            self.paused_choice.store(self.paused, Ordering::SeqCst);
+            let now = if self.paused { "paused" } else { "resumed" };
+            tracing::info!("{now}, as settings.json now says");
+        }
+        // Unpairing deleted those it was asked to.
+        let gone: Vec<ServiceId> = self
+            .home
+            .pairing_files
+            .iter()
+            .filter(|id| self.home.services.contains_key(*id))
+            .filter(|id| !home.services.contains_key(*id) || !home.pairing_files.contains(*id))
+            .filter(|id| !self.leaving.contains(*id) && left.as_ref() != Some(*id))
+            .cloned()
+            .collect();
+        if let Some(left) = &left {
+            self.leaving.remove(left);
+        }
+        self.follow_services(&home, &bundles, starting);
+        for id in gone {
+            self.forget(id);
+        }
+        if *self.home != home {
+            self.home = Arc::new(home);
+        }
+    }
+
+    /// Connects to the services `home` pairs this machine with, disconnects
+    /// from the others, and follows the approvals of those it stays
+    /// connected to, with `bundles`, the verified copies of what they
+    /// approve.
+    fn follow_services(
+        &mut self,
+        home: &HomeState,
+        bundles: &BTreeMap<ServiceId, Vec<Bundle>>,
+        starting: bool,
+    ) {
+        let connected: Vec<ServiceId> = self.services.keys().cloned().collect();
+        for id in connected {
+            let Some(service) = home.services.get(&id).filter(|s| s.pairing.is_some()) else {
+                let name = &self.services[&id].paired.name;
+                tracing::info!(
+                    "disconnecting from {name}: this machine is no longer paired with it"
+                );
+                self.disconnect(&id);
+                continue;
+            };
+            self.follow_approvals(service);
+            if self.services[&id].paired.pairing != service.pairing {
+                tracing::info!("paired with {} ({})", service.name, service.base_url);
+                if let Some(old) = self.services.remove(&id) {
+                    old.stop.cancel();
+                }
+                self.connect(service.clone());
+            }
+        }
+        let new: Vec<&services::Service> = home
+            .services
+            .values()
+            .filter(|s| s.pairing.is_some())
+            .filter(|s| !self.services.contains_key(&s.id) && !self.leaving.contains(&s.id))
+            .collect();
+        for service in new {
+            if !starting {
+                tracing::info!("paired with {} ({})", service.name, service.base_url);
+            }
+            self.connect(service.clone());
+        }
+        // Such as those of a folder cloned from git, once it's paired.
+        let mut approved = Vec::new();
+        for (id, service) in &self.services {
+            let announced: BTreeSet<BundleHash> =
+                service.paired.approved_hashes().into_iter().collect();
+            approved.extend(
+                bundles
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| {
+                        announced.contains(&b.hash()) && !self.bundles.contains_key(&b.hash())
+                    })
+                    .cloned(),
+            );
+        }
+        for bundle in approved {
+            if self.bundles.insert(bundle.hash(), bundle.clone()).is_none() && !starting {
+                self.prepare(bundle);
+            }
+        }
+        self.drop_unapproved_bundles();
+    }
+
+    /// Goes by the approvals `service` has now, if the agent is connected
+    /// to it: its running attempt stops if its bundle no longer counts as
+    /// approved, and the service is told what is (in
+    /// [`reconcile`](Self::reconcile)).
+    fn follow_approvals(&mut self, service: &services::Service) {
+        let Some(connected) = self.services.get_mut(&service.id) else {
+            return;
+        };
+        let before = &connected.paired;
+        let name = &service.name;
+        for approval in &service.approvals {
+            if !before.is_approved(&approval.hash) {
+                tracing::info!(
+                    "{name}: approved {} {} ({})",
+                    approval.name,
+                    approval.version,
+                    approval.hash
+                );
+            }
+        }
+        for approval in &before.approvals {
+            if !service.is_approved(&approval.hash) {
+                tracing::info!(
+                    "{name}: {} {} ({}) is no longer approved",
+                    approval.name,
+                    approval.version,
+                    approval.hash
+                );
+            }
+        }
+        if let Some(running) = &mut self.running
+            && running.key.service == service.id
+            && !service.is_approved(&running.bundle)
+            && !running.status.stopping
+        {
+            // The owner no longer consents to running it.
+            tracing::info!("stopping {}: its bundle is no longer approved", running.key);
+            running.stop(StopReason::Interrupted);
+        }
+        connected.paired.name.clone_from(&service.name);
+        connected.paired.approvals.clone_from(&service.approvals);
+    }
+
+    /// Closes the channel of service `id` and forgets its attempts,
+    /// stopping the running one. Returns the channel's task, if there was
+    /// one, which ends once the channel has closed.
+    fn disconnect(&mut self, id: &ServiceId) -> Option<JoinHandle<()>> {
+        self.drop_attempts(id);
+        let removed = self.services.remove(id);
+        self.drop_unapproved_bundles();
+        removed.map(|service| {
+            service.stop.cancel();
+            service.join
+        })
+    }
+
+    /// Deletes this machine's token for service `id`, off the coordinator,
+    /// if its folder no longer has its pairing (spec/machine.md §1.3). The
+    /// service still lists the machine until the owner removes it there.
+    fn forget(&self, id: ServiceId) {
+        let machine = self.machine.clone();
+        tokio::task::spawn_blocking(move || match machine.forget_if_gone(&id) {
+            Ok(true) => tracing::info!(
+                "deleted this machine's token for {id}, which the home no longer pairs it with"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                "couldn't delete this machine's token for {id}, which the home no longer pairs \
+                 it with: {e}"
+            ),
+        });
+    }
+
     fn link_event(&mut self, id: &ServiceId, event: LinkEvent) {
         let Some(service) = self.services.get_mut(id) else {
             return;
@@ -555,6 +789,16 @@ impl Coordinator {
                 );
                 service.link = None;
                 service.connection = Connection::Unpaired;
+                self.drop_attempts(id);
+            }
+            LinkEvent::NoToken => {
+                tracing::warn!(
+                    "moil has no token for {}, so it can't connect to it; pair with it again",
+                    service.paired.name
+                );
+                service.link = None;
+                service.connection = Connection::Unpaired;
+                self.tokenless.insert(id.clone());
                 self.drop_attempts(id);
             }
             LinkEvent::Replaced => {
@@ -703,6 +947,27 @@ impl Coordinator {
             Err(unavailable) => return self.refuse(key, unavailable.into()),
         };
         tracing::info!("starting {key}: {}", bundle.manifest().name);
+        // Where the attempt leaves its outputs if it succeeds, for the hook
+        // there may be by then.
+        let hook = match &self.hooks {
+            Ok(hooks) => match hooks.entry() {
+                Ok(pending) => Some(ForHook {
+                    pending,
+                    service: ServiceRef::from(&self.services[id].paired),
+                    bundle: BundleRef {
+                        name: bundle.manifest().name.clone(),
+                        version: bundle.manifest().version.clone(),
+                        hash: bundle.hash(),
+                    },
+                    params: assign.params.clone(),
+                }),
+                Err(e) => {
+                    tracing::warn!("{key} runs, but its hook won't: {e}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         let (stopper, stop) = moil_runtime::stop_signal();
         let status = JobStatus {
             service: id.clone(),
@@ -720,14 +985,16 @@ impl Coordinator {
             key.clone(),
             Attempt::new(Duration::from_millis(assign.lease_ms)),
         );
-        self.running = Some(Running {
-            key: key.clone(),
-            bundle: bundle.hash(),
-            stopper,
-            status,
-        });
         let mut job = Job::from_assign(assign, bundle);
         job.url_policy = self.url_policy(&key.service);
+        job.hand_off = hook.as_ref().map(|hook| hook.pending.hand_off());
+        self.running = Some(Running {
+            key: key.clone(),
+            bundle: job.bundle.hash(),
+            stopper,
+            status,
+            hook,
+        });
         self.spawn_attempt(key, job, stop);
     }
 
@@ -766,7 +1033,7 @@ impl Coordinator {
     /// Which URLs the jobs of service `id` may use for their files (spec
     /// §3).
     fn url_policy(&self, id: &ServiceId) -> UrlPolicy {
-        let insecure = self.machine.settings().allow_insecure_http;
+        let insecure = self.machine.allows_insecure_http();
         match self.services.get(id) {
             Some(service) => UrlPolicy::for_service(&service.paired.base_url, insecure),
             None => UrlPolicy {
@@ -884,21 +1151,60 @@ impl Coordinator {
     }
 
     fn finished(&mut self, key: AttemptKey, outcome: Outcome) {
+        let mut hook = None;
         if let Some(running) = self.running.take_if(|r| r.key == key) {
-            self.last_job = Some(running.status.ended((&outcome).into()));
+            let title = running.status.title.clone();
+            let report = running.status.ended((&outcome).into());
+            hook = running.hook.map(|hook| (hook, title, report.ended_at));
+            self.last_job = Some(report);
             if let Some(shutdown) = &mut self.shutdown {
                 shutdown.deliver_by = Some(Instant::now() + self.options.shutdown_grace);
             }
         }
+        let mut succeeded = None;
         if let Some(attempt) = self.attempts.get_mut(&key) {
             match &outcome {
-                Outcome::Succeeded { .. } => tracing::info!("{key} succeeded"),
+                Outcome::Succeeded { result } => {
+                    tracing::info!("{key} succeeded");
+                    succeeded = Some(result.clone());
+                }
                 Outcome::Failed { error } => tracing::info!("{key} failed: {error}"),
                 Outcome::Cancelled => tracing::info!("{key} was cancelled"),
             }
             attempt.push_done(&key, outcome);
-            self.unsent.insert(key);
+            self.unsent.insert(key.clone());
         }
+        // Only once its `done` is queued, so that the hook can't hold up or
+        // change what the service hears (spec/machine.md §2.1). An attempt
+        // that failed, or whose service no longer hears of it, gets none.
+        if let Some((hook, title, ended_at)) = hook {
+            let succeeded = succeeded.map(|result| (title, result, ended_at));
+            self.settle(key, hook, succeeded);
+        }
+    }
+
+    /// Queues the hook of attempt `key` if it `succeeded`, with its title,
+    /// result and end, and removes its entry otherwise: off the
+    /// coordinator, since both take the disk a moment, but after the
+    /// attempt that ended before it, so that hooks run in the order their
+    /// attempts ended.
+    fn settle(
+        &mut self,
+        key: AttemptKey,
+        hook: ForHook,
+        succeeded: Option<(Option<String>, JobResult, SystemTime)>,
+    ) {
+        let before = self.settling.take();
+        self.settling = Some(tokio::spawn(async move {
+            if let Some(before) = before {
+                let _ = before.await;
+            }
+            let settled = tokio::task::spawn_blocking(move || match succeeded {
+                Some((title, result, ended_at)) => hook.ready(&key, title, result, ended_at),
+                None => drop(hook),
+            });
+            let _ = settled.await;
+        }));
     }
 
     fn ack(&mut self, id: &ServiceId, attempt: AttemptRef) {
@@ -1054,6 +1360,7 @@ impl Coordinator {
     }
 
     fn connect(&mut self, paired: services::Service) {
+        self.tokenless.remove(&paired.id);
         let task = self.next_task;
         self.next_task += 1;
         let stop = CancellationToken::new();
@@ -1128,14 +1435,31 @@ impl Coordinator {
             job: self.running.as_ref().map(|r| r.status.clone()),
             last_job: self.last_job.clone(),
         };
-        self.snapshot.send_if_modified(|current| {
-            let changed = *current != snapshot;
-            if changed {
-                *current = snapshot;
-            }
-            changed
-        });
+        let published = Published {
+            snapshot: snapshot.clone(),
+            home: self.home.clone(),
+            tokenless: self.tokenless.clone(),
+        };
+        self.outputs
+            .snapshot
+            .send_if_modified(|current| replace(current, snapshot));
+        if self
+            .outputs
+            .published
+            .send_if_modified(|current| replace(current, published))
+        {
+            self.outputs.changes.send_replace(());
+        }
     }
+}
+
+/// Replaces `current` with `new` if they differ, and says whether they did.
+fn replace<T: PartialEq>(current: &mut T, new: T) -> bool {
+    let changed = *current != new;
+    if changed {
+        *current = new;
+    }
+    changed
 }
 
 /// Says so when `service` isn't told about every bundle approved for it.
@@ -1218,12 +1542,28 @@ mod tests {
 
         let (jobs, mut ran) = mpsc::unbounded_channel();
         let (inputs, _) = mpsc::unbounded_channel();
-        let (snapshot, _) = watch::channel(Snapshot::default());
-        let options = AgentOptions::default();
-        let mut coordinator =
-            Coordinator::new(machine, Arc::new(Jobs(jobs)), options, inputs, snapshot);
+        let outputs = Outputs {
+            snapshot: watch::Sender::default(),
+            published: watch::Sender::default(),
+            changes: watch::Sender::default(),
+        };
+        let reading = Reading::take(&machine);
+        let watcher = (CancellationToken::new(), tokio::spawn(async {}));
+        let hooks = Err(Problem {
+            path: "hooks".into(),
+            message: "not in this test".into(),
+        });
+        let mut coordinator = Coordinator::new(
+            machine,
+            Arc::new(Jobs(jobs)),
+            AgentOptions::default(),
+            inputs,
+            outputs,
+            hooks,
+            watcher,
+        )
+        .starting_from(reading);
         coordinator.services[&id].stop.cancel();
-        coordinator.bundles = coordinator.warm_up().await;
         let (outbox, _frames) = connection::outbox();
         let welcome = Welcome {
             protocol: PROTOCOL_VERSION,

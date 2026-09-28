@@ -568,8 +568,8 @@ async fn watching_sends_each_change_until_the_agent_stops() {
     while !matches!(conn.recv().await, MachineMessage::Done(_)) {}
     conn.send(ServiceMessage::Ack(attempt("j1", 1)));
 
-    // ...and by other commands, even those the agent's snapshot doesn't
-    // show, such as approving a bundle the service doesn't offer.
+    // ...by other commands, even those the agent's snapshot doesn't show,
+    // such as approving a bundle the service doesn't offer...
     let unlisted = bundle("transcribe", "2.0.0", "print('two')");
     setup
         .service
@@ -588,6 +588,30 @@ async fn watching_sends_each_change_until_the_agent_stops() {
             .any(|a| a.hash == unlisted.hash())
     })
     .await;
+
+    // ...through the agent's handle, as the app does...
+    let v3 = bundle("transcribe", "3.0.0", "print('three')");
+    setup.service.serve_bundle(v3.hash(), v3.to_response());
+    let review = setup.agent.review(&setup.paired().id, v3.hash());
+    setup.agent.approve(&review.await.unwrap()).await.unwrap();
+    next_where(&mut watch, "the app's approval", |s| {
+        s.services[0].approvals.iter().any(|a| a.hash == v3.hash())
+    })
+    .await;
+
+    // ...and by other programs, in the home's files.
+    let hook = setup.home.hook(&setup.paired().id, "transcribe");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    next_where(&mut watch, "the hook", |s| {
+        s.services[0].hooks.iter().any(|h| h.runnable)
+    })
+    .await;
+    std::fs::write(setup.home.settings_file(), "{\"paused\": true}\n").unwrap();
+    next_where(&mut watch, "the pause", |s| s.paused).await;
+    std::fs::write(setup.home.services_dir().join("notes.txt"), "").unwrap();
+    next_where(&mut watch, "the problem", |s| !s.problems.is_empty()).await;
 
     setup.shut_down().await;
     let end = within("the watch to end", async {
