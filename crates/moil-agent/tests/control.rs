@@ -429,6 +429,25 @@ async fn a_pause_moil_cant_keep_fails_and_changes_nothing() {
     assert!(saved.contains("\"paused\": true"), "{saved}");
 }
 
+/// `moil pause` says what `settings.json` says once it returns, even
+/// over an edit the agent hasn't noticed yet, and the agent goes by it.
+#[tokio::test]
+async fn a_pause_is_saved_over_an_edit_moil_hasnt_seen_yet() {
+    let setup = Setup::slow_to_notice().await;
+    let mut client = setup.client().await;
+    let settings = setup.home.settings_file();
+    assert!(client.set_paused(true).await.unwrap());
+
+    // Someone resumes in the file, and pauses again before the agent looks.
+    std::fs::write(&settings, "{\"paused\": false}\n").unwrap();
+    assert!(client.set_paused(true).await.unwrap());
+    let saved = std::fs::read_to_string(&settings).unwrap();
+    assert!(saved.contains("\"paused\": true"), "{saved}");
+    // Reading the home now finds nothing to undo.
+    assert!(client.status().await.unwrap().paused);
+    assert!(setup.agent.snapshot().paused);
+}
+
 #[tokio::test]
 async fn approving_over_the_socket_reaches_the_service_and_the_agent() {
     let mut setup = Setup::new().await;

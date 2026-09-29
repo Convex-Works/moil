@@ -142,7 +142,9 @@ impl PairingCode {
     ) -> Result<(PairingSession, Self), Error> {
         if let Some(name) = name {
             machine
-                .blocking(|machine| machine.update_settings(|s| s.machine_name = Some(name)))
+                .blocking(move |machine| {
+                    machine.update_settings(|s| s.machine_name = Some(name.clone()))
+                })
                 .await?;
         }
         let session = pair().await?;

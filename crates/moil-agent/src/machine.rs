@@ -168,29 +168,6 @@ pub(crate) struct SettingsChange {
     pub after: Settings,
 }
 
-/// Makes the fields that differ between `before` and `after` the same in
-/// `target`, leaving the others as they are.
-fn carry_changes(before: &Settings, after: &Settings, target: &mut Settings) {
-    let Settings {
-        paused,
-        machine_name,
-        allow_insecure_http,
-        keep_work_dirs,
-    } = after;
-    if before.paused != *paused {
-        target.paused = *paused;
-    }
-    if before.machine_name != *machine_name {
-        target.machine_name.clone_from(machine_name);
-    }
-    if before.allow_insecure_http != *allow_insecure_http {
-        target.allow_insecure_http = *allow_insecure_http;
-    }
-    if before.keep_work_dirs != *keep_work_dirs {
-        target.keep_work_dirs = *keep_work_dirs;
-    }
-}
-
 impl Machine {
     /// Opens the machine's home, creating it if needed, and writes what
     /// the home's readers go by (`README.md` and the `.gitignore` files).
@@ -270,18 +247,20 @@ impl Machine {
         self.lock_settings().clone()
     }
 
-    /// Changes the settings and saves them, returning the new ones. Only
-    /// the fields `change` changes are written: whatever else someone
-    /// changed in `settings.json` meanwhile stays, for an agent to notice.
-    /// Fails without writing if `settings.json` isn't valid, since it's
-    /// the owner's to fix.
-    pub fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<Settings, Error> {
+    /// Changes the settings and saves them, returning the new ones.
+    /// `change` is made to `settings.json` as it is on disk, so the file
+    /// says what `change` says once this returns, even if someone edited
+    /// it since moil last read it; whatever else they changed stays, for
+    /// an agent to notice. `change` is made to the settings moil goes by
+    /// too, so it runs twice. Fails without writing if `settings.json`
+    /// isn't valid, since it's the owner's to fix.
+    pub fn update_settings(&self, change: impl Fn(&mut Settings)) -> Result<Settings, Error> {
         let mut settings = self.lock_settings();
         let mut changed = settings.clone();
         change(&mut changed);
         let on_disk = self.inner.home.load_settings()?;
         let mut written = on_disk.clone();
-        carry_changes(&settings, &changed, &mut written);
+        change(&mut written);
         if written != on_disk {
             self.inner.home.save_settings(&written)?;
         }
