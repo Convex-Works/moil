@@ -23,8 +23,8 @@ pub enum OpenError {
 /// symbolic link at `path` itself: whoever can change the folder it is in,
 /// such as someone pushing to a repository the folder is kept in, can't
 /// make moil open another file through a link, read a device without end,
-/// or wait on a FIFO. Opening never blocks. The file is opened
-/// non-blocking, which makes no difference to a regular file.
+/// or wait on a FIFO. Opening never blocks; the file it returns reads and
+/// writes as usual, as does a process that gets it as its stdout.
 pub fn open_regular(path: &Path, options: &OpenOptions) -> Result<File, OpenError> {
     let mut options = options.clone();
     #[cfg(unix)]
@@ -51,12 +51,30 @@ pub fn open_regular(path: &Path, options: &OpenOptions) -> Result<File, OpenErro
     if !file.metadata()?.is_file() {
         return Err(OpenError::NotRegular);
     }
+    #[cfg(unix)]
+    block(&file)?;
     Ok(file)
+}
+
+/// Clears `O_NONBLOCK`, which only opening needed.
+#[cfg(unix)]
+fn block(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let fd = file.as_raw_fd();
+    // SAFETY: fcntl on a descriptor `file` owns has no memory-safety
+    // preconditions.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
 
     use super::*;
@@ -125,6 +143,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let mut file = open_regular(&path, &append).unwrap();
+        // SAFETY: fcntl on an open descriptor has no memory-safety
+        // preconditions.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "only opening is non-blocking");
         file.write_all(b"one\n").unwrap();
         let mut text = String::new();
         open_regular(&path, &read)
