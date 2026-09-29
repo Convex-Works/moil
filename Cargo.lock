@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "moil-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "fastrand",
@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "moil-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "auto-launch",
  "futures",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "moil-bundle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "moil-proto",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "moil-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "moil-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "moil-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures",
