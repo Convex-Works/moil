@@ -305,6 +305,11 @@ impl Pairing {
         }
     }
 
+    /// Whether `moil pair` is still running.
+    pub fn is_running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
     /// Waits for `moil pair` to end.
     pub fn finish(mut self) -> Run {
         self.finish_ref()
@@ -449,6 +454,8 @@ struct Shared {
     names: Mutex<Vec<String>>,
     bundles: Mutex<Vec<Bundle>>,
     forgotten: Mutex<Vec<String>>,
+    /// While true, `DELETE /v1/machine` doesn't answer.
+    hold_forgets: tokio::sync::watch::Sender<bool>,
     channels: mpsc::Sender<Channel>,
 }
 
@@ -473,6 +480,7 @@ impl FakeService {
             names: Mutex::default(),
             bundles: Mutex::default(),
             forgotten: Mutex::default(),
+            hold_forgets: tokio::sync::watch::Sender::new(false),
             channels,
         });
         let app = Router::new()
@@ -517,6 +525,13 @@ impl FakeService {
     /// The tokens machines asked the service to forget.
     pub fn forgotten(&self) -> Vec<String> {
         self.shared.forgotten.lock().unwrap().clone()
+    }
+
+    /// Makes the service answer a machine that asks it to forget a token,
+    /// once it has, only when called again with `false`, as a slow service
+    /// would.
+    pub fn hold_forgets(&self, hold: bool) {
+        self.shared.hold_forgets.send_replace(hold);
     }
 
     /// The next control channel a machine opens, once it has said hello
@@ -649,6 +664,7 @@ async fn forget(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
     };
     shared.tokens.lock().unwrap().remove(&token);
     shared.forgotten.lock().unwrap().push(token);
+    let _ = shared.hold_forgets.subscribe().wait_for(|held| !held).await;
     StatusCode::NO_CONTENT.into_response()
 }
 

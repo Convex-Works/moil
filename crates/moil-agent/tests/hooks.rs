@@ -495,6 +495,54 @@ async fn a_log_that_is_a_symbolic_link_isnt_written_through() {
     assert!(fs::symlink_metadata(&log).unwrap().is_symlink());
 }
 
+/// As a commit could leave it: the service's logs folder a link to a
+/// folder of the owner's, or a hook's log a FIFO.
+#[tokio::test]
+async fn a_log_moil_would_have_to_write_through_a_link_or_to_a_fifo_isnt_written() {
+    let t = Test::new();
+    t.hook(
+        "transcribe",
+        "#!/bin/sh\necho printed\ntouch REPORT/transcribed\n",
+    );
+    let theirs = t.report.join("notes");
+    fs::create_dir(&theirs).unwrap();
+    // A log past the size limit, which moil would otherwise rename.
+    let full = "x".repeat((1 << 20) + 1);
+    fs::write(theirs.join("transcribe.log"), &full).unwrap();
+    let logs = t.home.hook_log(&service(), "transcribe");
+    let logs = logs.parent().unwrap();
+    fs::create_dir_all(logs.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&theirs, logs).unwrap();
+
+    let hooks = t.start();
+    queue(&hooks, "transcribe", "recording-1", &[]);
+    until("the hook to run", || t.report.join("transcribed").exists()).await;
+    until("the entry to go", || t.queued().is_empty()).await;
+    let mut names: Vec<_> = fs::read_dir(&theirs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["transcribe.log"]);
+    assert_eq!(
+        fs::read_to_string(theirs.join("transcribe.log")).unwrap(),
+        full
+    );
+
+    // A FIFO nobody reads would hold up every hook after this one.
+    fs::remove_file(logs).unwrap();
+    fs::create_dir(logs).unwrap();
+    let fifo = std::ffi::CString::new(logs.join("summarize.log").to_str().unwrap()).unwrap();
+    // SAFETY: `fifo` is a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    t.hook("summarize", "#!/bin/sh\nhead -c 1000000 /dev/zero\n");
+    queue(&hooks, "summarize", "recording-2", &[]);
+    queue(&hooks, "transcribe", "recording-3", &[]);
+    let log = t.closed("transcribe", 1).await;
+    assert!(exited(closing_lines(&log)[0], 0), "{log}");
+    until("the entries to go", || t.queued().is_empty()).await;
+}
+
 #[tokio::test]
 async fn a_hook_that_runs_too_long_is_stopped_as_a_script_is() {
     let t = Test::new();

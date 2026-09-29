@@ -15,22 +15,23 @@
 //!
 //! A hook that didn't get to exit because moil quit or crashed runs again
 //! from the start, with the same outputs, the next time [`Hooks::start`]
-//! runs on the home. [`scan`] lists a home's hooks and what's wrong with
-//! them, whether or not an agent runs.
+//! runs on the home; one that exited never runs again. Wherever moil
+//! crashes, each run it logged gets one closing line. [`scan`] lists a
+//! home's hooks and what's wrong with them, whether or not an agent runs.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use moil_bundle::Bundle;
+use moil_bundle::{Bundle, OpenError, open_regular};
 use moil_proto::{Assign, BundleHash, FileName, JobId, JobResult};
 use moil_runtime::HandOff;
 use moil_runtime::process::{Group, Process};
@@ -45,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Home;
 use crate::folders::runnable;
 pub use crate::folders::{HookScan, scan_hooks as scan};
-use crate::fs::{PRIVATE, with_path, write_atomic};
+use crate::fs::{PRIVATE, read_json, with_path, write_atomic};
 use crate::report::ServiceRef;
 
 /// The hook contract's version: the context's `v`.
@@ -120,18 +121,27 @@ impl Default for HookOptions {
 // the attempts ended in.
 //
 //   outputs/      the outputs as the runtime handed them off, untouched
-//   hook.json     once the attempt succeeded: a `Queued`
-//   running.json  while the hook runs: the process running it
+//   hook.json     once the attempt succeeded, until its hook has run: a
+//                 `Queued`
+//   running.json  from before the run's first line in the log: a `Running`
 //   group.json    once the hook has started: the leader of its process
 //                 group
+//   ended.json    once the hook has ended, until moil is done with the
+//                 run: an `Ended`
 //   out/          the hook's output_dir, made afresh from outputs/ for
 //                 every run
 //   tmp/          the hook's working directory and TMPDIR while it runs
+//
+// Each record is written before what it lets moil finish after a crash,
+// and removed after it: `recover_entry` then knows whether the log has the
+// run's first line, whether it has its closing line, and whether the hook
+// runs again.
 
 const OUTPUTS: &str = "outputs";
 const QUEUED: &str = "hook.json";
 const RUNNING: &str = "running.json";
 const GROUP: &str = "group.json";
+const ENDED: &str = "ended.json";
 const OUT: &str = "out";
 const TMP: &str = "tmp";
 
@@ -153,6 +163,33 @@ struct Queued {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     not_run: Option<String>,
     context: HookContext,
+}
+
+/// `running.json`: a hook's run under way.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Running {
+    /// The process running it.
+    supervisor: Process,
+    /// How long the log was before the run's first line: if it's longer,
+    /// the log has that line, and needs a closing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_length: Option<u64>,
+}
+
+/// `ended.json`: how a hook's run ended, recorded before the log's closing
+/// line is written.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ended {
+    /// The closing line, without its `== `.
+    closing: String,
+    /// How long the log was before the closing line: if it's longer, the
+    /// log has that line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_length: Option<u64>,
+    /// Whether the hook runs again from the start: it didn't get to exit.
+    again: bool,
 }
 
 /// A home's queue of hooks, and the task that runs them. Dropping it stops
@@ -180,8 +217,10 @@ impl Hooks {
     /// Starts running the hooks queued in `home`: those that were waiting
     /// when moil last stopped, and those that were running then, after
     /// killing what's left of them and closing their logs with `==
-    /// stopped: moil stopped unexpectedly` if moil crashed. Entries of
-    /// attempts that never ended are removed.
+    /// stopped: moil stopped unexpectedly` if moil crashed. A hook that had
+    /// exited doesn't run again, and its log gets the closing line it
+    /// missed, if it missed it. Entries of attempts that never ended are
+    /// removed.
     ///
     /// Call it once, from within a Tokio runtime, in the process that holds
     /// the home's lock, before it runs any attempt.
@@ -401,24 +440,28 @@ impl Inner {
             self.home
                 .hook_log(&context.service.id, &context.bundle.name),
         );
+        // Recorded before the run's first line, so that a crash from here
+        // on leaves it, for moil to close the log and kill what's left of
+        // the hook when it next starts.
+        let recorded = supervisor.is_some_and(|supervisor| {
+            let running = Running {
+                supervisor: supervisor.clone(),
+                log_length: log.length(),
+            };
+            let otherwise = "moil can't stop the hook, or close its log, if moil crashes";
+            record(&dir.join(RUNNING), &running, otherwise)
+        });
         log.line(&format!(
             "{} {} attempt {}",
             crate::rfc3339::format(SystemTime::now()),
             context.job_id,
             context.attempt
         ));
-        // Until the closing line, a crash leaves this record, for moil to
-        // write that line and kill what's left of the hook when it next
-        // starts.
-        let running = dir.join(RUNNING);
-        let recorded = supervisor.is_some_and(|supervisor| record(&running, supervisor));
         let ending = match &queued.not_run {
             Some(why) => Ending::NotRun(why.clone()),
             None => self.run_hook(dir, context, &hook, &log, recorded).await,
         };
-        log.line(&ending.to_string());
-        remove_quietly(&dir.join(GROUP));
-        remove_quietly(&running);
+        end_run(dir, &mut log, &ending);
         Some(ending)
     }
 
@@ -463,7 +506,8 @@ impl Inner {
         };
         let started = Instant::now();
         if recorded {
-            record(&dir.join(GROUP), &group.leader());
+            let otherwise = "moil can't stop what's left of the hook if moil crashes";
+            record(&dir.join(GROUP), &group.leader(), otherwise);
         }
         let mut line = serde_json::to_vec(context).expect("a queued context serializes");
         line.push(b'\n');
@@ -512,18 +556,54 @@ impl Inner {
     }
 }
 
-/// Writes `process` to the record at `path`. Returns whether it did: if
-/// not, moil can't clean up after the hook should it crash, and says so.
-fn record(path: &Path, process: &Process) -> bool {
-    let json = serde_json::to_vec(process).expect("a process serializes");
+/// Writes `value` to the record at `path`. Returns whether it did; if not,
+/// warns that `otherwise`.
+fn record(path: &Path, value: &impl Serialize, otherwise: &str) -> bool {
+    let json = serde_json::to_vec(value).expect("a record serializes");
     match write_atomic(path, &json, PRIVATE) {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(
-                "couldn't record a running hook, so moil can't stop it if moil crashes: {}",
+                "couldn't record a hook's run, so {otherwise}: {}",
                 with_path(error, path)
             );
             false
+        }
+    }
+}
+
+/// Ends the run of the entry in `dir`, which ended as `ending`: records
+/// that, then closes `log` with it and forgets the run, as
+/// [`Ended::close`] does.
+fn end_run(dir: &Path, log: &mut Log, ending: &Ending) {
+    let ended = Ended {
+        closing: ending.to_string(),
+        log_length: log.length(),
+        again: ending.runs_again(),
+    };
+    let otherwise = "a crash now would run it again, or close its log twice";
+    record(&dir.join(ENDED), &ended, otherwise);
+    ended.close(dir, log);
+}
+
+impl Ended {
+    /// Finishes the run it records, of the entry in `dir`: closes `log`
+    /// with the closing line, unless the log has that line already, then
+    /// forgets the run, removing first what queues the hook, unless it
+    /// runs again. Once this is recorded, a crash neither runs a hook that
+    /// exited again nor closes its log twice: [`recover`] calls this again.
+    fn close(&self, dir: &Path, log: &mut Log) {
+        // Once the hook has ended, only this line makes the log grow.
+        if self.log_length.is_some() && !log.grew_since(self.log_length) {
+            log.line(&self.closing);
+        }
+        if !self.again {
+            remove_quietly(&dir.join(QUEUED));
+        }
+        // This record last: a run recorded as running and not as ended is
+        // one moil lost track of.
+        for record in [GROUP, RUNNING, ENDED] {
+            remove_quietly(&dir.join(record));
         }
     }
 }
@@ -553,6 +633,12 @@ enum Ending {
 }
 
 impl Ending {
+    /// Whether the hook runs again from the start when moil next starts,
+    /// because it didn't get to exit.
+    fn runs_again(&self) -> bool {
+        matches!(self, Self::Quit | Self::Crashed)
+    }
+
     fn from_status(status: io::Result<std::process::ExitStatus>, after: Duration) -> Self {
         use std::os::unix::process::ExitStatusExt as _;
         match status {
@@ -612,35 +698,35 @@ struct Log {
 }
 
 impl Log {
-    /// Opens the log at `path`, first renaming it to `<name>.1` if it has
-    /// passed [`MAX_LOG_BYTES`] (spec/machine.md §2.3).
+    /// Opens the log at `path` as a hook starts, making it if it isn't
+    /// there, first renaming it to `<name>.1` if it has passed
+    /// [`MAX_LOG_BYTES`] (spec/machine.md §2.3).
     fn open(path: PathBuf) -> Self {
-        let file = open_log(&path)
-            .map_err(|error| {
-                tracing::warn!(
-                    "couldn't open a hook's log, so what the hook prints is lost: {}",
-                    log_error(error, &path)
-                );
-            })
-            .ok();
+        let file = open_log(&path, true).unwrap_or_else(|error| {
+            tracing::warn!("couldn't open a hook's log, so what the hook prints is lost: {error}");
+            None
+        });
         Self { path, file }
     }
 
     /// The log at `path`, to add to it, if it's there: a log that's gone,
     /// or a service folder, isn't made again just for a closing line.
     fn existing(path: PathBuf) -> Self {
-        let file = match log_options().open(&path) {
-            Ok(file) => Some(file),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => {
-                tracing::warn!(
-                    "couldn't write to a hook's log: {}",
-                    log_error(error, &path)
-                );
-                None
-            }
-        };
+        let file = open_log(&path, false).unwrap_or_else(|error| {
+            tracing::warn!("couldn't write to a hook's log: {error}");
+            None
+        });
         Self { path, file }
+    }
+
+    /// How long the log is, if it's open.
+    fn length(&self) -> Option<u64> {
+        Some(self.file.as_ref()?.metadata().ok()?.len())
+    }
+
+    /// Whether the log is open, and longer than it was `before`.
+    fn grew_since(&self, before: Option<u64>) -> bool {
+        matches!((before, self.length()), (Some(before), Some(now)) if now > before)
     }
 
     /// Appends `== <text>` as a line of its own.
@@ -672,37 +758,50 @@ impl Log {
     }
 }
 
-fn open_log(path: &Path) -> io::Result<File> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+/// Opens the log at `path` to add to it, if it's there, or with `start`,
+/// as a hook starts, making it and its folder if they aren't, and first
+/// renaming it to `<name>.1` if it has passed [`MAX_LOG_BYTES`]. Only a
+/// regular file in a folder that isn't a symbolic link: a commit could put
+/// a link at either path to have moil write to another of the owner's
+/// files.
+fn open_log(path: &Path, start: bool) -> io::Result<Option<File>> {
+    let dir = path
+        .parent()
+        .expect("a hook's log is in its service's folder");
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(refused(dir, &OpenError::SymbolicLink));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !start => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir).map_err(|e| with_path(e, dir))?;
+        }
+        // Anything else wrong with it, opening the log reports.
+        _ => {}
     }
-    if fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > MAX_LOG_BYTES) {
+    if start && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > MAX_LOG_BYTES) {
         let mut old = path.as_os_str().to_owned();
         old.push(".1");
-        fs::rename(path, old)?;
+        fs::rename(path, old).map_err(|e| with_path(e, path))?;
     }
-    log_options().create(true).open(path)
-}
-
-/// How moil opens a hook's log, to add to it: never through a symbolic
-/// link, which a commit could put there to have moil write to another of
-/// the owner's files.
-fn log_options() -> fs::OpenOptions {
     let mut options = File::options();
-    options
-        .read(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW);
-    options
+    options.read(true).append(true).create(start);
+    match open_regular(path, &options) {
+        Ok(file) => Ok(Some(file)),
+        Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::NotFound && !start => Ok(None),
+        Err(OpenError::Io(e)) => Err(with_path(e, path)),
+        Err(why) => Err(refused(path, &why)),
+    }
 }
 
-/// `error`, from opening the log at `path`, as a sentence.
-fn log_error(error: io::Error, path: &Path) -> io::Error {
-    if error.raw_os_error() == Some(libc::ELOOP) {
-        let why = "it's a symbolic link, which moil doesn't write through. Remove it";
-        return io::Error::new(error.kind(), format!("{}: {why}", path.display()));
-    }
-    with_path(error, path)
+/// Why moil doesn't write a log at `path`, or in the folder at `path`, as
+/// a sentence.
+fn refused(path: &Path, why: &OpenError) -> io::Error {
+    let why = match why {
+        OpenError::SymbolicLink => "it's a symbolic link, which moil doesn't write through",
+        _ => "it isn't a regular file, which is all moil writes a log to",
+    };
+    io::Error::other(format!("{}: {why}. Remove it", path.display()))
 }
 
 /// Makes `out` afresh with copies of the outputs `names` from `kept`, so
@@ -776,46 +875,61 @@ fn recover(home: &Home) -> io::Result<(BTreeMap<u64, Queued>, u64)> {
     Ok((ready, next_number))
 }
 
-/// The hook to run for the entry at `dir`, if it is to run.
+/// The hook to run for the entry at `dir`, if it is to run, once moil has
+/// finished what a crash left of its last run.
 fn recover_entry(home: &Home, dir: &Path) -> io::Result<Option<Queued>> {
     let queued = read_record::<Queued>(&dir.join(QUEUED));
-    let running = dir.join(RUNNING);
-    if let Some(supervisor) = read_record::<Process>(&running) {
-        // Another process runs it; with the home's lock, that can only be
-        // a moil that is about to exit.
-        if supervisor.is_running() {
-            return Ok(None);
-        }
-        let group = dir.join(GROUP);
-        if let Some(leader) = read_record::<Process>(&group) {
+    let running = read_record::<Running>(&dir.join(RUNNING));
+    // Another process runs it; with the home's lock, that can only be a
+    // moil that is about to exit.
+    if running.as_ref().is_some_and(|r| r.supervisor.is_running()) {
+        return Ok(None);
+    }
+    let ended = read_record::<Ended>(&dir.join(ENDED));
+    if running.is_some() && ended.is_none() {
+        // moil lost track of the hook as it ran.
+        if let Some(leader) = read_record::<Process>(&dir.join(GROUP)) {
             leader.kill_group()?;
-            fs::remove_file(&group)?;
-        }
-        fs::remove_file(&running)?;
-        // The run moil lost track of gets its closing line before the next
-        // one starts (spec/machine.md §2.3).
-        if let Some(queued) = &queued {
-            let context = &queued.context;
-            Log::existing(home.hook_log(&context.service.id, &context.bundle.name))
-                .line(&Ending::Crashed.to_string());
         }
         tracing::info!(
             "a hook was running when moil stopped; it runs again from the start: {}",
             dir.display()
         );
     }
-    match queued {
-        // Wherever the home is now.
-        Some(mut queued) => {
-            locate_outputs(&mut queued.context, dir);
-            Ok(Some(queued))
+    // The attempt never ended, its hook has run, or its record is damaged.
+    let Some(mut queued) = queued else {
+        moil_runtime::remove_tree(dir)?;
+        return Ok(None);
+    };
+    let context = &queued.context;
+    let mut log = Log::existing(home.hook_log(&context.service.id, &context.bundle.name));
+    let again = match (ended, running) {
+        (Some(ended), _) => {
+            ended.close(dir, &mut log);
+            ended.again
         }
-        // The attempt never ended, or its record is damaged.
-        None => {
-            moil_runtime::remove_tree(dir)?;
-            Ok(None)
+        // The run moil lost track of gets its closing line before the
+        // next one starts (spec/machine.md §2.3), if its first line made
+        // it to the log.
+        (None, Some(running)) => {
+            if log.grew_since(running.log_length) {
+                end_run(dir, &mut log, &Ending::Crashed);
+            } else {
+                for record in [GROUP, RUNNING] {
+                    remove_quietly(&dir.join(record));
+                }
+            }
+            true
         }
+        (None, None) => true,
+    };
+    if !again {
+        moil_runtime::remove_tree(dir)?;
+        return Ok(None);
     }
+    // Wherever the home is now.
+    locate_outputs(&mut queued.context, dir);
+    Ok(Some(queued))
 }
 
 /// Points `context` at the outputs of the queue entry in `dir`.
@@ -829,17 +943,10 @@ fn locate_outputs(context: &mut HookContext, dir: &Path) {
 
 /// The record at `path`, or `None` if there is none or it's damaged.
 fn read_record<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            tracing::warn!("couldn't read {}: {error}", path.display());
-            return None;
-        }
-    };
-    serde_json::from_slice(&bytes)
-        .map_err(|error| tracing::warn!("ignoring {}, which is damaged: {error}", path.display()))
-        .ok()
+    read_json(path).unwrap_or_else(|error| {
+        tracing::warn!("ignoring a hook's record: {error}");
+        None
+    })
 }
 
 /// Removes a queue entry, with its outputs.
@@ -861,5 +968,175 @@ fn remove_quietly(path: &Path) {
     };
     if let Err(error) = removed {
         tracing::warn!("couldn't remove {}: {error}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a run does to its queue entry and its log, one step at a time.
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        /// Records that it runs, as [`Running`].
+        Running,
+        /// Writes this line to the log.
+        Line(&'static str),
+        /// Records how it ended, as [`Ended`]: the closing line, and
+        /// whether the hook runs again.
+        Ended(&'static str, bool),
+        Remove(&'static str),
+    }
+
+    const EARLIER: &str =
+        "== 2026-09-27T22:41:08Z recording-0 attempt 1\nearlier\n== exited 0 after 1s\n";
+    const FIRST: &str = "2026-09-27T22:42:00Z recording-1 attempt 1";
+    const CRASHED: &str = "stopped: moil stopped unexpectedly";
+
+    /// The steps of a run that ends with `closing`, and runs again if
+    /// `again`, in the order `run` and [`end_run`] take them: each is a
+    /// point moil can crash after.
+    fn run(closing: &'static str, again: bool) -> Vec<Step> {
+        let mut steps = vec![
+            Step::Running,
+            Step::Line(FIRST),
+            Step::Line("printed"),
+            Step::Ended(closing, again),
+            Step::Line(closing),
+        ];
+        if !again {
+            steps.push(Step::Remove(QUEUED));
+        }
+        steps.extend([Step::Remove(RUNNING), Step::Remove(ENDED)]);
+        steps
+    }
+
+    fn context(home: &Home) -> HookContext {
+        let mut context = HookContext {
+            v: HOOK_CONTRACT_VERSION,
+            service: ServiceRef {
+                id: crate::ServiceId::new("klisi.example.com").unwrap(),
+                name: "klisi".into(),
+                base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            },
+            bundle: BundleRef {
+                name: "transcribe".into(),
+                version: "0.3.0".into(),
+                hash: "42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6"
+                    .parse()
+                    .unwrap(),
+            },
+            job_id: JobId::new("recording-1").unwrap(),
+            attempt: 1,
+            title: None,
+            params: serde_json::json!({}),
+            meta: None,
+            ended_at: SystemTime::UNIX_EPOCH,
+            output_dir: PathBuf::new(),
+            outputs: BTreeMap::from([(FileName::new("a.txt").unwrap(), PathBuf::new())]),
+        };
+        locate_outputs(&mut context, &home.hooks_queue_dir().join("0"));
+        context
+    }
+
+    /// Wherever moil crashes in a run, the run's first line in the log gets
+    /// one closing line, and the hook runs again only if it didn't get to
+    /// exit: when moil next starts, and when it starts once more after
+    /// crashing again right away.
+    #[tokio::test]
+    async fn a_crash_anywhere_in_a_run_closes_its_log_once_and_reruns_only_what_didnt_exit() {
+        // What a crash leaves of moil: a process that has exited.
+        let group = Group::spawn(Command::new("/usr/bin/true")).unwrap();
+        let crashed = group.leader();
+        group.finish().await.unwrap();
+
+        // An exited hook; one stopped as moil quit; and one that moil
+        // crashed during, then crashed again as it closed its log.
+        let runs = [
+            run("exited 0 after 1s", false),
+            run("stopped: moil quit", true),
+            run(CRASHED, true),
+        ];
+        for steps in runs {
+            for taken in 0..=steps.len() {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home::new(dir.path());
+                let entry = home.hooks_queue_dir().join("0");
+                fs::create_dir_all(entry.join(OUTPUTS)).unwrap();
+                fs::write(entry.join(OUTPUTS).join("a.txt"), "a").unwrap();
+                let queued = Queued {
+                    not_run: None,
+                    context: context(&home),
+                };
+                let context = &queued.context;
+                let log = home.hook_log(&context.service.id, &context.bundle.name);
+                fs::create_dir_all(log.parent().unwrap()).unwrap();
+                fs::write(&log, EARLIER).unwrap();
+                fs::write(entry.join(QUEUED), serde_json::to_vec(&queued).unwrap()).unwrap();
+                let length = || Some(fs::metadata(&log).unwrap().len());
+
+                // What the log holds, whether the run's first line is
+                // there, and how the run ended, if moil recorded it.
+                let mut written = EARLIER.to_owned();
+                let (mut started, mut ended) = (false, None);
+                for step in &steps[..taken] {
+                    match *step {
+                        Step::Running => {
+                            let running = Running {
+                                supervisor: crashed.clone(),
+                                log_length: length(),
+                            };
+                            assert!(record(&entry.join(RUNNING), &running, ""));
+                        }
+                        Step::Line(line) => {
+                            let line = match line {
+                                "printed" => "printed\n".to_owned(),
+                                line => format!("== {line}\n"),
+                            };
+                            let mut file = File::options().append(true).open(&log).unwrap();
+                            file.write_all(line.as_bytes()).unwrap();
+                            written.push_str(&line);
+                            started = true;
+                        }
+                        Step::Ended(closing, again) => {
+                            let how = Ended {
+                                closing: closing.into(),
+                                log_length: length(),
+                                again,
+                            };
+                            assert!(record(&entry.join(ENDED), &how, ""));
+                            ended = Some((closing, again));
+                        }
+                        Step::Remove(record) => fs::remove_file(entry.join(record)).unwrap(),
+                    }
+                }
+                // The run, if logged, closed once: as it ended, or as moil
+                // crashed if moil lost track of it.
+                let closing = format!("== {}\n", ended.map_or(CRASHED, |(closing, _)| closing));
+                let mut logged = written;
+                if started && !logged.ends_with(&closing) {
+                    logged.push_str(&closing);
+                }
+                let runs_again = ended.is_none_or(|(_, again)| again);
+
+                for start in ["moil starts", "moil starts again"] {
+                    let (ready, _) = recover(&home).unwrap();
+                    let at = format!("{steps:?} crashed after {taken} steps, then {start}");
+                    assert_eq!(fs::read_to_string(&log).unwrap(), logged, "{at}");
+                    assert_eq!(ready.contains_key(&0), runs_again, "{at}");
+                    let mut left: Vec<String> = match fs::read_dir(&entry) {
+                        Ok(names) => names
+                            .map(|n| n.unwrap().file_name().into_string().unwrap())
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    left.sort();
+                    match runs_again {
+                        true => assert_eq!(left, [QUEUED, OUTPUTS], "{at}"),
+                        false => assert_eq!(left, [] as [String; 0], "{at}"),
+                    }
+                }
+            }
+        }
     }
 }

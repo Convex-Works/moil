@@ -198,7 +198,9 @@ apply them as if the owner had made them through moil:
 - A change to `paused` takes effect.
 
 When a file becomes unreadable or invalid, moil reports it as a problem
-(§3.3) and keeps what it had read from that file before.
+(§3.3) and keeps what it had read from that file before. moil doesn't look
+inside folders that are symbolic links: it notices one being added,
+removed or replaced, not an edit deeper down.
 
 ## 2. Hooks
 
@@ -312,14 +314,17 @@ The closing line is one of:
 Before a hook runs, if its log has passed 1 MiB, moil renames it to
 `<bundle name>.log.1`, replacing any older one, and starts a new log.
 moil never writes to a log through a symbolic link, which a commit could
-put at its path to point at another of the owner's files: what that hook
-prints is lost, and moil says why in `logs/moil.log`.
+put at its path to point at another of the owner's files, nor into a
+`logs/` folder that is a symbolic link, nor to a log that isn't a regular
+file: what that hook prints is lost, and moil says why in `logs/moil.log`.
 
 moil records a hook's exit status and doesn't retry a hook that failed.
 But a hook that didn't get to exit, because moil quit or crashed, runs
 again from the start, with the same outputs, when moil next starts, unless
-its file is gone by then. So a hook runs at least once for each attempt
-that succeeded, and it should cope with running twice.
+its file is gone by then. Wherever moil crashes, each run it logged gets
+one closing line, and a hook that exited never runs again. So a hook runs
+at least once for each attempt that succeeded, and it should cope with
+running twice.
 
 ### 2.4 Trust
 
@@ -345,7 +350,11 @@ context carries no token, and no URL other than the service's base URL.
   control socket (§4): the agent pairs, fetches bundles, approves and
   holds the tokens, and the change takes effect at once. What a command
   reports is the home as it is when the command asks, so a change just
-  made from outside (§1.3) shows at once. When no agent
+  made from outside (§1.3) shows at once, as does the first report of
+  `status --watch`. If the home is changing, as during a `git pull`, the
+  agent waits for it to hold still for a moment first; if it keeps
+  changing for about a second, the command shows it as the agent last
+  read it. When no agent
   runs, the command works on the home itself. Only `stop`, `quit`,
   `login-item` and `status --watch` need a running agent. Without one they
   say so and exit with status 3.
@@ -382,14 +391,14 @@ context carries no token, and no URL other than the service's base URL.
 | `moil status [--watch]` | Whether an agent runs and in what; whether the machine is paused; the running job and its progress; the last job; each service's connection, and the bundles waiting for review; the hooks; and any problem with the home. `--watch` prints it again whenever it changes. | The tray menu |
 | `moil pause`, `moil resume` | Stop or resume taking new jobs. A running job carries on. | Pause, Resume |
 | `moil stop` | Stop the running job. Its service may give it to another machine. | Stop Current Job |
-| `moil pair SERVICE [--name NAME] [--no-browser]` | Pair with the service at a URL, with a service the home knows but isn't paired with (§1.2), or again with a paired one. Prints the code and the confirmation page's URL, opens the page, and waits for the owner to confirm there. `--name` sets `machine_name` (§1.1), for every service. Without an agent, the command holds the home until the pairing ends, so no agent can start meanwhile. | Pair with a Service…, Pair Again |
+| `moil pair SERVICE [--name NAME] [--no-browser]` | Pair with the service at a URL, with a service the home knows but isn't paired with (§1.2), or again with a paired one. Prints the code and the confirmation page's URL, opens the page, and waits for the owner to confirm there. `--name` sets `machine_name` (§1.1), for every service. Without an agent, the command holds the home until the pairing ends, so no agent can start meanwhile, and pairing again has the service forget the old token before the command ends. | Pair with a Service…, Pair Again |
 | `moil unpair SERVICE` | Tell the service to forget this machine, and delete this machine's pairing and token. The folder, with its approvals and hooks, stays; delete it to forget those too. | Unpair |
 | `moil services` | The services the home knows, paired or not, with their approvals. | The services in the menu |
 | `moil review SERVICE [HASH]` | The bundles a service offers and whether each is approved. With a hash, that bundle in full (protocol §5.5). | Review |
 | `moil approve SERVICE HASH [--yes]` | Show the bundle in full, then approve it. | Approve |
 | `moil revoke SERVICE HASH` | Withdraw an approval, stopping a running attempt of that bundle, and delete the bundle's files. It also removes an approval that doesn't count (§1.2). | Revoke Approval |
 | `moil hooks` | Each hook: its service and bundle, its path and log, and whether moil can run it. | The hooks in the menu |
-| `moil logs [SERVICE BUNDLE] [-f] [-n LINES]` | The agent's log or, given a service and bundle, that hook's log: all of it, or its last `LINES`. `-f` follows it, starting from the last 10 lines unless `-n` says otherwise. | Show Log |
+| `moil logs [SERVICE BUNDLE] [-f] [-n LINES]` | The agent's log or, given a service and bundle, that hook's log: all of it, or its last `LINES`. `-f` follows it, starting from the last 10 lines unless `-n` says otherwise. A log is read only from a regular file, not through a symbolic link. | Show Log |
 | `moil home` | The home's path. | Open moil Folder |
 | `moil login-item [on\|off]` | Whether the app opens at login. Needs the app to be running; under `moil agent` it fails. | Open at Login |
 | `moil quit` | Stop the agent. The running job is interrupted and reported, and the app quits, or `moil agent` exits. | Quit moil |

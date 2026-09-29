@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::lock::{LockedPackage, parse_lockfile};
 use crate::manifest::{Manifest, ManifestError};
+use crate::regular::{OpenError, open_regular};
 use crate::{FILE_NAMES, LOCKFILE, MANIFEST, MAX_BUNDLE_BYTES, SCRIPT};
 
 /// A valid bundle and its hash.
@@ -126,15 +127,14 @@ impl Bundle {
                 path: path.display().to_string(),
                 source,
             };
-            let file = match open_regular(&path) {
+            let file = match open_regular(&path, File::options().read(true)) {
                 Ok(file) => file,
-                Err(_) if is_link(&path) => return Err(LoadError::NotAFile(name)),
-                Err(e) => return Err(failed(e)),
+                Err(OpenError::Io(e)) => return Err(failed(e)),
+                Err(OpenError::SymbolicLink | OpenError::NotRegular) => {
+                    return Err(LoadError::NotAFile(name));
+                }
             };
             let metadata = file.metadata().map_err(failed)?;
-            if !metadata.is_file() {
-                return Err(LoadError::NotAFile(name));
-            }
             Ok((name, file, metadata.len()))
         };
         let files = [open(SCRIPT)?, open(LOCKFILE)?, open(MANIFEST)?];
@@ -263,27 +263,6 @@ impl fmt::Debug for Bundle {
             .field("hash", &self.hash)
             .finish_non_exhaustive()
     }
-}
-
-/// Opens `path` for reading, unless it is a symbolic link. Never blocks,
-/// even on a FIFO; check what it opened.
-fn open_regular(path: &Path) -> io::Result<File> {
-    let mut options = File::options();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    #[cfg(not(unix))]
-    if is_link(path) {
-        return Err(io::Error::other("a symbolic link"));
-    }
-    options.open(path)
-}
-
-fn is_link(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The bundle hash of `files` (spec §5.2): the SHA-256 of their `sha256sum`

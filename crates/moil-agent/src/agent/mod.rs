@@ -173,15 +173,21 @@ impl AgentHandle {
     /// Like [`Machine::pair`]; once the pairing completes, the agent
     /// connects to the service (to the same one again, with the new token,
     /// if it was paired before), ready to take the jobs of the bundles its
-    /// folder already approves.
+    /// folder already approves. Pairing again, the session doesn't wait for
+    /// the service to forget the old token: the agent tells it meanwhile.
     pub async fn pair(&self, base_url: &str) -> Result<PairingSession, Error> {
         let session = self.machine.pair(base_url).await?;
         let refreshes = self.refreshes.clone();
-        Ok(session.on_paired(Box::new(move |_: &Service| {
+        Ok(session.lives_on().on_paired(Box::new(move |_: &Service| {
             // Called where waiting is fine: the pairing completes once the
             // agent goes by it.
             let (done, applied) = oneshot::channel();
-            if refreshes.send(Refresh { left: None, done }).is_ok() {
+            let refresh = Refresh {
+                left: None,
+                settle: false,
+                done,
+            };
+            if refreshes.send(refresh).is_ok() {
                 let _ = applied.blocking_recv();
             }
         })))
@@ -229,12 +235,16 @@ impl AgentHandle {
         Ok(())
     }
 
-    /// Has the home read again at once, and waits until the agent goes by
-    /// what it says, so that a status taken next shows what is on disk now,
-    /// changes from outside included: what an owner or their agent just
-    /// wrote, then asks moil about (spec/machine.md §3.1).
+    /// Has the home read again, and waits until the agent goes by what it
+    /// says, so that a status taken next shows what is on disk now, changes
+    /// from outside included: what an owner or their agent just wrote, then
+    /// asks moil about (spec/machine.md §3.1). Quick unless the home has
+    /// changed since the agent last read it: then the reading waits for it
+    /// to hold still a moment, as the agent waits for any change from
+    /// outside, and if it doesn't, the agent goes on by what it read
+    /// before, until it does.
     pub async fn read_home(&self) {
-        self.refresh(None).await;
+        self.reread(None, true).await;
     }
 
     /// Has the home read again at once, and waits until the agent goes by
@@ -242,9 +252,14 @@ impl AgentHandle {
     /// owner changed it through the handle. `left` is a service the agent
     /// disconnected from to unpair it, which it may connect to again.
     async fn refresh(&self, left: Option<ServiceId>) {
+        self.reread(left, false).await;
+    }
+
+    async fn reread(&self, left: Option<ServiceId>, settle: bool) {
         let (done, applied) = oneshot::channel();
         // Fails only once the agent has shut down.
-        if self.refreshes.send(Refresh { left, done }).is_ok() {
+        let refresh = Refresh { left, settle, done };
+        if self.refreshes.send(refresh).is_ok() {
             let _ = applied.await;
         }
     }
