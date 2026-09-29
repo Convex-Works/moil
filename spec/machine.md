@@ -142,10 +142,12 @@ together with the base URL it was issued for. It is never kept in the
 service's folder.
 
 A service is **paired** on this machine when its folder has a
-`pairing.json` whose `base_url` is the one in `service.json`, and moil
-holds a token issued for that URL. A folder without them, such as one
-cloned from git, is a service the machine knows but isn't paired with.
-Pairing it (§3.2) keeps its approvals and hooks.
+`pairing.json` whose `base_url` is the one in `service.json`. moil
+connects to it only while it also holds a token issued for that URL; a
+paired service without one is to be paired again, which its connection
+says (§3.3). A folder without a `pairing.json`, such as one cloned from
+git, is a service the machine knows but isn't paired with. Pairing it
+(§3.2) keeps its approvals and hooks.
 
 moil MUST send a token only to the base URL it was issued for, as the
 keychain (or `.machine/`) records it, whatever the service's files say:
@@ -300,7 +302,7 @@ The closing line is one of:
 
 - `== exited <status> after <duration>`
 - `== killed by signal <number> after <duration>`
-- `== exited after <duration>, but moil couldn't tell how`
+- `== exited after <duration>, but moil couldn't tell how: <error>`
 - `== stopped after an hour`
 - `== stopped: moil quit`
 - `== stopped: moil stopped unexpectedly`, written when moil next starts,
@@ -394,8 +396,8 @@ context carries no token, and no URL other than the service's base URL.
 | `moil agent` | Run the agent in this terminal until interrupted. | — |
 | `moil init`, `check`, `hash`, `run` | Bundle authoring, as before. | — |
 
-`moil home` prints `Home: <path>`. The other commands' `Label: value`
-lines are as they are today: `Code:`, `URL:` and `Paired:` for `pair`,
+`moil home` prints `Home: <path>`. The other commands print these
+`Label: value` lines: `Code:`, `URL:` and `Paired:` for `pair`,
 `Approved:`, `Revoked:`, `Unpaired:`, and `Paused:` (`true` or `false`)
 for `pause` and `resume`, which answer once `settings.json` says so. When
 it can't say so, say because it isn't valid, they fail and change
@@ -482,9 +484,9 @@ A service, in `status` and as each element of `moil services --json`:
 ```
 
 - `paired` is true when the folder's `pairing.json` names its URL
-  (§1.2), with or without an agent. Only an agent looks for the token,
-  since reading the keychain may ask the owner first; it tells a missing
-  one by the connection.
+  (§1.2), with or without an agent. It doesn't depend on the token, since
+  reading the keychain may ask the owner first; while an agent runs, the
+  connection tells a missing one.
 - `connection` and `offered` are present while an agent runs and the
   service is paired. `connection.state` is `connecting`, `connected`,
   `offline` (with `error` and `retry_at`), `unpaired` (pair again: the

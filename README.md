@@ -149,10 +149,12 @@ contract.
 
 **The command line does everything the app does**, while the app runs
 too, so scripts and agents can drive moil: `moil status`, `pause`,
-`stop`, `pair`, `review`, `approve`, `hooks`, `logs` and the rest, each
-with `--json`. A service folder kept in git moves your approvals and
-hooks to your other machines; `.gitignore` keeps out what belongs to one
-machine alone, and the token never leaves the keychain.
+`stop`, `pair`, `review`, `approve`, `hooks`, `logs` and the rest, with
+`--json` on all that report something. A service folder kept in git moves
+your approvals and hooks to your other machines; `.gitignore` keeps out
+what belongs to one machine alone, and the token is never in a service's
+folder: it stays in the keychain (in `.machine/` off macOS), kept with the
+one URL it may be sent to.
 
 ## Write a bundle
 
