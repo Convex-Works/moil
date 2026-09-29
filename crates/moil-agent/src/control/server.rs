@@ -326,6 +326,8 @@ impl Shared {
     /// Sends the status now, then whenever it changes, until the client
     /// leaves or the agent stops.
     async fn watch(&self, mut reader: BufReader<OwnedReadHalf>, mut writer: OwnedWriteHalf) {
+        // The first, like any status, shows what's on disk now.
+        self.agent.read_home().await;
         let mut changes = self.agent.subscribe();
         let mut sent = None;
         loop {

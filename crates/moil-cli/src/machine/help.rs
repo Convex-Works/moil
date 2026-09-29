@@ -141,7 +141,7 @@ On stdin, the hook context: one line of JSON, then end-of-file. For example (spr
 The hook runs:
 
 - In an empty directory, which is also its TMPDIR, and which moil removes afterwards. The outputs are in output_dir, which the hook may change as it likes; moil deletes it once the hook exits, so a hook that wants to keep an output copies or moves it elsewhere. The outputs' names come from the service, so moil doesn't run the hook among them, where a file such as uv.toml could change what the hook runs.
-- With only these environment variables: HOME, USER, LANG, MOIL_HOME, TMPDIR, and PATH, which is <home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin. <home>/.machine/bin holds the moil and uv this machine runs, so a hook starting `#!/usr/bin/env -S uv run --script` can declare its Python dependencies inline, as a bundle does. A hook names anything else it needs itself, a program by its absolute path or a PATH of its own, so that the file alone says what it depends on.
+- With only these environment variables: HOME; USER, if moil has one; LANG, moil's own or else C.UTF-8; MOIL_HOME; TMPDIR; and PATH, which is <home>/.machine/bin:/usr/bin:/bin:/usr/sbin:/sbin. <home>/.machine/bin holds the moil and uv this machine runs, so a hook starting `#!/usr/bin/env -S uv run --script` can declare its Python dependencies inline, as a bundle does. A hook names anything else it needs itself, a program by its absolute path or a PATH of its own, so that the file alone says what it depends on.
 - In a process group of its own, for at most an hour. After that moil stops it as it stops a job's script: SIGTERM to the group, then SIGKILL 10 seconds later.
 
 WHAT IT LEAVES
@@ -156,6 +156,7 @@ The closing line is one of:
 
   == exited <status> after <duration>
   == killed by signal <number> after <duration>
+  == exited after <duration>, but moil couldn't tell how: <error>
   == stopped after an hour
   == stopped: moil quit
   == stopped: moil stopped unexpectedly      (written when moil next starts)

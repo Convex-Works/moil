@@ -177,3 +177,45 @@ impl Process {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt as _;
+
+    use super::*;
+
+    const KILL_GROUP_0: &str = "MOIL_TEST_KILL_GROUP_0";
+
+    /// Not a test of its own: the process that
+    /// [`a_record_naming_group_0_kills_nothing`] starts, in a process group
+    /// of its own, which signalling group 0 would kill.
+    #[test]
+    #[ignore = "run by another test in this file, in a process of its own"]
+    fn kill_group_0() {
+        if std::env::var_os(KILL_GROUP_0).is_none() {
+            return;
+        }
+        let record = Process {
+            pid: 0,
+            started: sys::start_token(0).unwrap_or_default(),
+            boot: sys::boot_id(),
+        };
+        record.kill_group().unwrap();
+    }
+
+    /// Signalling group 0 reaches the process that signals it, and group 1
+    /// every process the owner has, so a record naming either kills
+    /// nothing. Only group 0 is tried: were group 1 signalled, it would
+    /// take the computer's other processes with it.
+    #[test]
+    fn a_record_naming_group_0_kills_nothing() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::tests::kill_group_0", "--ignored"])
+            .env(KILL_GROUP_0, "1")
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status:?}");
+    }
+}

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use moil_agent::display::reveal;
+use moil_bundle::{OpenError, open_regular};
 
 /// How often a follower looks for more.
 const POLL: Duration = Duration::from_millis(100);
@@ -19,10 +20,12 @@ const FOLLOW_LINES: usize = 10;
 /// Prints the log at `path`, or its last `lines` lines, then with `follow`
 /// what is added to it until interrupted, whatever file is at `path` by
 /// then: logs are renamed aside and started afresh once they grow too big.
+/// Reads only a regular file, not through a symbolic link: a commit could
+/// put anything at a hook's log's path.
 pub fn print(path: &Path, follow: bool, lines: Option<usize>) -> anyhow::Result<()> {
     let lines = lines.or(follow.then_some(FOLLOW_LINES));
     let mut out = Lines::default();
-    let printed = match File::open(path) {
+    let printed = match open(path) {
         Ok(mut file) => {
             let mut text = Vec::new();
             file.read_to_end(&mut text)
@@ -113,7 +116,7 @@ fn follow_log(path: &Path, mut file: Option<File>, out: &mut Lines) -> io::Resul
 
 /// What is at `path`, unless nothing is, as while a log is renamed aside.
 fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -121,11 +124,21 @@ fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
 }
 
 fn open_if_there(path: &Path) -> io::Result<Option<File>> {
-    match File::open(path) {
+    match open(path) {
         Ok(file) => Ok(Some(file)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Opens the log at `path` to read it, if it is a regular file.
+fn open(path: &Path) -> io::Result<File> {
+    open_regular(path, File::options().read(true)).map_err(|error| match error {
+        OpenError::Io(e) => e,
+        refused => io::Error::other(format!(
+            "{refused}, and moil reads a log only from a regular file"
+        )),
+    })
 }
 
 /// Prints whole lines as they come in, with hidden characters revealed:

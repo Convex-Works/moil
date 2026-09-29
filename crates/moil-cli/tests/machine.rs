@@ -190,6 +190,33 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
     }
 }
 
+/// Without an agent, nothing goes on running after `moil pair` to tell
+/// the service to forget the old token, so `moil pair` does so first.
+#[test]
+fn pairing_again_without_an_agent_has_the_old_token_forgotten_before_it_ends() {
+    let home = Home::new();
+    let service = FakeService::start("klisi");
+    let args = [service.base_url.as_str(), "--no-browser", "--json"];
+    let mut pairing = Pairing::start(&home, &args);
+    parse::<Code>(&pairing.next_line());
+    service.confirm();
+    let id = parse::<Paired>(&pairing.next_line()).paired;
+    pairing.finish().success();
+
+    service.hold_forgets(true);
+    let mut pairing = Pairing::start(&home, &args);
+    parse::<Code>(&pairing.next_line());
+    service.confirm();
+    until("the service to be told", || {
+        service.forgotten() == ["moil_token_1"]
+    });
+    assert!(pairing.is_running(), "moil pair waits for the service");
+    service.hold_forgets(false);
+    assert_eq!(parse::<Paired>(&pairing.next_line()).paired, id);
+    pairing.finish().success();
+    assert_eq!(service.tokens(), ["moil_token_2".to_owned()].into());
+}
+
 #[test]
 fn pausing_works_with_or_without_an_agent() {
     for with in [With::Home, With::Agent] {
@@ -660,6 +687,50 @@ fn logs_prints_the_last_lines_and_follows_across_rotation() {
     let printed = home.run(&["logs", "klisi", "transcribe"]).success();
     assert_eq!(printed.stdout(), written);
     home.run(&["logs", "nobody", "transcribe"]).failure(1);
+}
+
+/// What a commit could put at a hook's log's path: `moil logs` reads
+/// neither through a link, which could lead to /dev/zero, nor from a FIFO,
+/// which would keep it waiting.
+#[test]
+fn logs_reads_only_a_regular_file() {
+    use std::io::Read;
+
+    let home = Home::new();
+    home.service_folder(
+        "klisi",
+        "https://klisi.example.com/moil",
+        "klisi",
+        json!([]),
+    );
+    let logs = home.path().join("services/klisi/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", logs.join("transcribe.log")).unwrap();
+    let fifo = logs.join("summarize.log");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success());
+
+    for (bundle, why) in [
+        ("transcribe", "it is a symbolic link"),
+        ("summarize", "it isn't a regular file"),
+    ] {
+        for follow in [false, true] {
+            let mut args = vec!["logs", "klisi", bundle];
+            args.extend(follow.then_some("-f"));
+            let mut logging = home
+                .moil(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let status = wait(&mut logging);
+            let mut stderr = String::new();
+            let mut piped = logging.stderr.take().unwrap();
+            piped.read_to_string(&mut stderr).unwrap();
+            assert_eq!(status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains(why), "{args:?}: {stderr}");
+        }
+    }
 }
 
 #[test]

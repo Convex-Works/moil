@@ -61,6 +61,9 @@ pub struct PairingSession {
     interval: Duration,
     slow_down: Duration,
     on_paired: Option<OnPaired>,
+    /// Whether the process goes on running once paired, to tell the
+    /// service to forget the old token after [`wait`](Self::wait) returns.
+    lives_on: bool,
 }
 
 /// One answer to a token poll that doesn't end the pairing.
@@ -93,6 +96,7 @@ impl PairingSession {
             interval: Duration::from_secs(pairing.interval),
             slow_down: Self::SLOW_DOWN,
             on_paired: None,
+            lives_on: false,
         }
     }
 
@@ -115,16 +119,30 @@ impl PairingSession {
         self
     }
 
+    /// Has [`wait`](Self::wait) return without waiting for the service to
+    /// forget the old token, when pairing again, since this process goes
+    /// on running to tell it, as an agent's does.
+    pub(crate) fn lives_on(mut self) -> Self {
+        self.lives_on = true;
+        self
+    }
+
     /// Polls the service until the owner confirms or rejects the pairing, or
     /// the code expires. On confirmation, records the pairing and its token,
     /// in the folder of the service with this base URL if the home knows
     /// one (keeping its approvals and hooks), else in a new one.
     ///
+    /// Pairing again with a paired service, it also tells the service to
+    /// forget the old token, and returns once the service has answered or
+    /// the request has timed out, so that a process that exits once paired
+    /// doesn't leave the old token in use; unless the process
+    /// [`lives_on`](Self::lives_on).
+    ///
     /// Dropping the future abandons the pairing until the service has sent
     /// the token. From then on the pairing completes (the service and token
-    /// are stored, and an agent pairing through
-    /// [`AgentHandle::pair`](crate::AgentHandle::pair) connects) whether
-    /// the future is polled to the end or not.
+    /// are stored, the service is told to forget the old token, and an
+    /// agent pairing through [`AgentHandle::pair`](crate::AgentHandle::pair)
+    /// connects) whether the future is polled to the end or not.
     pub async fn wait(mut self) -> Result<Service, Error> {
         loop {
             tokio::time::sleep(self.interval).await;
@@ -199,7 +217,8 @@ impl PairingSession {
         }
         let (base_url, on_paired) = (self.base_url, self.on_paired);
         // One task that runs to the end, whoever waits for it.
-        self.machine
+        let (service, forgetting) = self
+            .machine
             .blocking(move |machine| {
                 let (service, replaced) = machine.record_pairing(
                     &base_url,
@@ -212,8 +231,7 @@ impl PairingSession {
                 }
                 // Pairing again made the service a new machine record; the
                 // old one would otherwise linger there, offline forever.
-                // Nothing waits for the service to answer.
-                if let Some(old) = replaced {
+                let forgetting = replaced.map(|old| {
                     let machine = machine.clone();
                     tokio::spawn(async move {
                         if let Err(e) = machine.forget_token_on(&old).await {
@@ -222,11 +240,17 @@ impl PairingSession {
                                 old.base_url
                             );
                         }
-                    });
-                }
-                Ok(service)
+                    })
+                });
+                Ok((service, forgetting))
             })
-            .await
+            .await?;
+        if let Some(forgetting) = forgetting
+            && !self.lives_on
+        {
+            let _ = forgetting.await;
+        }
+        Ok(service)
     }
 }
 

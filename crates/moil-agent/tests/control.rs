@@ -318,6 +318,69 @@ async fn the_status_over_the_socket_shows_the_home_as_it_is_now() {
     let hooks = &status.services[0].hooks;
     assert_eq!(hooks.len(), 1, "{status:?}");
     assert!(hooks[0].runnable && hooks[0].bundle == "transcribe");
+
+    // The same for the first status of a watch.
+    std::fs::remove_file(&hook).unwrap();
+    let mut watch = setup.client().await.watch().await.unwrap();
+    let first = watch.next().await.unwrap().unwrap();
+    assert_eq!(first.services[0].hooks, [], "{first:?}");
+}
+
+/// A status asked for while a checkout is under way, here with the
+/// service's service.json gone for the moment, isn't taken from the home
+/// half done: the service stays connected, and its job running.
+#[tokio::test]
+async fn a_status_asked_for_during_a_checkout_waits_for_it_to_end() {
+    let mut setup = Setup::slow_to_notice().await;
+    let mut conn = setup.connect(&[&setup.bundle]).await;
+    let mut client = setup.client().await;
+    conn.send(assign("j1", 1, setup.bundle.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    let run = setup.runs.next().await;
+
+    let id = &setup.paired().id;
+    let service_file = setup.home.service_file(id);
+    let kept = std::fs::read(&service_file).unwrap();
+    std::fs::remove_file(&service_file).unwrap();
+    // The rest of the checkout, which takes its time.
+    let checking_out = tokio_util::sync::CancellationToken::new();
+    let checkout = tokio::spawn({
+        let notes = setup.home.service_dir(id).join("notes.md");
+        let checking_out = checking_out.clone();
+        async move {
+            for line in 0.. {
+                std::fs::write(&notes, format!("line {line}\n")).unwrap();
+                tokio::select! {
+                    () = checking_out.cancelled() => return,
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        }
+    });
+    let during = client.status().await.unwrap();
+    checking_out.cancel();
+    checkout.await.unwrap();
+    std::fs::write(&service_file, kept).unwrap();
+    let after = client.status().await.unwrap();
+
+    for status in [&during, &after] {
+        let [service] = &status.services[..] else {
+            panic!("{status:?}");
+        };
+        assert_eq!(service.connection, Some(ConnectionReport::Connected));
+        let job = status.job.as_ref().expect("the job runs");
+        assert!(!job.stopping, "{status:?}");
+    }
+    run.finish(succeeded());
+    loop {
+        if let MachineMessage::Done(done) = conn.recv().await {
+            assert!(
+                matches!(done.outcome, moil_proto::Outcome::Succeeded { .. }),
+                "{done:?}"
+            );
+            break;
+        }
+    }
 }
 
 #[tokio::test]

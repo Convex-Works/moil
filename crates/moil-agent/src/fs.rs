@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use moil_bundle::{OpenError, open_regular};
 use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -171,30 +172,16 @@ pub(crate) enum Unreadable {
 /// through a link, a device or without end, or wait on a FIFO.
 pub(crate) fn read_small(path: &Path) -> Result<Option<Vec<u8>>, Unreadable> {
     use std::io::Read;
-    let is_link = || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
     let failed = |e| Unreadable::Io(with_path(e, path));
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(
-        &mut options,
-        libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-    );
-    #[cfg(not(unix))]
-    if is_link() {
-        return Err(Unreadable::Refused(SYMBOLIC_LINK.into()));
-    }
-    let file = match options.open(path) {
+    let file = match open_regular(path, OpenOptions::new().read(true)) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) if is_link() => return Err(Unreadable::Refused(SYMBOLIC_LINK.into())),
-        Err(e) => return Err(failed(e)),
+        Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(OpenError::Io(e)) => return Err(failed(e)),
+        Err(OpenError::SymbolicLink) => return Err(Unreadable::Refused(SYMBOLIC_LINK.into())),
+        Err(refused) => return Err(Unreadable::Refused(refused.to_string())),
     };
     let metadata = file.metadata().map_err(failed)?;
     let too_large = || Unreadable::Refused("it is larger than 1 MiB".into());
-    if !metadata.is_file() {
-        return Err(Unreadable::Refused("it isn't a regular file".into()));
-    }
     if metadata.len() > MAX_JSON_BYTES {
         return Err(too_large());
     }

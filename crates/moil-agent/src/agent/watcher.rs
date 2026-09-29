@@ -20,6 +20,14 @@
 //! all the time can't hold the others up: within three polls of the
 //! change either way.
 //!
+//! A command asks for a reading too, to show the home as it is now. If
+//! nothing changed since the last, it needs none. Otherwise it gets one
+//! once the fingerprint has held still for a moment ([`MAX_ASKED_SETTLE`],
+//! or one poll if that's shorter), so that it doesn't catch a checkout
+//! half done either. If the home doesn't hold still within
+//! [`MAX_ASKED_POLLS`] of those, the command goes without, and the change
+//! is read as any other.
+//!
 //! Everything the agent learns from the home comes through here, the
 //! changes it makes itself included: the handle asks for a
 //! [`Refresh`] once it has written them. Readings reach the coordinator
@@ -54,6 +62,14 @@ use crate::{Home, Machine, Service, ServiceId};
 /// How many polls in a row may find the home changing before it is read
 /// all the same.
 const MAX_UNSETTLED_POLLS: u32 = 3;
+
+/// How long the home must hold still before a reading a command asked for
+/// is taken, at most: the watcher's own poll, if that is shorter.
+const MAX_ASKED_SETTLE: Duration = Duration::from_millis(250);
+
+/// How many times a reading a command asked for looks for the home to hold
+/// still before it goes without.
+const MAX_ASKED_POLLS: u32 = 4;
 
 /// How deep [`fingerprint`] looks under `services/`, down to
 /// `<id>/bundles/<name>/<hash>/<file>`.
@@ -174,15 +190,29 @@ impl Reading {
     }
 }
 
-/// Asks the watcher to read the home at once, for a change the owner made
-/// through the agent.
+/// Asks the watcher to read the home: at once, for a change the owner made
+/// through the agent, or once it holds still, for a command to show it.
 #[derive(Debug)]
 pub(super) struct Refresh {
     /// A service the agent disconnected from to unpair it, which it may
     /// connect to again once the home has been read, if it's still paired.
     pub left: Option<ServiceId>,
-    /// Told once the agent goes by what was read.
+    /// Whether to wait for the home to hold still first, as for changes
+    /// made from outside, which may still be under way. Only without
+    /// `left`.
+    pub settle: bool,
+    /// Told once the agent goes by what was read, or would have been.
     pub done: oneshot::Sender<()>,
+}
+
+/// What a reading a command asked for finds, before it is taken.
+enum Asked {
+    /// Nothing changed since the last reading, so it needn't be taken.
+    Unchanged,
+    /// The home changed, and has held still since.
+    Settled,
+    /// The home is still changing.
+    Changing,
 }
 
 /// The task that reads the home whenever it changes, and when asked to.
@@ -206,7 +236,7 @@ impl Watcher {
         let mut last = self.read;
         let mut unsettled = 0;
         loop {
-            let refresh = tokio::select! {
+            let mut refresh = tokio::select! {
                 () = self.stop.cancelled() => return,
                 refresh = self.refreshes.recv() => match refresh {
                     Some(refresh) => Some(refresh),
@@ -214,6 +244,20 @@ impl Watcher {
                 },
                 _ = polls.tick() => None,
             };
+            if let Some(Refresh { settle: true, .. }) = refresh {
+                let Some(asked) = self.settle().await else {
+                    return;
+                };
+                if !matches!(asked, Asked::Settled) {
+                    let done = refresh.take().expect("a command asked").done;
+                    // Answered once what came before shows, with nothing
+                    // new to go by.
+                    if self.inputs.send(Input::Reply(done)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
             if refresh.is_none() {
                 let now = self
                     .machine
@@ -244,7 +288,7 @@ impl Watcher {
             };
             (self.read, last, unsettled) = (fingerprint, fingerprint, 0);
             let (left, done) = match refresh {
-                Some(Refresh { left, done }) => (left, Some(done)),
+                Some(Refresh { left, done, .. }) => (left, Some(done)),
                 None => (None, None),
             };
             let input = Input::Home {
@@ -256,6 +300,37 @@ impl Watcher {
                 return;
             }
         }
+    }
+
+    /// Waits for the home to hold still for a reading a command asked for,
+    /// for as long as the watcher's own poll or [`MAX_ASKED_SETTLE`], and at
+    /// most [`MAX_ASKED_POLLS`] times that. `None` once the agent stops.
+    async fn settle(&self) -> Option<Asked> {
+        let mut before = self.fingerprint().await?;
+        if before == self.read {
+            return Some(Asked::Unchanged);
+        }
+        let wait = self.interval.min(MAX_ASKED_SETTLE);
+        for _ in 0..MAX_ASKED_POLLS {
+            tokio::select! {
+                () = self.stop.cancelled() => return None,
+                () = tokio::time::sleep(wait) => {}
+            }
+            let now = self.fingerprint().await?;
+            if now == before {
+                return Some(Asked::Settled);
+            }
+            before = now;
+        }
+        Some(Asked::Changing)
+    }
+
+    /// The home's [`fingerprint`] now, or `None` once the agent stops.
+    async fn fingerprint(&self) -> Option<u64> {
+        self.machine
+            .blocking(|machine| Ok(fingerprint(machine.home())))
+            .await
+            .ok()
     }
 }
 
@@ -297,15 +372,23 @@ fn walk(digest: &mut DefaultHasher, dir: &Path, depth: usize) {
 }
 
 /// Adds what's at `path` to `digest`: a link, and what it leads to.
-/// Returns whether it's a directory, or leads to one.
+/// Returns whether it's a directory to look into, which a link to one
+/// isn't: a commit could link to a folder as large as the disk, or one
+/// slow to read. What is added to a linked folder, removed from it or
+/// replaced in it changes its times all the same.
 fn entry(digest: &mut DefaultHasher, path: &Path) -> bool {
     let own = fs::symlink_metadata(path);
     metadata(digest, &own);
     match own {
         Ok(own) if own.file_type().is_symlink() => {
-            let target = fs::metadata(path);
-            metadata(digest, &target);
-            target.is_ok_and(|target| target.is_dir())
+            match fs::metadata(path) {
+                Ok(target) if target.is_dir() => {
+                    let times = (target.mtime(), target.mtime_nsec());
+                    (target.dev(), target.ino(), target.mode(), times).hash(digest);
+                }
+                target => metadata(digest, &target),
+            }
+            false
         }
         own => own.is_ok_and(|own| own.is_dir()),
     }
@@ -369,5 +452,25 @@ mod tests {
             assert!(!seen.contains(&now), "{seen:?} {now}");
             seen.push(now);
         }
+    }
+
+    /// A commit could link a folder as large as the disk into the home: the
+    /// fingerprint looks at a linked folder, not into it.
+    #[test]
+    fn the_fingerprint_doesnt_look_into_linked_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("home"));
+        let service = home.services_dir().join("klisi.example.com");
+        write(&service.join("service.json"), "{}");
+        let elsewhere = dir.path().join("elsewhere");
+        write(&elsewhere.join("deep/file"), "one");
+        std::os::unix::fs::symlink(&elsewhere, service.join("hooks")).unwrap();
+        let before = fingerprint(&home);
+
+        write(&elsewhere.join("deep/file"), "one, and more");
+        assert_eq!(fingerprint(&home), before);
+        // What is added to the linked folder itself changes its times.
+        write(&elsewhere.join("transcribe"), "#!/bin/sh\n");
+        assert_ne!(fingerprint(&home), before);
     }
 }
