@@ -653,19 +653,18 @@ impl App {
     }
 
     /// Runs `work` against the agent on Tokio and delivers the event it
-    /// ends with.
+    /// ends with. `work` is called there too, within the runtime.
     fn spawn<F, Fut>(&self, work: F)
     where
-        F: FnOnce(Arc<dyn Backend>) -> Fut,
+        F: FnOnce(Arc<dyn Backend>) -> Fut + Send + 'static,
         Fut: Future<Output = AppEvent> + Send + 'static,
     {
         let Ok(backend) = self.backend.clone() else {
             return;
         };
         let proxy = self.proxy.clone();
-        let work = work(backend);
         self.runtime.spawn(async move {
-            let _ = proxy.send_event(work.await);
+            let _ = proxy.send_event(work(backend).await);
         });
     }
 
@@ -821,10 +820,7 @@ impl App {
             return;
         }
         tracing::info!("shutting down as the system ends the app");
-        let shutdown = tokio::time::timeout(SHUTDOWN_TIMEOUT, backend.shutdown());
-        if self.runtime.block_on(shutdown).is_err() {
-            tracing::warn!("the agent took too long to shut down");
-        }
+        shut_down_now(&self.runtime, &**backend);
     }
 
     /// Shuts the agent down, then exits. The running job is reported as
@@ -845,13 +841,84 @@ impl App {
         };
         let proxy = self.proxy.clone();
         self.runtime.spawn(async move {
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, backend.shutdown())
-                .await
-                .is_err()
-            {
-                tracing::warn!("the agent took too long to shut down");
-            }
+            shut_down(&*backend).await;
             let _ = proxy.send_event(AppEvent::ShutDown);
         });
+    }
+}
+
+/// Shuts the agent down, waiting for it at most [`SHUTDOWN_TIMEOUT`].
+async fn shut_down(backend: &dyn Backend) {
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, backend.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!("the agent took too long to shut down");
+    }
+}
+
+/// Shuts the agent down on `runtime` and returns once it has, from the
+/// main thread or any other outside the runtime. The event loop's threads
+/// aren't in the runtime's context, which timers need, so everything is
+/// made inside it.
+fn shut_down_now(runtime: &tokio::runtime::Runtime, backend: &dyn Backend) {
+    runtime.block_on(shut_down(backend));
+}
+
+#[cfg(test)]
+mod tests {
+    use moil_agent::control::{Client, ClientError};
+    use moil_agent::host::{HostConfig, Hosted};
+    use moil_agent::report::Host;
+    use moil_agent::{AgentOptions, Home, Machine, MachineConfig, MemorySecrets};
+
+    use super::*;
+
+    struct NoControls;
+
+    impl HostControls for NoControls {
+        fn quit(&self) {}
+    }
+
+    /// When the system ends the app, as logging out does, the event loop's
+    /// last event comes on the main thread, outside the runtime. The agent
+    /// shuts down from there, and commands no longer reach it.
+    #[test]
+    fn the_agent_shuts_down_when_the_system_ends_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("moil"));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let machine = Machine::open(MachineConfig {
+            home: home.clone(),
+            secrets: Arc::new(MemorySecrets::default()),
+            app_version: "0.0.0".into(),
+        })
+        .unwrap();
+        // No job runs, so any program will do for uv and moil.
+        let program = PathBuf::from("/usr/bin/true");
+        let jobs = moil_runtime::Runtime::new(machine.runtime_config(program.clone())).unwrap();
+        let hosted = runtime
+            .block_on(Hosted::start(HostConfig {
+                machine,
+                runtime: jobs,
+                moil: program,
+                host: Host::App,
+                controls: Arc::new(NoControls),
+                options: AgentOptions::default(),
+            }))
+            .unwrap();
+        assert!(home.socket().exists());
+
+        shut_down_now(&runtime, &hosted);
+
+        assert!(!home.socket().exists(), "the agent still listens");
+        let connected = runtime.block_on(Client::connect(&home));
+        assert!(
+            matches!(connected, Err(ClientError::NoAgent(_))),
+            "{connected:?}"
+        );
     }
 }
