@@ -22,8 +22,9 @@ use crate::process::Group;
 use crate::progress::{self, Meter};
 use crate::stderr::{self, Tail};
 use crate::stdout::{self, Report};
+use crate::sys::FileId;
 use crate::workdir::WorkDir;
-use crate::{EventSink, Job, Runtime, StopSignal, units, uv};
+use crate::{EventSink, HandOff, Job, Runtime, StopSignal, hand_off, units, uv};
 
 /// How long to keep reading the script's output after its process group is
 /// gone. Only a process that left the group can hold it open longer.
@@ -42,9 +43,15 @@ pub(crate) async fn run(
         job: &job,
         events: &events,
         ran: None,
+        uploaded: None,
     };
     let ended = attempt.run(&mut limits).await;
-    attempt.with_script_facts(outcome(&limits, ended))
+    let outcome = attempt.with_script_facts(outcome(&limits, ended));
+    if let (Outcome::Succeeded { result }, Some(hand_off)) = (&outcome, &job.hand_off) {
+        attempt.hand_off(hand_off, result);
+    }
+    outcome
+    // The working directory goes with `attempt`.
 }
 
 /// How an attempt that ended as `ended` turns out (spec §8.5). A stop wins
@@ -73,12 +80,26 @@ struct Attempt<'a> {
     events: &'a EventSink,
     /// Set once the script has run.
     ran: Option<Ran>,
+    /// Set once the outputs are up.
+    uploaded: Option<Uploaded>,
 }
 
 /// What every failure after the script ran reports about it (spec §9).
 struct Ran {
     exit_code: Option<i32>,
     stderr_tail: String,
+}
+
+/// An attempt whose outputs are up, kept until its outcome is known so
+/// that a success can hand them off before the working directory goes.
+struct Uploaded {
+    /// `out/`.
+    outputs: PathBuf,
+    /// The files that were uploaded, by name, or why they can't be told
+    /// apart from others.
+    files: Result<BTreeMap<FileName, FileId>, String>,
+    /// Removes the working directory when dropped.
+    _registration: Registration,
 }
 
 /// How an attempt ends other than in success.
@@ -148,7 +169,19 @@ impl Attempt<'_> {
             .await?;
 
         self.phase(Phase::Uploading);
+        // For handing them off, which never changes the outcome.
+        let uploaded = accepted
+            .files
+            .iter()
+            .map(|(name, file)| Ok((name.clone(), FileId::of(file)?)))
+            .collect::<std::io::Result<_>>()
+            .map_err(|e| format!("couldn't tell which files the outputs are: {e}"));
         let files = limits.guard(self.upload(accepted.files)).await??;
+        self.uploaded = Some(Uploaded {
+            outputs: work.outputs(),
+            files: uploaded,
+            _registration: registration,
+        });
         Ok(JobResult {
             meta: accepted.meta,
             files,
@@ -253,7 +286,7 @@ impl Attempt<'_> {
             .stderr(Stdio::piped());
         let mut group = Group::spawn(command).map_err(|e| uv::cant_start(&uv, &e))?;
         registration
-            .set_group(group.id())
+            .set_group(group.leader())
             .map_err(internal("couldn't record the script's process group"))?;
 
         let child = group.child_mut();
@@ -326,6 +359,29 @@ impl Attempt<'_> {
             uploaded.insert(name, info);
         }
         Ok(uploaded)
+    }
+
+    /// Leaves the outputs of an attempt that succeeded with `result` in
+    /// `hand_off`'s directory, and records how that went.
+    fn hand_off(&self, hand_off: &HandOff, result: &JobResult) {
+        let Some(uploaded) = &self.uploaded else {
+            debug_assert!(false, "an attempt succeeded without uploading");
+            return;
+        };
+        // A kept working directory keeps its outputs too.
+        let copy = self.runtime.config.keep_work_dirs;
+        let handed = uploaded.files.clone().and_then(|files| {
+            debug_assert!(result.files.keys().eq(files.keys()));
+            hand_off::hand_off(&uploaded.outputs, &files, hand_off.dir(), copy)
+        });
+        if let Err(why) = &handed {
+            tracing::warn!(
+                job_id = %self.job.id,
+                attempt = self.job.attempt,
+                "the attempt succeeded, but {why}"
+            );
+        }
+        hand_off.set_result(handed);
     }
 
     fn phase(&self, phase: Phase) {

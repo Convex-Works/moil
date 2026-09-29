@@ -28,7 +28,6 @@ getrandom = "0.4"
 maud = "0.27"
 open = "5"
 tao = "0.37"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tray-icon = "0.25"
 wry = "0.57"
 

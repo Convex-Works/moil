@@ -21,9 +21,10 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
+use moil_agent::hooks::HookOptions;
 use moil_agent::{
-    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, PairedService,
-    SecretStore, Snapshot,
+    AgentHandle, AgentOptions, FileSecrets, Home, Machine, MachineConfig, SecretStore, Service,
+    Snapshot,
 };
 use moil_bundle::Bundle;
 use moil_proto::control::{BundleInfo, Hello, Resume, Welcome};
@@ -32,8 +33,8 @@ use moil_proto::http::{
     TokenRequest, TokenResponse,
 };
 use moil_proto::{
-    Assign, AttemptRef, BundleHash, ErrorCode, JobError, JobEvent, MachineMessage, Offer, Outcome,
-    ServiceInfo, ServiceMessage,
+    Assign, AttemptRef, BundleHash, ErrorCode, FileInfo, FileName, JobError, JobEvent, JobResult,
+    MachineMessage, Offer, Outcome, ServiceInfo, ServiceMessage,
 };
 use moil_runtime::{EventSink, Executor, Job, StopReason, StopSignal};
 use tokio::sync::{mpsc, oneshot};
@@ -59,13 +60,19 @@ pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     .await;
 }
 
-/// Timings that keep tests fast: reconnects in milliseconds.
+/// Timings that keep tests fast: reconnects in milliseconds, and changes
+/// to the home noticed as quickly.
 pub fn fast() -> AgentOptions {
     AgentOptions {
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(40),
         channel_timeout: Duration::from_secs(5),
         shutdown_grace: Duration::from_secs(5),
+        home_poll: Duration::from_millis(20),
+        hooks: HookOptions {
+            time_limit: PATIENCE,
+            kill_grace: Duration::from_millis(200),
+        },
         ..AgentOptions::default()
     }
 }
@@ -112,18 +119,59 @@ impl SecretStore for SlowSecrets {
     }
 }
 
-/// Opens the machine whose home is `dir`, keeping tokens in a file there.
+/// Opens the machine whose home is `dir`, keeping tokens in a file there,
+/// as it does without a keychain.
 pub fn open_machine(dir: &Path) -> Machine {
-    Machine::open(MachineConfig {
-        home: Home::new(dir),
-        secrets: Arc::new(FileSecrets::new(dir.join("secrets.json"))),
+    Machine::open(config(dir)).unwrap()
+}
+
+/// The config of the machine whose home is `dir`, keeping tokens in a
+/// file there.
+pub fn config(dir: &Path) -> MachineConfig {
+    let home = Home::new(dir);
+    MachineConfig {
+        secrets: Arc::new(FileSecrets::new(home.secrets_file())),
+        home,
         app_version: "0.1.0-test".into(),
-    })
-    .unwrap()
+    }
+}
+
+/// What `moil status` finds wrong with the home at `dir`, reading it as a
+/// command does when no agent runs.
+pub fn problems(dir: &Path) -> Vec<moil_agent::report::Problem> {
+    let reader = Machine::open_read_only(config(dir)).unwrap();
+    moil_agent::status::from_home(&reader).problems
+}
+
+/// The tokens of the machine whose home is `dir`, by key.
+pub fn tokens(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    issued_tokens(dir)
+        .into_iter()
+        .map(|(key, (_, token))| (key, token))
+        .collect()
+}
+
+/// The tokens of the machine whose home is `dir`, by key, each with the
+/// base URL it was issued for.
+pub fn issued_tokens(dir: &Path) -> std::collections::BTreeMap<String, (String, String)> {
+    let stored: std::collections::BTreeMap<String, String> =
+        match std::fs::read_to_string(Home::new(dir).secrets_file()) {
+            Ok(text) => serde_json::from_str(&text).unwrap(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => panic!("{e}"),
+        };
+    stored
+        .into_iter()
+        .map(|(key, value)| {
+            let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+            let field = |name: &str| value[name].as_str().unwrap().to_owned();
+            (key, (field("base_url"), field("token")))
+        })
+        .collect()
 }
 
 /// Pairs `machine` with `service`, the owner confirming at once.
-pub async fn pair(machine: &Machine, service: &FakeService) -> PairedService {
+pub async fn pair(machine: &Machine, service: &FakeService) -> Service {
     service.script_pairing([TokenReply::Grant]);
     let session = machine.pair(&service.base_url).await.unwrap();
     within("pairing", session.wait()).await.unwrap()
@@ -254,6 +302,8 @@ struct Shared {
     bundles: Mutex<HashMap<BundleHash, BundleResponse>>,
     listed: Mutex<Vec<BundleInfo>>,
     forgotten: Mutex<Vec<String>>,
+    /// Every token a machine presented, accepted or not.
+    presented: Mutex<Vec<String>>,
     refuse_upgrades: Mutex<Option<StatusCode>>,
     /// While true, `DELETE /v1/machine` doesn't answer.
     hold_forgets: tokio::sync::watch::Sender<bool>,
@@ -296,6 +346,7 @@ impl FakeService {
             bundles: Mutex::default(),
             listed: Mutex::default(),
             forgotten: Mutex::default(),
+            presented: Mutex::default(),
             refuse_upgrades: Mutex::default(),
             hold_forgets: tokio::sync::watch::Sender::new(false),
             open: Mutex::default(),
@@ -390,6 +441,12 @@ impl FakeService {
         self.shared.hold_forgets.send_replace(hold);
     }
 
+    /// Every token a machine presented, whether the service accepted it
+    /// or not.
+    pub fn presented(&self) -> Vec<String> {
+        self.shared.presented.lock().unwrap().clone()
+    }
+
     /// Tokens the service currently accepts.
     pub fn tokens(&self) -> HashSet<String> {
         self.shared.tokens.lock().unwrap().clone()
@@ -424,6 +481,7 @@ impl Shared {
             .ok()?
             .strip_prefix("Bearer ")?
             .to_owned();
+        self.presented.lock().unwrap().push(token.clone());
         self.tokens
             .lock()
             .unwrap()
@@ -799,6 +857,32 @@ impl FakeRun {
     /// Ends the attempt with `outcome`.
     pub fn finish(mut self, outcome: Outcome) {
         let _ = self.finish.take().unwrap().send(outcome);
+    }
+
+    /// Ends the attempt as one that succeeded with `meta`, having uploaded
+    /// `outputs` (names and contents), and hands them off as the runtime
+    /// does (spec §8.5) if the agent asked it to.
+    pub fn succeed_with(self, meta: Option<serde_json::Value>, outputs: &[(&str, &str)]) {
+        if let Some(hand_off) = &self.job.hand_off {
+            std::fs::create_dir_all(hand_off.dir()).unwrap();
+            for (name, contents) in outputs {
+                std::fs::write(hand_off.dir().join(name), contents).unwrap();
+            }
+            hand_off.set_result(Ok(()));
+        }
+        let files = outputs
+            .iter()
+            .map(|(name, contents)| {
+                let info = FileInfo {
+                    size_bytes: contents.len() as u64,
+                    sha256: "0".repeat(64),
+                };
+                (FileName::new(*name).unwrap(), info)
+            })
+            .collect();
+        self.finish(Outcome::Succeeded {
+            result: JobResult { meta, files },
+        });
     }
 
     /// Waits until the agent asks the attempt to stop, and says why. The

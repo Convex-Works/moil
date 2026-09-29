@@ -6,17 +6,19 @@ use std::time::{Duration, Instant};
 use moil_proto::http::{PairResponse, TokenRequest, TokenResponse, token_error};
 use url::Url;
 
-use crate::{Error, Machine, PairedService, net};
+use crate::{Error, Machine, Service, net};
 
 /// Called with the service once a pairing completes.
-pub(crate) type OnPaired = Box<dyn FnOnce(&PairedService) + Send + Sync>;
+pub(crate) type OnPaired = Box<dyn FnOnce(&Service) + Send + Sync>;
 
-/// Fails unless `page`, a confirmation page from the service at
-/// `base_url`, is a web page on the service's own origin, with no user
-/// name or password to disguise it (spec §4). A service could otherwise
-/// relay another service's pairing, and the owner, confirming on that
-/// service's page, would pair the relay's machine with their account there.
-pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<(), Error> {
+/// `page`, a confirmation page from the service at `base_url`, as it was
+/// checked: a web page on the service's own origin, with no user name or
+/// password to disguise it (spec §4). A service could otherwise relay
+/// another service's pairing, and the owner, confirming on that service's
+/// page, would pair the relay's machine with their account there. Show
+/// and open the returned URL, never `page` itself, which another parser
+/// could read as another page.
+pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<Url, Error> {
     let refuse = |reason: &str| {
         Err(Error::NotAService {
             url: base_url.to_string(),
@@ -36,7 +38,7 @@ pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<(), 
     if !url.username().is_empty() || url.password().is_some() {
         return refuse("has a user name or password in it");
     }
-    Ok(())
+    Ok(url)
 }
 
 /// A pairing in progress: show [`PairingSession::user_code`] to the owner,
@@ -45,6 +47,9 @@ pub(crate) fn check_confirmation_page(base_url: &Url, page: &str) -> Result<(), 
 pub struct PairingSession {
     /// The code the owner should see on the service's confirmation page.
     pub user_code: String,
+    /// The service's confirmation page, and the same with the code filled
+    /// in, each as moil parsed it to check that it is on the service's own
+    /// origin: open exactly this.
     pub verification_uri: String,
     pub verification_uri_complete: String,
     /// The name the service gives itself.
@@ -56,6 +61,9 @@ pub struct PairingSession {
     interval: Duration,
     slow_down: Duration,
     on_paired: Option<OnPaired>,
+    /// Whether the process goes on running once paired, to tell the
+    /// service to forget the old token after [`wait`](Self::wait) returns.
+    lives_on: bool,
 }
 
 /// One answer to a token poll that doesn't end the pairing.
@@ -88,6 +96,7 @@ impl PairingSession {
             interval: Duration::from_secs(pairing.interval),
             slow_down: Self::SLOW_DOWN,
             on_paired: None,
+            lives_on: false,
         }
     }
 
@@ -110,15 +119,31 @@ impl PairingSession {
         self
     }
 
+    /// Has [`wait`](Self::wait) return without waiting for the service to
+    /// forget the old token, when pairing again, since this process goes
+    /// on running to tell it, as an agent's does.
+    pub(crate) fn lives_on(mut self) -> Self {
+        self.lives_on = true;
+        self
+    }
+
     /// Polls the service until the owner confirms or rejects the pairing, or
-    /// the code expires. On confirmation, stores the service and its token.
+    /// the code expires. On confirmation, records the pairing and its token,
+    /// in the folder of the service with this base URL if the home knows
+    /// one (keeping its approvals and hooks), else in a new one.
+    ///
+    /// Pairing again with a paired service, it also tells the service to
+    /// forget the old token, and returns once the service has answered or
+    /// the request has timed out, so that a process that exits once paired
+    /// doesn't leave the old token in use; unless the process
+    /// [`lives_on`](Self::lives_on).
     ///
     /// Dropping the future abandons the pairing until the service has sent
     /// the token. From then on the pairing completes (the service and token
-    /// are stored, and an agent pairing through
-    /// [`AgentHandle::pair`](crate::AgentHandle::pair) connects) whether
-    /// the future is polled to the end or not.
-    pub async fn wait(mut self) -> Result<PairedService, Error> {
+    /// are stored, the service is told to forget the old token, and an
+    /// agent pairing through [`AgentHandle::pair`](crate::AgentHandle::pair)
+    /// connects) whether the future is polled to the end or not.
+    pub async fn wait(mut self) -> Result<Service, Error> {
         loop {
             tokio::time::sleep(self.interval).await;
             if Instant::now() >= self.expires_at {
@@ -179,7 +204,7 @@ impl PairingSession {
         }
     }
 
-    async fn complete(self, granted: TokenResponse) -> Result<PairedService, Error> {
+    async fn complete(self, granted: TokenResponse) -> Result<Service, Error> {
         if !moil_proto::ids::is_machine_id(&granted.machine_id) {
             return Err(Error::Http(format!(
                 "{} gave this machine an invalid ID ({:?})",
@@ -192,7 +217,8 @@ impl PairingSession {
         }
         let (base_url, on_paired) = (self.base_url, self.on_paired);
         // One task that runs to the end, whoever waits for it.
-        self.machine
+        let (service, forgetting) = self
+            .machine
             .blocking(move |machine| {
                 let (service, replaced) = machine.record_pairing(
                     &base_url,
@@ -205,16 +231,26 @@ impl PairingSession {
                 }
                 // Pairing again made the service a new machine record; the
                 // old one would otherwise linger there, offline forever.
-                // Nothing waits for the service to answer.
-                if let Some(old_token) = replaced {
+                let forgetting = replaced.map(|old| {
                     let machine = machine.clone();
-                    tokio::spawn(
-                        async move { machine.forget_token_on(&base_url, &old_token).await },
-                    );
-                }
-                Ok(service)
+                    tokio::spawn(async move {
+                        if let Err(e) = machine.forget_token_on(&old).await {
+                            tracing::warn!(
+                                "couldn't tell {} to forget this machine's old token: {e}",
+                                old.base_url
+                            );
+                        }
+                    })
+                });
+                Ok((service, forgetting))
             })
-            .await
+            .await?;
+        if let Some(forgetting) = forgetting
+            && !self.lives_on
+        {
+            let _ = forgetting.await;
+        }
+        Ok(service)
     }
 }
 
@@ -237,7 +273,7 @@ impl fmt::Debug for PairingSession {
 mod tests {
     use super::*;
 
-    fn check(base: &str, page: &str) -> Result<(), Error> {
+    fn check(base: &str, page: &str) -> Result<Url, Error> {
         check_confirmation_page(&Url::parse(base).unwrap(), page)
     }
 

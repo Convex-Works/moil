@@ -16,7 +16,7 @@ mod gallery;
 mod icon;
 mod ipc;
 mod links;
-mod log;
+mod local_bin;
 mod login;
 mod page;
 mod pair;
@@ -75,12 +75,14 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let log_dir = if options.demo {
-        Some(log::demo_dir())
+    let home = if options.demo {
+        // Apart from the real app's.
+        Some(demo::home())
     } else {
-        log::default_dir()
+        moil_agent::Home::default_root().ok()
     };
-    let log_file = log::init(log_dir.as_deref());
+    let log_file = home.map(|root| moil_agent::Home::new(root).log_file());
+    let log_file = moil_agent::log::init(log_file.as_deref());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -94,18 +96,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (backend, login): (Result<Arc<dyn Backend>, String>, Box<dyn LoginItem>) = {
+    let event_loop = app::event_loop();
+    let (backend, login): (Result<Arc<dyn Backend>, String>, Box<dyn LoginItem>) = if options.demo {
+        tracing::info!("running the demo: nothing here touches this machine's moil");
         let _entered = runtime.enter();
-        if options.demo {
-            tracing::info!("running the demo: nothing here touches this machine's moil");
-            let demo: Arc<dyn Backend> = Arc::new(demo::Demo::start());
-            (Ok(demo), Box::new(DemoLoginItem::default()))
-        } else {
-            let login = Cached::new(SystemLoginItem::new(), Duration::from_secs(30));
-            (backend::start_agent(), Box::new(login))
-        }
+        let demo: Arc<dyn Backend> = Arc::new(demo::Demo::start());
+        (Ok(demo), Box::new(DemoLoginItem::default()))
+    } else {
+        local_bin::put_on_path();
+        let controls = Arc::new(app::Controls::new(&event_loop));
+        let login = Cached::new(SystemLoginItem::new(), Duration::from_secs(30));
+        (backend::start_agent(&runtime, controls), Box::new(login))
     };
-    app::run(runtime, backend, login, options.links, log_file)
+    app::run(event_loop, runtime, backend, login, options.links, log_file)
 }
 
 #[cfg(test)]

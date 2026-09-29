@@ -1,14 +1,18 @@
 //! What the app needs from the machine agent, as a trait, so that the same
-//! UI runs on the real agent ([`AgentHandle`]) or on the demo
+//! UI runs on the real agent ([`Hosted`]) or on the demo
 //! ([`crate::demo::Demo`]).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use moil_agent::control::HostControls;
+use moil_agent::host::{HostConfig, Hosted};
+use moil_agent::report::Host;
 use moil_agent::{
-    AgentHandle, Error, Home, Machine, MachineConfig, PairedService, Review, ServiceId, Snapshot,
+    AgentOptions, Error, Home, Machine, MachineConfig, Review, Service, ServiceId, Snapshot,
     default_secrets,
 };
 use moil_proto::BundleHash;
@@ -17,11 +21,16 @@ use tokio::sync::watch;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// The machine agent, as the app uses it. Methods mirror [`AgentHandle`]'s;
-/// futures own their arguments so they can run on any task.
+/// The machine agent, as the app uses it. Methods mirror
+/// [`AgentHandle`](moil_agent::AgentHandle)'s; futures own their arguments
+/// so they can run on any task.
 pub trait Backend: Send + Sync + 'static {
-    /// Watches the agent's state; the receiver holds the current snapshot.
+    /// Watches the agent's state, the home as it goes by it included; the
+    /// receiver holds the current snapshot.
     fn subscribe(&self) -> watch::Receiver<Snapshot>;
+
+    /// The home the agent runs on, as an absolute path.
+    fn home(&self) -> PathBuf;
 
     /// Starts pairing with the service at `base_url`: checks it is a moil
     /// service and asks it for a code for the owner to confirm.
@@ -38,17 +47,20 @@ pub trait Backend: Send + Sync + 'static {
     /// bundle for that service.
     fn revoke(&self, service: ServiceId, hash: BundleHash) -> BoxFuture<'_, Result<()>>;
 
-    /// Disconnects from a service and forgets it, stopping its running job.
+    /// Disconnects from a service and unpairs from it, stopping its running
+    /// job. Its folder, with its approvals and hooks, stays.
     fn unpair(&self, service: ServiceId) -> BoxFuture<'_, Result<()>>;
 
     /// Stops or resumes taking new jobs. A running job carries on.
-    fn set_paused(&self, paused: bool);
+    /// Resolves once `settings.json` says so too, or with why it can't.
+    fn set_paused(&self, paused: bool) -> BoxFuture<'_, Result<()>>;
 
     /// Stops the running job, if any; its service may give it to another
-    /// machine.
-    fn stop_job(&self);
+    /// machine. Resolves once the snapshot shows it stopping.
+    fn stop_job(&self) -> BoxFuture<'_, ()>;
 
-    /// Stops the running job, reports it, and closes every connection.
+    /// Stops the running job, reports it, and closes every connection,
+    /// then stops listening for commands.
     fn shutdown(&self) -> BoxFuture<'_, ()>;
 }
 
@@ -59,7 +71,7 @@ pub struct Pairing {
     /// service, or the code expires. Dropping it abandons the pairing,
     /// unless the service has already sent the machine's token: then the
     /// pairing completes anyway, and the agent connects.
-    pub confirmed: BoxFuture<'static, Result<PairedService>>,
+    pub confirmed: BoxFuture<'static, Result<Service>>,
 }
 
 impl std::fmt::Debug for Pairing {
@@ -81,14 +93,19 @@ pub struct PairingCode {
     pub expires_at: Instant,
 }
 
-impl Backend for AgentHandle {
+impl Backend for Hosted {
     fn subscribe(&self) -> watch::Receiver<Snapshot> {
-        AgentHandle::subscribe(self)
+        self.agent().subscribe()
+    }
+
+    fn home(&self) -> PathBuf {
+        let root = self.agent().machine().home().root();
+        std::path::absolute(root).unwrap_or_else(|_| root.to_owned())
     }
 
     fn pair(&self, base_url: String) -> BoxFuture<'_, Result<Pairing>> {
         async move {
-            let session = AgentHandle::pair(self, &base_url).await?;
+            let session = self.agent().pair(&base_url).await?;
             let code = PairingCode {
                 user_code: session.user_code.clone(),
                 verification_uri: session.verification_uri.clone(),
@@ -105,31 +122,31 @@ impl Backend for AgentHandle {
     }
 
     fn review(&self, service: ServiceId, hash: BundleHash) -> BoxFuture<'_, Result<Review>> {
-        async move { AgentHandle::review(self, &service, hash).await }.boxed()
+        async move { self.agent().review(&service, hash).await }.boxed()
     }
 
     fn approve(&self, review: Review) -> BoxFuture<'_, Result<()>> {
-        async move { AgentHandle::approve(self, &review).await }.boxed()
+        async move { self.agent().approve(&review).await }.boxed()
     }
 
     fn revoke(&self, service: ServiceId, hash: BundleHash) -> BoxFuture<'_, Result<()>> {
-        async move { AgentHandle::revoke(self, &service, hash).await }.boxed()
+        async move { self.agent().revoke(&service, hash).await }.boxed()
     }
 
     fn unpair(&self, service: ServiceId) -> BoxFuture<'_, Result<()>> {
-        async move { AgentHandle::unpair(self, &service).await }.boxed()
+        async move { self.agent().unpair(&service).await }.boxed()
     }
 
-    fn set_paused(&self, paused: bool) {
-        AgentHandle::set_paused(self, paused);
+    fn set_paused(&self, paused: bool) -> BoxFuture<'_, Result<()>> {
+        self.agent().set_paused(paused).boxed()
     }
 
-    fn stop_job(&self) {
-        AgentHandle::stop_job(self);
+    fn stop_job(&self) -> BoxFuture<'_, ()> {
+        self.agent().stop_job().map(drop).boxed()
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
-        AgentHandle::shutdown(self).boxed()
+        Hosted::shutdown(self).boxed()
     }
 }
 
@@ -146,13 +163,20 @@ pub enum StartError {
     Runtime(#[from] moil_runtime::ConfigError),
 }
 
-/// Opens this computer's moil home and starts the agent on it, the way the
-/// app runs for real, or says why it couldn't, in words for the owner. A
-/// bug that panics while starting is reported the same way, so that the
-/// owner sees it instead of the app vanishing. Must be called within a
-/// Tokio runtime.
-pub fn start_agent() -> Result<Arc<dyn Backend>, String> {
-    match std::panic::catch_unwind(start) {
+/// Opens this computer's moil home and runs the agent on it, the way the
+/// app runs for real: through [`Hosted`], which also serves the control
+/// socket, so that `moil` commands reach the agent while the app runs.
+/// `controls` does for those commands what only the app can. Or says why
+/// it couldn't start, in words for the owner. A bug that panics while
+/// starting is reported the same way, so that the owner sees it instead of
+/// the app vanishing.
+pub fn start_agent(
+    runtime: &tokio::runtime::Runtime,
+    controls: Arc<dyn HostControls>,
+) -> Result<Arc<dyn Backend>, String> {
+    let started =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(runtime, controls)));
+    match started {
         Ok(started) => started.map_err(|e| e.to_string()),
         Err(panic) => {
             let what = panic
@@ -165,7 +189,10 @@ pub fn start_agent() -> Result<Arc<dyn Backend>, String> {
     }
 }
 
-fn start() -> Result<Arc<dyn Backend>, StartError> {
+fn start(
+    tokio: &tokio::runtime::Runtime,
+    controls: Arc<dyn HostControls>,
+) -> Result<Arc<dyn Backend>, StartError> {
     let home = Home::new(Home::default_root()?);
     let secrets = default_secrets(&home)?;
     let machine = Machine::open(MachineConfig {
@@ -175,13 +202,21 @@ fn start() -> Result<Arc<dyn Backend>, StartError> {
     })?;
     let uv = find_uv().ok_or(StartError::NoUv)?;
     let runtime = Runtime::new(machine.runtime_config(uv))?;
-    match runtime.reap_orphans() {
-        Ok(0) => {}
-        Ok(n) => tracing::info!("cleaned up {n} attempts left over from an earlier run"),
-        Err(e) => tracing::warn!("couldn't clean up attempts left over from an earlier run: {e}"),
-    }
-    Ok(Arc::new(moil_agent::Agent::start(
+    let hosted = tokio.block_on(Hosted::start(HostConfig {
         machine,
-        Arc::new(runtime),
-    )))
+        runtime,
+        moil: own_moil(),
+        host: Host::App,
+        controls,
+        options: AgentOptions::default(),
+    }))?;
+    Ok(Arc::new(hosted))
+}
+
+/// The `moil` beside the app: in `Moil.app/Contents/MacOS`, or where Cargo
+/// builds both.
+fn own_moil() -> PathBuf {
+    std::env::current_exe()
+        .map(|exe| exe.with_file_name("moil"))
+        .unwrap_or_else(|_| PathBuf::from("moil"))
 }

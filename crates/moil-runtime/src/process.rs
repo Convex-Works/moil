@@ -1,10 +1,13 @@
-//! The script's process group: stopping it gracefully and making sure none
-//! of it outlives the attempt (spec §8.6).
+//! Process groups: stopping one gracefully, making sure none of it outlives
+//! its leader, and cleaning up after a crash (spec §8.6). The runtime runs
+//! scripts this way, and the machine agent runs its owner's hooks the same
+//! way (spec/machine.md §2.2).
 
 use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
@@ -16,7 +19,7 @@ use crate::sys::{self, SIGKILL, SIGTERM};
 /// can't be reused while it's being signalled. Dropping a group before then
 /// kills all of it.
 #[derive(Debug)]
-pub(crate) struct Group {
+pub struct Group {
     child: Child,
     pgid: i32,
     /// Resolves once the leader has exited; `None` after that was seen.
@@ -35,7 +38,7 @@ impl Group {
             .ok_or_else(|| io::Error::other("the spawned process has no pid"))?;
         let exit = tokio::task::spawn_blocking(move || {
             if let Err(error) = sys::wait_exited(pgid) {
-                tracing::warn!(pgid, %error, "couldn't wait for the script's process");
+                tracing::warn!(pgid, %error, "couldn't wait for a process group's leader");
             }
         });
         Ok(Self {
@@ -49,6 +52,19 @@ impl Group {
     /// The group's ID, which is also its leader's pid.
     pub fn id(&self) -> i32 {
         self.pgid
+    }
+
+    /// The group's leader, for a record that lets [`Process::kill_group`]
+    /// clean up after a crash.
+    pub fn leader(&self) -> Process {
+        Process {
+            pid: self.pgid,
+            // Empty if the leader has already exited, which matches no
+            // process: the group is then treated like one whose leader is
+            // gone.
+            started: sys::start_token(self.pgid).unwrap_or_default(),
+            boot: sys::boot_id(),
+        }
     }
 
     pub fn child_mut(&mut self) -> &mut Child {
@@ -83,7 +99,7 @@ impl Group {
 
     fn signal(&self, signal: i32) {
         if let Err(error) = sys::signal_group(self.pgid, signal) {
-            tracing::warn!(pgid = self.pgid, signal, %error, "couldn't signal the script's process group");
+            tracing::warn!(pgid = self.pgid, signal, %error, "couldn't signal a process group");
         }
     }
 }
@@ -95,5 +111,111 @@ impl Drop for Group {
             // reaps the leader in the background once the child is dropped.
             self.signal(SIGKILL);
         }
+    }
+}
+
+/// A process, told apart from any later process with the same pid, even
+/// across reboots: what a record on disk names, so that whoever reads it
+/// after a crash never mistakes an unrelated process for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Process {
+    pub(crate) pid: i32,
+    pub(crate) started: String,
+    /// The boot the process ran in, if the platform can tell. A record
+    /// without one, such as one an earlier moil wrote, never leads to
+    /// killing anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot: Option<String>,
+}
+
+impl Process {
+    /// This process, or `None` if the platform can't tell processes apart.
+    pub fn current() -> Option<Self> {
+        Self::of(std::process::id() as i32)
+    }
+
+    pub(crate) fn of(pid: i32) -> Option<Self> {
+        Some(Self {
+            pid,
+            started: sys::start_token(pid)?,
+            boot: sys::boot_id(),
+        })
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// Whether this very process still runs.
+    pub fn is_running(&self) -> bool {
+        sys::start_token(self.pid).as_deref() == Some(&self.started)
+    }
+
+    /// Kills what's left of the process group this process led, as
+    /// [`Group::leader`] names it: all of it if the leader still runs or is
+    /// gone, nothing if its pid now belongs to an unrelated process. Kills
+    /// nothing either if the computer has restarted since, which ends every
+    /// group, or if it can't tell whether it has, or if the pid is one no
+    /// group of moil's can have.
+    pub fn kill_group(&self) -> io::Result<()> {
+        // After a restart, a group with this ID is someone else's, even
+        // with its leader gone. Signalling group 0 or 1 would reach moil's
+        // own group or every process.
+        if self.pid <= 1 || self.boot.is_none() || self.boot != sys::boot_id() {
+            return Ok(());
+        }
+        match sys::start_token(self.pid) {
+            // The leader still runs: the group is certainly this one.
+            Some(started) if started == self.started => sys::signal_group(self.pid, SIGKILL),
+            // The pid now belongs to an unrelated process: leave it alone.
+            Some(_) => Ok(()),
+            // The leader is gone. The OS doesn't reuse a group ID while any
+            // process is still in the group, so whatever is in it is left
+            // over from this one, unless all of it ended and the ID went to
+            // a new group whose own leader has ended since too.
+            None => sys::signal_group(self.pid, SIGKILL),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt as _;
+
+    use super::*;
+
+    const KILL_GROUP_0: &str = "MOIL_TEST_KILL_GROUP_0";
+
+    /// Not a test of its own: the process that
+    /// [`a_record_naming_group_0_kills_nothing`] starts, in a process group
+    /// of its own, which signalling group 0 would kill.
+    #[test]
+    #[ignore = "run by another test in this file, in a process of its own"]
+    fn kill_group_0() {
+        if std::env::var_os(KILL_GROUP_0).is_none() {
+            return;
+        }
+        let record = Process {
+            pid: 0,
+            started: sys::start_token(0).unwrap_or_default(),
+            boot: sys::boot_id(),
+        };
+        record.kill_group().unwrap();
+    }
+
+    /// Signalling group 0 reaches the process that signals it, and group 1
+    /// every process the owner has, so a record naming either kills
+    /// nothing. Only group 0 is tried: were group 1 signalled, it would
+    /// take the computer's other processes with it.
+    #[test]
+    fn a_record_naming_group_0_kills_nothing() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::tests::kill_group_0", "--ignored"])
+            .env(KILL_GROUP_0, "1")
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status:?}");
     }
 }

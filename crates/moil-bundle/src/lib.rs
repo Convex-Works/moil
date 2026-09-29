@@ -8,6 +8,7 @@ mod bundle;
 mod diff;
 mod lock;
 mod manifest;
+mod regular;
 mod store;
 
 pub use bundle::{Bundle, BundleError, LoadError, hash_files};
@@ -15,6 +16,7 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineKind, diff};
 pub use lock::{LockedPackage, PackageSource};
 pub use manifest::{Asset, GpuRequirement, Manifest, ManifestError, Resources};
 pub use moil_proto::BundleHash;
+pub use regular::{OpenError, open_regular};
 pub use store::BundleStore;
 
 /// The script, with PEP 723 inline metadata.

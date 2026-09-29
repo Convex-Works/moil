@@ -4,18 +4,29 @@
 //! each window's module decides what its page shows and what its buttons
 //! do. This module carries events to them and carries out what they ask
 //! for, on the main thread for windows and on Tokio for the agent.
+//!
+//! Commands reach the app too, through the control socket that the agent's
+//! host serves (spec/machine.md §4). Most go to the agent directly; what
+//! only the app can do, quitting and Open at Login, comes here as an event
+//! ([`Controls`]), and is done as the menu does it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use moil_agent::control::HostControls;
 use moil_agent::{Review, ServiceId, Snapshot};
 use moil_proto::BundleHash;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+use tao::event_loop::{
+    ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
+};
 use tao::window::{Theme, WindowBuilder, WindowId};
+use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tray_icon::menu::{Menu, MenuEvent, MenuId};
 use url::Url;
@@ -24,7 +35,7 @@ use wry::{NewWindowResponse, WebView, WebViewBuilder};
 use crate::backend::{Backend, Pairing, PairingCode};
 use crate::ipc::{self, ConfirmMessage, PairMessage, ReviewMessage};
 use crate::links::{DeepLink, Navigation, browser_url};
-use crate::login::LoginItem;
+use crate::login::{self, LoginItem};
 use crate::page;
 use crate::pair::{PairEffect, PairWindow};
 use crate::platform;
@@ -73,22 +84,67 @@ pub enum AppEvent {
     },
     /// A signal asked the app to quit.
     Quit,
+    /// `moil quit` asked the app to quit, as the menu's Quit does.
+    QuitCommand,
+    /// `moil login-item` asked whether the app opens at login, and to turn
+    /// that on or off if `set` says to.
+    LoginItem {
+        set: Option<bool>,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     /// The agent has shut down; the app can exit.
     ShutDown,
 }
 
-/// Runs the app until the owner quits. `backend` is the agent, or why it
-/// couldn't start; `links` are `moil://` links from the command line;
-/// `log_file` is where the app logs, if it keeps a file.
+/// The app's event loop, set up for a menu-bar app. Must be made on the
+/// main thread.
+pub fn event_loop() -> EventLoop<AppEvent> {
+    let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    platform::configure(&mut event_loop);
+    event_loop
+}
+
+/// What commands ask of the app itself, carried into its event loop. A
+/// command can come at any time, from another thread; one that comes
+/// before the event loop runs waits for it.
+#[derive(Debug)]
+pub struct Controls(EventLoopProxy<AppEvent>);
+
+impl Controls {
+    pub fn new(event_loop: &EventLoop<AppEvent>) -> Self {
+        Self(event_loop.create_proxy())
+    }
+}
+
+impl HostControls for Controls {
+    fn quit(&self) {
+        let _ = self.0.send_event(AppEvent::QuitCommand);
+    }
+
+    fn login_item(&self, set: Option<bool>) -> BoxFuture<'_, Result<bool, String>> {
+        let (reply, answer) = oneshot::channel();
+        // If the event loop has ended, the reply goes with the event.
+        let _ = self.0.send_event(AppEvent::LoginItem { set, reply });
+        async move {
+            answer
+                .await
+                .unwrap_or_else(|_| Err("moil quit before it could answer.".to_owned()))
+        }
+        .boxed()
+    }
+}
+
+/// Runs the app on `event_loop` until the owner quits. `backend` is the
+/// agent, or why it couldn't start; `links` are `moil://` links from the
+/// command line; `log_file` is where the app logs, if it keeps a file.
 pub fn run(
+    event_loop: EventLoop<AppEvent>,
     runtime: tokio::runtime::Runtime,
     backend: Result<Arc<dyn Backend>, String>,
     login: Box<dyn LoginItem>,
     links: Vec<String>,
     log_file: Option<PathBuf>,
 ) -> ! {
-    let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
-    platform::configure(&mut event_loop);
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -339,6 +395,17 @@ impl App {
                 tracing::info!("quitting, as a signal asks");
                 self.quit();
             }
+            AppEvent::QuitCommand => {
+                if !self.quitting {
+                    tracing::info!("quitting, as `moil quit` asks");
+                }
+                self.quit();
+            }
+            AppEvent::LoginItem { set, reply } => {
+                let answer = login::answer(&*self.login, set);
+                self.refresh_tray();
+                let _ = reply.send(answer);
+            }
             AppEvent::ShutDown => self.exit = true,
         }
     }
@@ -348,8 +415,14 @@ impl App {
             return;
         };
         match action {
-            Action::StopJob => backend.stop_job(),
-            Action::SetPaused(paused) => backend.set_paused(paused),
+            Action::StopJob => {
+                self.runtime.spawn(async move { backend.stop_job().await });
+            }
+            Action::SetPaused(paused) => {
+                // The agent logs why, if settings.json can't say so.
+                self.runtime
+                    .spawn(async move { backend.set_paused(paused).await });
+            }
             Action::Pair => self.pair(None, target),
             Action::PairAgain(url) => self.pair(Some(&url), target),
             Action::Review { service, hash } => self.review(service, hash, target),
@@ -363,6 +436,7 @@ impl App {
                 }
                 self.refresh_tray();
             }
+            Action::OpenHome => platform::open_folder(&backend.home()),
             Action::ShowLog => {
                 if let Some(path) = &self.log_file {
                     platform::reveal(path);

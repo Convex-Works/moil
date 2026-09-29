@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use moil_bundle::{Bundle, PackageSource};
 use moil_proto::{FileName, JobEvent, JobId, LogLevel, Outcome, Phase, UrlPolicy};
-use moil_runtime::{Executor, Job, Runtime, RuntimeConfig, StopReason, Uv, stop_signal};
+use moil_runtime::{Executor, Job, Runtime, StopReason, Uv, stop_signal};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -20,6 +20,10 @@ mod storage;
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Print a bundle's hash.
+    ///
+    /// The hash names the bundle's three files exactly: owners approve it,
+    /// and services send jobs for it.
+    #[command(after_help = "Examples:\n  moil hash\n  moil hash examples/bundles/echo")]
     Hash {
         /// The bundle's directory.
         #[arg(default_value = ".")]
@@ -27,12 +31,16 @@ pub enum Command {
     },
     /// Check that a bundle is valid and its lockfile current, and show what
     /// it holds.
+    #[command(after_help = "Examples:\n  moil check\n  moil check examples/bundles/echo")]
     Check {
         /// The bundle's directory.
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
     /// Create a bundle to start from: job.py, its lockfile and a manifest.
+    #[command(
+        after_help = "Examples:\n  moil init transcribe\n  moil init ~/bundles/notes --name meeting-notes"
+    )]
     Init {
         /// Where to create it.
         dir: PathBuf,
@@ -47,6 +55,9 @@ pub enum Command {
     /// in a temporary home, but bundles, their environments and assets stay
     /// cached (in $XDG_CACHE_HOME/moil, ~/Library/Caches/moil on macOS)
     /// between runs.
+    #[command(after_help = "Examples:\n  \
+        moil run examples/bundles/echo --params '{\"text\": \"hi\"}'\n  \
+        moil run examples/bundles/echo --input text.txt=README.md --output echo.txt --json")]
     Run(RunArgs),
 }
 
@@ -371,10 +382,11 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("couldn't create {}", args.out_dir.display()))?;
 
-    // A throwaway home unless one is given. Bundles, environments and assets
-    // are kept by hash, and bundles and assets verified, so they can be kept
-    // between runs all the same: a bundle's environment is then reused, and
-    // big assets fetched once.
+    // A throwaway home unless one is given, in whose .machine/ the run
+    // keeps what the agent would. Bundles, environments and assets are kept
+    // by hash, and bundles and assets verified, so they can be kept between
+    // runs all the same: a bundle's environment is then reused, and big
+    // assets fetched once.
     let mut temporary = None;
     let home = match &globals.home {
         Some(home) => home.clone(),
@@ -383,7 +395,7 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
             temporary.insert(dir).path().to_owned()
         }
     };
-    let mut config = RuntimeConfig::new(uv()?.program().to_owned(), &home);
+    let mut config = moil_agent::Home::new(&home).runtime_config(uv()?.program().to_owned());
     if globals.home.is_none()
         && let Some(cache) = cache_dir()
     {
@@ -421,6 +433,7 @@ async fn run_bundle(args: RunArgs, globals: &Globals) -> anyhow::Result<i32> {
             loopback_http: true,
             any_http: false,
         },
+        hand_off: None,
     };
     let work_dir = runtime.work_dir(&job.id, job.attempt);
 

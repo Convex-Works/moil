@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use moil_agent::{
     Agent, AgentHandle, AgentOptions, Approval, Connection, Home, JobOutcome, JobReport, Machine,
-    MachineConfig, PairedService, Settings,
+    MachineConfig, Service, Settings,
 };
 use moil_bundle::Bundle;
 use moil_proto::control::{EventMessage, Hello, Welcome};
@@ -25,7 +25,7 @@ use tempfile::TempDir;
 /// an agent with a fake executor.
 struct Setup {
     dir: TempDir,
-    services: Vec<(FakeService, PairedService)>,
+    services: Vec<(FakeService, Service)>,
     bundle: Bundle,
     agent: AgentHandle,
     runs: FakeRuns,
@@ -39,7 +39,7 @@ impl Setup {
     async fn build(
         names: &[&str],
         options: AgentOptions,
-        before_start: impl FnOnce(&Machine, &[(FakeService, PairedService)]),
+        before_start: impl FnOnce(&Machine, &[(FakeService, Service)]),
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let machine = open_machine(dir.path());
@@ -69,7 +69,7 @@ impl Setup {
         &self.services[0].0
     }
 
-    fn paired(&self) -> &PairedService {
+    fn paired(&self) -> &Service {
         &self.services[0].1
     }
 
@@ -223,24 +223,33 @@ async fn hello_describes_the_machine_and_what_it_approved_for_that_service() {
 async fn a_service_is_told_of_its_1024_most_recent_approvals_at_most() {
     let mut approved = Vec::new();
     let setup = Setup::build(&["klisi"], fast(), |machine, services| {
-        // Approved one after another, after the setup's own.
-        let mut paired = services[0].1.clone();
+        // Approved one after another, after the setup's own: each with its
+        // files in the service's folder, or it wouldn't count.
+        let id = &services[0].1.id;
+        let path = machine.home().service_file(id);
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut all = vec![services[0].1.approvals[0].hash];
         for i in 0..1029 {
-            let hash = bundle("transcribe", &format!("1.0.{i}"), "print('hi')").hash();
-            paired.approvals.push(Approval {
-                hash,
-                name: "transcribe".into(),
-                version: format!("1.0.{i}"),
-                approved_at: std::time::SystemTime::now(),
-            });
+            let version = format!("2.0.{i}");
+            let bundle = bundle("transcribe", &version, "print('hi')");
+            let dir = machine
+                .home()
+                .approved_bundle_dir(id, "transcribe", &bundle.hash());
+            bundle.write_to(dir).unwrap();
+            file["approvals"].as_array_mut().unwrap().push(
+                serde_json::to_value(Approval {
+                    hash: bundle.hash(),
+                    name: "transcribe".into(),
+                    version,
+                    approved_at: std::time::SystemTime::UNIX_EPOCH,
+                })
+                .unwrap(),
+            );
+            all.push(bundle.hash());
         }
-        let all: Vec<_> = paired.approvals.iter().map(|a| a.hash).collect();
         approved = all[all.len() - 1024..].to_vec();
-        let file = machine
-            .home()
-            .services_dir()
-            .join(format!("{}.json", paired.id));
-        std::fs::write(file, serde_json::to_vec(&paired).unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
     })
     .await;
     let hello = setup.service().accept().await.hello().await;
@@ -265,11 +274,11 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     conn.send(offer("j2", unapproved.hash()));
     assert_eq!(conn.recv().await, decline("j2", DeclineReason::NotApproved));
 
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     assert_eq!(conn.recv().await, state(MachineState::Paused));
     conn.send(offer("j5", hash));
     assert_eq!(conn.recv().await, decline("j5", DeclineReason::Paused));
-    setup.agent.set_paused(false);
+    setup.agent.set_paused(false).await.unwrap();
     assert_eq!(conn.recv().await, state(MachineState::Idle));
 
     conn.send(assign("j6", 1, hash, 30_000));
@@ -279,35 +288,82 @@ async fn offers_get_a_bid_only_when_the_machine_can_take_the_job() {
     assert_eq!(conn.recv().await, decline("j7", DeclineReason::Busy));
 }
 
+/// Changes a file moil wrote read-only, as the owner may.
+fn overwrite(path: &std::path::Path, text: &str) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// The approved copy of the setup's bundle, in its first service's folder.
+fn approved_dir(machine: &Machine, setup_bundle: &Bundle, service: &Service) -> std::path::PathBuf {
+    machine
+        .home()
+        .approved_bundle_dir(&service.id, "transcribe", &setup_bundle.hash())
+}
+
 #[tokio::test]
-async fn jobs_run_the_copy_verified_at_approval_whatever_happens_to_the_store() {
+async fn jobs_run_the_verified_copy_and_only_while_the_files_match_it() {
     let mut setup = Setup::new().await;
     let mut conn = setup.connect().await;
     let hash = setup.hash();
 
-    // Offers are answered from memory: the store isn't read, let alone
-    // hashed, for each one...
-    let store = setup.agent.machine().home().bundles();
-    std::fs::write(store.dir(&hash).join("job.py"), "import os\n").unwrap();
+    // Offers are answered from memory: the approved files aren't read,
+    // let alone hashed, for each one, and the job gets the approved bundle,
+    // which the runtime checks its own copy against before it runs.
     conn.send(offer("j1", hash));
     assert_eq!(conn.recv().await, bid("j1"));
-
-    // ...and the job gets the approved bundle, which the runtime checks
-    // the stored copy against before it runs.
     conn.send(assign("j1", 1, hash, 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
-    assert_eq!(setup.runs.next().await.job.bundle, setup.bundle);
+    let mut run = setup.runs.next().await;
+    assert_eq!(run.job.bundle, setup.bundle);
+
+    // Once the files change, the approval doesn't count, and whatever
+    // runs of it stops (spec/machine.md §1.2)...
+    let machine = setup.agent.machine();
+    let job = approved_dir(machine, &setup.bundle, setup.paired()).join("job.py");
+    let original = std::fs::read_to_string(&job).unwrap();
+    overwrite(&job, "import os\n");
+    assert_eq!(run.stopped().await, StopReason::Interrupted);
+    assert_eq!(
+        conn.recv().await,
+        MachineMessage::Approved { hashes: vec![] }
+    );
+    let (_, error) = failure(conn.recv().await);
+    assert_eq!(error.code, ErrorCode::Interrupted);
+    assert_eq!(conn.recv().await, state(MachineState::Idle));
+    conn.send(offer("j2", hash));
+    assert_eq!(conn.recv().await, decline("j2", DeclineReason::NotApproved));
+    conn.send(assign("j2", 1, hash, 30_000));
+    let (_, error) = failure(conn.recv().await);
+    assert_eq!(error.code, ErrorCode::NotApproved);
+
+    // ...until they match again.
+    overwrite(&job, &original);
+    assert_eq!(
+        conn.recv().await,
+        MachineMessage::Approved { hashes: vec![hash] }
+    );
+    conn.send(offer("j3", hash));
+    assert_eq!(conn.recv().await, bid("j3"));
 }
 
 #[tokio::test]
-async fn a_stored_copy_that_fails_verification_takes_no_jobs_until_approved_again() {
+async fn an_approval_whose_files_changed_takes_no_jobs_until_approved_again() {
     let mut setup = Setup::build(&["klisi"], fast(), |machine, services| {
-        let hash = services[0].1.approvals[0].hash;
-        let dir = machine.home().bundles().dir(&hash);
-        std::fs::write(dir.join("job.py"), "import os\n").unwrap();
+        let dir = machine.home().approved_bundle_dir(
+            &services[0].1.id,
+            "transcribe",
+            &services[0].1.approvals[0].hash,
+        );
+        overwrite(&dir.join("job.py"), "import os\n");
     })
     .await;
-    let mut conn = setup.connect().await;
+    let mut conn = setup.service().accept().await;
+    let hello = conn.handshake(vec![info(&setup.bundle)], vec![]).await;
+    assert_eq!(hello.approved, [], "the approval doesn't count");
     let hash = setup.hash();
     conn.send(offer("j1", hash));
     assert_eq!(conn.recv().await, decline("j1", DeclineReason::NotApproved));
@@ -316,7 +372,12 @@ async fn a_stored_copy_that_fails_verification_takes_no_jobs_until_approved_agai
     assert_eq!(error.code, ErrorCode::NotApproved);
 
     let review = setup.agent.review(&setup.paired().id, hash).await.unwrap();
+    assert!(!review.approved);
     setup.agent.approve(&review).await.unwrap();
+    assert_eq!(
+        conn.recv().await,
+        MachineMessage::Approved { hashes: vec![hash] }
+    );
     conn.send(offer("j2", hash));
     assert_eq!(conn.recv().await, bid("j2"));
     conn.send(assign("j2", 1, hash, 30_000));
@@ -328,7 +389,7 @@ async fn a_stored_copy_that_fails_verification_takes_no_jobs_until_approved_agai
 async fn a_keychain_that_keeps_moil_waiting_doesnt_hold_up_the_agent() {
     let service = FakeService::start("klisi").await;
     let dir = tempfile::tempdir().unwrap();
-    let keychain = Arc::new(SlowSecrets::new(dir.path().join("secrets.json")));
+    let keychain = Arc::new(SlowSecrets::new(Home::new(dir.path()).secrets_file()));
     let machine = Machine::open(MachineConfig {
         home: Home::new(dir.path()),
         secrets: keychain.clone(),
@@ -343,14 +404,14 @@ async fn a_keychain_that_keeps_moil_waiting_doesnt_hold_up_the_agent() {
     keychain.slow_down(Duration::from_secs(1));
     let agent = Agent::start_with(machine, executor, fast());
     let started = Instant::now();
-    agent.set_paused(true);
+    agent.set_paused(true).await.unwrap();
     snapshot_where(&agent, "the pause to show", |s| s.paused).await;
     let id = agent.snapshot().services[0].id.clone();
     let unpairing = tokio::spawn({
         let agent = agent.clone();
         async move { agent.unpair(&id).await }
     });
-    agent.set_paused(false);
+    agent.set_paused(false).await.unwrap();
     snapshot_where(&agent, "the resumption to show", |s| !s.paused).await;
     let took = started.elapsed();
     assert!(
@@ -667,7 +728,7 @@ async fn the_owner_stopping_a_job_makes_it_retryable_elsewhere() {
     assert_eq!(conn.recv().await, state(MachineState::Busy));
     let mut run = setup.runs.next().await;
 
-    setup.agent.stop_job();
+    setup.agent.stop_job().await;
     assert_eq!(run.stopped().await, StopReason::Interrupted);
     let (seq, error) = failure(conn.recv().await);
     assert_eq!(
@@ -691,7 +752,7 @@ async fn a_stopping_job_shows_as_stopping_until_it_ends() {
 
         let (reason, outcome) = match cause {
             "the owner" => {
-                setup.agent.stop_job();
+                setup.agent.stop_job().await;
                 (StopReason::Interrupted, interrupted())
             }
             "the service" => {
@@ -1132,7 +1193,7 @@ async fn pausing_is_told_to_every_service_and_remembered() {
     let mut klisi = connect(&setup.services[0].0, &setup.bundle).await;
     let mut notes = connect(&setup.services[1].0, &setup.bundle).await;
 
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     assert_eq!(klisi.recv().await, state(MachineState::Paused));
     assert_eq!(notes.recv().await, state(MachineState::Paused));
     assert!(setup.agent.snapshot().paused);
@@ -1140,20 +1201,14 @@ async fn pausing_is_told_to_every_service_and_remembered() {
         let text = std::fs::read_to_string(setup.dir.path().join("settings.json")).ok()?;
         serde_json::from_str(&text).ok()
     };
-    until("the pause to be saved", || {
-        saved().is_some_and(|s| s.paused)
-    })
-    .await;
+    assert!(saved().is_some_and(|s| s.paused), "saved once it answers");
     klisi.send(offer("j1", setup.hash()));
     assert_eq!(klisi.recv().await, decline("j1", DeclineReason::Paused));
 
-    setup.agent.set_paused(false);
+    setup.agent.set_paused(false).await.unwrap();
     assert_eq!(klisi.recv().await, state(MachineState::Idle));
     assert_eq!(notes.recv().await, state(MachineState::Idle));
-    until("the resumption to be saved", || {
-        saved().is_some_and(|s| !s.paused)
-    })
-    .await;
+    assert!(saved().is_some_and(|s| !s.paused));
     assert!(!setup.agent.machine().settings().paused);
 }
 
@@ -1165,7 +1220,7 @@ async fn a_running_job_carries_on_when_the_machine_is_paused() {
     assert_eq!(conn.recv().await, state(MachineState::Busy));
     let run = setup.runs.next().await;
 
-    setup.agent.set_paused(true);
+    setup.agent.set_paused(true).await.unwrap();
     run.emit(log("working"));
     assert_eq!(conn.recv().await, event("j1", 1, 1, log("working")));
     run.finish(succeeded());
@@ -1348,7 +1403,7 @@ async fn pairing_again_connects_at_once_while_the_service_forgets_the_old_token(
 }
 
 #[tokio::test]
-async fn unpairing_through_the_agent_disconnects_and_forgets() {
+async fn unpairing_through_the_agent_disconnects_and_keeps_the_folder() {
     let setup = Setup::new().await;
     let mut conn = setup.connect().await;
     let id = setup.paired().id.clone();
@@ -1357,7 +1412,96 @@ async fn unpairing_through_the_agent_disconnects_and_forgets() {
     assert_eq!(conn.closed().await, Some(1000));
     assert_eq!(setup.service().forgotten(), ["moil_token_1"]);
     assert_eq!(setup.agent.snapshot().services, []);
-    assert_eq!(setup.agent.machine().services().unwrap(), []);
+    let known = setup.agent.machine().service(&id).unwrap();
+    assert_eq!(known.pairing, None);
+    assert!(known.is_approved(&setup.hash()));
+
+    // Paired again, it takes the jobs it approved before at once.
+    let service = setup.service();
+    service.script_pairing([TokenReply::Grant]);
+    let session = setup.agent.pair(&service.base_url).await.unwrap();
+    within("pairing", session.wait()).await.unwrap();
+    let mut conn = service.accept().await;
+    let hello = conn.handshake(vec![info(&setup.bundle)], vec![]).await;
+    assert_eq!(hello.approved, [setup.hash()]);
+    conn.send(offer("j1", setup.hash()));
+    assert_eq!(conn.recv().await, bid("j1"));
+}
+
+#[tokio::test]
+async fn pairing_through_the_agent_takes_the_jobs_a_cloned_folder_approves() {
+    // Another machine's folder for the service, as git would bring it:
+    // service.json and the approved bundle's files, without a pairing.
+    let service = FakeService::start("klisi").await;
+    let bundle = bundle("transcribe", "1.0.0", "print('hi')");
+    service.host(&bundle);
+    let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let elsewhere = open_machine(other.path());
+    let paired = pair(&elsewhere, &service).await;
+    let review = elsewhere.review(&paired.id, bundle.hash()).await.unwrap();
+    elsewhere.approve(&review).unwrap();
+    let machine = open_machine(dir.path());
+    let (from, to) = (
+        elsewhere.home().service_dir(&paired.id),
+        machine.home().service_dir(&paired.id),
+    );
+    std::fs::create_dir_all(approved_dir(&machine, &bundle, &paired)).unwrap();
+    std::fs::copy(from.join("service.json"), to.join("service.json")).unwrap();
+    for (name, _) in bundle.files() {
+        let file = |root: &std::path::Path| {
+            root.join("bundles/transcribe")
+                .join(bundle.hash().to_string())
+                .join(name)
+        };
+        std::fs::copy(file(&from), file(&to)).unwrap();
+    }
+
+    // Known but not paired, the agent leaves it alone.
+    let (executor, mut runs) = fake_executor();
+    let agent = Agent::start_with(machine, executor, fast());
+    assert_eq!(agent.snapshot().services, []);
+
+    service.script_pairing([TokenReply::Grant]);
+    let session = agent.pair(&service.base_url).await.unwrap();
+    let adopted = within("pairing", session.wait()).await.unwrap();
+    assert_eq!(adopted.id, paired.id);
+    assert_eq!(runs.prepared().await, bundle.hash(), "prepared at once");
+    let mut conn = service.accept().await;
+    assert_eq!(conn.token, "moil_token_2");
+    let hello = conn.handshake(vec![info(&bundle)], vec![]).await;
+    assert_eq!(hello.approved, [bundle.hash()]);
+    conn.send(offer("j1", bundle.hash()));
+    assert_eq!(conn.recv().await, bid("j1"));
+    conn.send(assign("j1", 1, bundle.hash(), 30_000));
+    assert_eq!(conn.recv().await, state(MachineState::Busy));
+    assert_eq!(runs.next().await.job.bundle, bundle);
+}
+
+/// A service's token goes only to the base URL the machine paired with
+/// (spec/machine.md §1.2).
+#[tokio::test]
+async fn a_service_whose_folder_names_another_url_isnt_connected() {
+    let moved_to = FakeService::start("klisi").await;
+    let setup = Setup::build(&["klisi", "notes"], fast(), |machine, services| {
+        let path = machine.home().service_file(&services[0].1.id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replace(&services[0].0.base_url, &moved_to.base_url);
+        std::fs::write(path, text).unwrap();
+    })
+    .await;
+
+    // The other service is connected, and this one isn't.
+    let notes = &setup.services[1];
+    connect(&notes.0, &setup.bundle).await;
+    snapshot_where(&setup.agent, "the other service to be connected", |s| {
+        s.service(&notes.1.id)
+            .is_some_and(|s| s.connection == Connection::Connected)
+    })
+    .await;
+    assert!(setup.agent.snapshot().service(&setup.paired().id).is_none());
+    assert!(!setup.service().has_pending_connection());
+    assert!(!moved_to.has_pending_connection());
+    assert_eq!(moved_to.presented(), [] as [String; 0]);
 }
 
 #[tokio::test]

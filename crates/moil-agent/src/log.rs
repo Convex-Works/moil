@@ -1,5 +1,7 @@
-//! The app's log: on stderr, and in a file the owner can find, since an
-//! app opened from Finder has nowhere to show stderr.
+//! The agent's log: on stderr, and in a file the owner can find, since an
+//! app opened from Finder has nowhere to show stderr. The app and `moil
+//! agent` both keep it at [`Home::log_file`](crate::Home::log_file)
+//! (spec/machine.md §1).
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fs::{self, File};
@@ -11,50 +13,21 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-/// The log file's name in its directory.
-const FILE_NAME: &str = "moil.log";
-
 /// How big the log grows before it starts over. The previous one is kept
 /// beside it, so the log takes at most twice this.
 const MAX_BYTES: u64 = 4 << 20;
 
-/// Where the app keeps its log: `~/Library/Logs/moil` on macOS, where
-/// Console looks, `%LOCALAPPDATA%\moil\logs` on Windows, and
-/// `$XDG_STATE_HOME/moil` (`~/.local/state/moil`) elsewhere.
-pub fn default_dir() -> Option<PathBuf> {
-    let var = |name: &str| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    if cfg!(target_os = "macos") {
-        return var("HOME").map(|home| home.join("Library/Logs/moil"));
-    }
-    if cfg!(windows) {
-        return var("LOCALAPPDATA").map(|data| data.join("moil").join("logs"));
-    }
-    let state = var("XDG_STATE_HOME")
-        .filter(|dir| dir.is_absolute())
-        .or_else(|| var("HOME").map(|home| home.join(".local/state")))?;
-    Some(state.join("moil"))
-}
-
-/// Where the demo keeps its log, apart from the real app's.
-pub fn demo_dir() -> PathBuf {
-    std::env::temp_dir().join("moil-demo")
-}
-
-/// Logs to stderr and to `moil.log` in `dir`, at the level `RUST_LOG`
-/// asks for (`info` by default), and logs panics as errors. Returns the
-/// log file, unless there is none; why not is logged.
-pub fn init(dir: Option<&Path>) -> Option<PathBuf> {
-    let opened = dir.map(|dir| {
-        let path = dir.join(FILE_NAME);
-        fs::create_dir_all(dir)
-            .and_then(|()| RotatingFile::open(&path, MAX_BYTES))
-            .map(|file| (path, file))
+/// Logs to stderr and to the file at `path`, at the level `RUST_LOG` asks
+/// for (`info` by default), and logs panics as errors. Returns the log
+/// file, unless there is none; why not is logged.
+pub fn init(path: Option<&Path>) -> Option<PathBuf> {
+    let opened = path.map(|path| {
+        path.parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| RotatingFile::open(path, MAX_BYTES))
+            .map(|file| (path.to_owned(), file))
     });
-    let (path, file, error) = match opened {
+    let (opened_path, file, error) = match opened {
         Some(Ok((path, file))) => (Some(path), Some(file), None),
         Some(Err(e)) => (None, None, Some(e)),
         None => (None, None, None),
@@ -72,14 +45,14 @@ pub fn init(dir: Option<&Path>) -> Option<PathBuf> {
         .init();
     log_panics();
 
-    match (&path, error, dir) {
+    match (&opened_path, error, path) {
         (Some(path), _, _) => tracing::debug!("logging to {}", path.display()),
-        (None, Some(e), Some(dir)) => {
-            tracing::warn!("couldn't keep a log in {}: {e}", dir.display());
+        (None, Some(e), Some(path)) => {
+            tracing::warn!("couldn't keep a log at {}: {e}", path.display());
         }
         _ => tracing::warn!("couldn't find where to keep a log; logging to stderr only"),
     }
-    path
+    opened_path
 }
 
 /// Sends panics to the log instead of only to stderr, with a backtrace

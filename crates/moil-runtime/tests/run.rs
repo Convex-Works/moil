@@ -8,7 +8,7 @@ use common::*;
 use moil_proto::{
     ErrorCode, FileInfo, JobEvent, LogLevel, Outcome, Phase, UploadMethod, UrlPolicy,
 };
-use moil_runtime::{Executor, StopReason};
+use moil_runtime::{Executor, Job, StopReason};
 use serde_json::json;
 
 #[tokio::test]
@@ -139,6 +139,144 @@ async fn kept_working_directories_survive_the_attempt() {
         "alpha"
     );
     assert!(is_empty_dir(&h.jobs_dir().join(".attempts")));
+}
+
+/// What the owner keeps of attempts that succeed (spec §8.5).
+mod hand_off {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use moil_runtime::HandOff;
+
+    use super::*;
+
+    /// The names of the files in `dir`.
+    fn names(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// A job that writes three declared outputs and names two in its result.
+    fn two_of_three(h: &Harness) -> Job {
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"write": "a.txt", "text": "alpha"},
+                {"write": "b.json", "text": "{}"},
+                {"write": "c.txt", "text": "not in the result"},
+                {"emit": {"type": "result", "files": ["a.txt", "b.json"], "meta": {"n": 2}}},
+            ])),
+        );
+        job.outputs.extend([
+            output(&h.server, "a.txt"),
+            output(&h.server, "b.json"),
+            output(&h.server, "c.txt"),
+        ]);
+        job
+    }
+
+    #[tokio::test]
+    async fn a_success_leaves_exactly_the_uploaded_outputs() {
+        let h = Harness::new().await;
+        let kept = h.home.path().join("kept");
+        let mut job = two_of_three(&h);
+        let hand_off = HandOff::new(&kept);
+        job.hand_off = Some(hand_off.clone());
+        let work_dir = h.runtime.work_dir(&job.id, job.attempt);
+
+        let run = h.run(job).await;
+
+        // The service hears what it would have heard without a hand-off.
+        let result = run.result();
+        assert_eq!(result.meta, Some(json!({"n": 2})));
+        assert_eq!(
+            result.files.keys().map(|n| n.as_str()).collect::<Vec<_>>(),
+            ["a.txt", "b.json"]
+        );
+        assert_eq!(hand_off.result(), Some(Ok(())));
+        assert_eq!(
+            names(&kept),
+            BTreeSet::from(["a.txt".into(), "b.json".into()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(kept.join("a.txt")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(std::fs::read_to_string(kept.join("b.json")).unwrap(), "{}");
+        assert!(!work_dir.exists());
+        assert!(is_empty_dir(&h.jobs_dir().join(".attempts")));
+    }
+
+    #[tokio::test]
+    async fn a_kept_working_directory_keeps_its_outputs_too() {
+        let h = Harness::with(|c| c.keep_work_dirs = true).await;
+        let kept = h.home.path().join("kept");
+        let mut job = two_of_three(&h);
+        let hand_off = HandOff::new(&kept);
+        job.hand_off = Some(hand_off.clone());
+        let work_dir = h.runtime.work_dir(&job.id, job.attempt);
+
+        h.run(job).await.result();
+
+        assert_eq!(hand_off.result(), Some(Ok(())));
+        assert_eq!(
+            names(&kept),
+            BTreeSet::from(["a.txt".into(), "b.json".into()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(kept.join("a.txt")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(
+            names(&work_dir.join("out")),
+            BTreeSet::from(["a.txt".into(), "b.json".into(), "c.txt".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_handed_off_unless_the_attempt_succeeds() {
+        let h = Harness::new().await;
+        let kept = h.home.path().join("kept");
+        let mut job = h.job(
+            &probe(),
+            steps(json!([
+                {"write": "a.txt", "text": "alpha"},
+                {"emit": {"type": "result", "files": ["a.txt"]}},
+                {"exit": 1},
+            ])),
+        );
+        job.outputs.extend([output(&h.server, "a.txt")]);
+        let hand_off = HandOff::new(&kept);
+        job.hand_off = Some(hand_off.clone());
+
+        assert_eq!(h.run(job).await.error().code, ErrorCode::Exit);
+        assert_eq!(hand_off.result(), None);
+        assert!(!kept.exists());
+    }
+
+    #[tokio::test]
+    async fn outputs_that_cant_be_handed_off_leave_the_outcome_alone() {
+        let h = Harness::new().await;
+        let kept = h.home.path().join("kept");
+        // b.json can't be renamed onto a directory that isn't empty, after
+        // a.txt was moved.
+        std::fs::create_dir_all(kept.join("b.json/in-the-way")).unwrap();
+        let mut job = two_of_three(&h);
+        let hand_off = HandOff::new(&kept);
+        job.hand_off = Some(hand_off.clone());
+        let work_dir = h.runtime.work_dir(&job.id, job.attempt);
+
+        let run = h.run(job).await;
+
+        assert_eq!(run.result().meta, Some(json!({"n": 2})));
+        let why = hand_off.result().unwrap().unwrap_err();
+        assert!(why.starts_with("couldn't move output b.json to "), "{why}");
+        // What was moved was taken back.
+        assert_eq!(names(&kept), BTreeSet::from(["b.json".into()]));
+        assert!(!work_dir.exists());
+    }
 }
 
 mod outcome {

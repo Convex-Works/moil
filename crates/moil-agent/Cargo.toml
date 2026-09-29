@@ -17,13 +17,18 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url.workspace = true
 tokio-util.workspace = true
 fastrand = "2"
+humantime = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 rustls-platform-verifier = "0.7"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = "4"

@@ -111,16 +111,50 @@ cargo run -p moil-app             # or: packaging/macos/build.sh && open target/
 
 Confirm the code on the page that opens, review and approve `echo` from
 the tray menu, and submit a job from http://127.0.0.1:8787. The same works
-from a terminal:
+from a terminal, while the app runs or without it:
 
 ```sh
 moil pair http://127.0.0.1:8787/moil
 moil review 127.0.0.1-8787                # list the service's bundles
 moil approve 127.0.0.1-8787 <hash>        # read it in full, then approve
-moil agent                                # take jobs until Ctrl-C
+moil status                               # what moil is doing; --json for scripts
+moil agent                                # without the app: take jobs until Ctrl-C
 ```
 
 `cargo run -p moil-app -- --demo` shows the app with a simulated agent.
+
+## Your machine, as files
+
+Everything moil runs or acts on is in one folder, `~/.moil`, which you,
+your editor or an LLM can read, and which you can keep in git
+([spec/machine.md](spec/machine.md)):
+
+```
+~/.moil/
+  settings.json
+  services/klisi.example.com/
+    service.json                 the service, and the bundles you approved for it
+    bundles/transcribe/<hash>/   each approved bundle's files, read-only, checked before every run
+    hooks/transcribe             yours: runs after each transcribe job that succeeds here
+    logs/transcribe.log          what that hook printed
+```
+
+**Hooks** are how a job's results become yours. After a job of a bundle
+succeeds on your machine, moil runs your executable
+`services/<service>/hooks/<bundle>` with the job's context on stdin and
+its outputs in a folder. The service never learns a hook exists. The
+[example hook](examples/hooks/meeting-notes.py) turns a klisi transcript
+into meeting notes in an Obsidian vault; `moil hooks --help` has the whole
+contract.
+
+**The command line does everything the app does**, while the app runs
+too, so scripts and agents can drive moil: `moil status`, `pause`,
+`stop`, `pair`, `review`, `approve`, `hooks`, `logs` and the rest, with
+`--json` on all that report something. A service folder kept in git moves
+your approvals and hooks to your other machines; `.gitignore` keeps out
+what belongs to one machine alone, and the token is never in a service's
+folder: it stays in the keychain (in `.machine/` off macOS), kept with the
+one URL it may be sent to.
 
 ## Write a bundle
 
@@ -186,6 +220,11 @@ an app means trusting its author.
   sensitive data (e.g. meeting audio) to machines their policy allows,
   typically the data owner's own.
 - There is no sandbox yet. The review window says so plainly.
+- Hooks are your own code: nobody approves them, and they run as you.
+  What they're given comes partly from the service (a job's title and
+  params, its outputs' names and contents), so a hook should treat it as
+  untrusted. Whoever can push to a service folder you keep in git can
+  approve bundles and add hooks on your machines.
 
 ## Repository
 
@@ -199,7 +238,7 @@ an app means trusting its author.
 | `crates/moil-runtime` | Runs attempts: uv environments, assets, the script, outputs |
 | `crates/moil-bundle`, `crates/moil-proto` | Bundles and wire types |
 | [`e2e/`](e2e) | End-to-end tests: the Go SDK against the real `moil` binary and uv |
-| [`examples/`](examples) | Example bundles and a demo service |
+| [`examples/`](examples) | Example bundles, a demo service, and example hooks |
 
 `make check` runs everything: formatting, lints, the Rust and Go tests and
 the end-to-end suite.
@@ -209,7 +248,8 @@ the end-to-end suite.
 - The app on Linux and Windows; a signed and notarized macOS build.
 - Trusting a publisher's signing key instead of approving each hash.
 - Sandboxing: `sandbox-exec` on macOS, Landlock or bubblewrap on Linux, Job
-  Objects on Windows.
+  Objects on Windows. A sandboxed script must also lose the reach it has
+  today into `~/.moil` and moil's control socket.
 - Jobs that survive a service restart; server SDKs in other languages.
 - Bundles in languages other than Python.
 

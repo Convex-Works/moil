@@ -1,31 +1,45 @@
 //! The machine side of moil.
 //!
-//! - [`Machine`] is this computer's moil state: settings, paired services,
-//!   approved bundles and tokens. The command line uses it directly.
+//! - [`Machine`] is this computer's moil state, kept in its [`Home`]:
+//!   settings, the services the home knows and this machine's pairings
+//!   with them, approved bundles and tokens. The command line uses it
+//!   directly.
 //! - [`Agent`] runs on top of a [`Machine`]: it keeps a control channel
 //!   open to every paired service, bids on offers, runs assigned attempts
 //!   through an [`Executor`](moil_runtime::Executor) and reports back. The
 //!   tray app and `moil agent` run one, and watch it through a [`Snapshot`].
+//! - [`control`] is the socket through which commands reach a running
+//!   agent, and [`status`] builds what `moil status` reports, whether or
+//!   not an agent runs.
 //!
 //! Only one process at a time may open a machine's [`Home`]; the second
 //! gets [`Error::AlreadyRunning`].
 
 mod agent;
+#[cfg(unix)]
+pub mod control;
 pub mod display;
 mod error;
-mod fs;
+mod folders;
+pub mod fs;
 mod hardware;
 pub mod home;
+pub mod hooks;
+pub mod host;
+pub mod log;
 pub mod machine;
 mod net;
 pub mod pairing;
+pub mod report;
 pub mod review;
+pub mod rfc3339;
 pub mod secrets;
 pub mod services;
+pub mod status;
 
 pub use agent::{
-    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, JobOutcome, JobReport, JobStatus,
-    ServiceStatus, Snapshot,
+    Agent, AgentHandle, AgentOptions, BundleStatus, Connection, HomeState, JobOutcome, JobReport,
+    JobStatus, ServiceStatus, Snapshot,
 };
 pub use error::Error;
 pub use home::{Home, Settings};
@@ -35,4 +49,4 @@ pub use review::Review;
 #[cfg(target_os = "macos")]
 pub use secrets::KeychainSecrets;
 pub use secrets::{FileSecrets, MemorySecrets, SecretStore, default_secrets};
-pub use services::{Approval, InvalidServiceId, PairedService, ServiceId};
+pub use services::{Approval, InvalidServiceId, Pairing, Service, ServiceId};

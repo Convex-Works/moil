@@ -103,6 +103,13 @@ pub fn reveal(path: &Path) {
     });
 }
 
+/// Opens a folder in the file manager: a Finder window on macOS.
+pub fn open_folder(path: &Path) {
+    if let Err(e) = open::that_detached(path) {
+        tracing::warn!("couldn't open {}: {e}", path.display());
+    }
+}
+
 /// The signals that ask the app to quit: SIGTERM, as `kill`, launchd and
 /// shutdown scripts send it, and SIGINT, Ctrl-C where it was started from
 /// a terminal. Listening starts when it's made, so a signal that comes

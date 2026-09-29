@@ -24,7 +24,8 @@ The key words MUST, SHOULD and MAY are used as in RFC 2119.
   It has a **base URL**, the URL where the SDK's HTTP handler is mounted,
   e.g. `https://klisi.example.com/moil`.
 - **Machine:** a computer running the moil app (or the headless `moil
-  agent`). It is paired with zero or more services.
+  agent`). It is paired with zero or more services. What it keeps on disk, and
+  what it runs for its owner, is in [machine.md](machine.md).
 - **Owner:** the service's own identifier for the user who paired a
   machine. moil never interprets it; the service uses it in its
   eligibility policy.
@@ -784,7 +785,9 @@ rule that applies:
    SHA-256.
 
 The working directory is deleted after the outcome is reported, unless
-the owner chose to keep it for debugging.
+the owner chose to keep it for debugging. A machine MAY keep the uploaded
+outputs for its owner's own use afterwards ([machine.md](machine.md) §2);
+nothing about that reaches the service.
 
 ### 8.6 Stopping a process
 
