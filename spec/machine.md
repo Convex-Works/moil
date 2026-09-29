@@ -141,6 +141,12 @@ with it is kept in the keychain on macOS, and in `.machine/` elsewhere,
 together with the base URL it was issued for. It is never kept in the
 service's folder.
 
+macOS asks the owner before one program reads a keychain item that
+another stored. moil is signed ad hoc, so the app, `moil` and each new
+version of either are different programs to it, and reading a token may
+ask the owner first. moil MUST replace and delete a token without reading
+it: that works whichever program stored it, and doesn't ask.
+
 A service is **paired** on this machine when its folder has a
 `pairing.json` whose `base_url` is the one in `service.json`. moil
 connects to it only while it also holds a token issued for that URL; a
