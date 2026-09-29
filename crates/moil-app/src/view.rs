@@ -492,7 +492,10 @@ fn service_menu(service: &ServiceStatus, hooks: &[HookReport], now: Instant) -> 
     if !hooks.is_empty() {
         entries.push(Separator);
     }
-    for hook in hooks {
+    // A bundle with more than one file that could be its hook has none
+    // that runs; it shows once.
+    let mut shown = HashSet::new();
+    for hook in hooks.iter().filter(|hook| shown.insert(&hook.bundle)) {
         let label = format!("Hook for {}", format::one_line(&hook.bundle, 32));
         entries.push(Text(if hook.runnable {
             Label::quiet(label)
@@ -800,7 +803,10 @@ mod tests {
     #[test]
     fn hooks_show_under_their_service_and_problems_in_brief() {
         let mut fx = Fixture::new();
-        fx.home.hooks = vec![hook("summarize", false), hook("transcribe", true)];
+        // Two files that could each be summarize's hook, so neither runs.
+        let mut other = hook("summarize", false);
+        other.hook.path.set_extension("sh");
+        fx.home.hooks = vec![hook("summarize", false), other, hook("transcribe", true)];
         fx.home.problems = vec![
             problem("services/klisi.example.com/hooks/summarize"),
             problem("services/stray.txt"),

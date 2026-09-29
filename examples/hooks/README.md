@@ -3,7 +3,14 @@
 A hook is your own executable that moil runs after a job of one bundle
 succeeds on your machine, with the job's outputs ([spec/machine.md
 §2](../../spec/machine.md#2-hooks); `moil hooks --help` has the whole
-contract). It lives at `~/.moil/services/<service>/hooks/<bundle>`.
+contract). It lives at `~/.moil/services/<service>/hooks/<bundle>`, with
+one extension if you like. To install the example as klisi's `transcribe`
+hook:
+
+```sh
+cp meeting-notes.py ~/.moil/services/<klisi's ID>/hooks/transcribe.py
+chmod +x ~/.moil/services/<klisi's ID>/hooks/transcribe.py
+```
 
 | Hook | For | What it does |
 |---|---|---|

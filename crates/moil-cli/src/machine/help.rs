@@ -87,8 +87,9 @@ A hook is an executable of yours that moil runs after an attempt of a bundle suc
 WHERE IT LIVES
 
   <home>/services/<service ID>/hooks/<bundle name>
+  <home>/services/<service ID>/hooks/<bundle name>.<extension>
 
-such as ~/.moil/services/klisi.convex.works/hooks/transcribe, for the attempts of klisi's bundle named transcribe. `moil home` prints the home, and `moil services` the services' IDs. A hook is named exactly after its bundle; files named otherwise, and hidden files, are never run.
+such as ~/.moil/services/klisi.convex.works/hooks/transcribe.py, for the attempts of klisi's bundle named transcribe. `moil home` prints the home, and `moil services` the services' IDs. A hook is named after its bundle, with at most one extension of letters and digits, such as .py or .sh, which tells you and your editor what it is; moil runs it the same way whatever its extension. A bundle has at most one hook: if two files could be its hook, such as transcribe and transcribe.py, moil runs neither. Files named otherwise, and hidden files, are never run.
 
 WHEN IT RUNS
 
@@ -174,7 +175,7 @@ Some of what a hook gets comes from the service: title, params, meta and job_id,
 
 AN EXAMPLE
 
-~/.moil/services/klisi.convex.works/hooks/transcribe, made executable with chmod +x, keeps each transcript in ~/Transcripts:
+~/.moil/services/klisi.convex.works/hooks/transcribe.py, made executable with chmod +x, keeps each transcript in ~/Transcripts:
 
   #!/usr/bin/env -S uv run --script
   # /// script

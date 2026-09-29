@@ -401,7 +401,7 @@ pub fn scan_hooks(home: &Home) -> HookScan {
         .filter_map(|name| ServiceId::new(name).ok())
         .filter(|id| home.service_dir(id).is_dir())
     {
-        let hooks_dir = home.service_dir(&id).join("hooks");
+        let hooks_dir = home.hooks_dir(&id);
         let names = match visible_names(&hooks_dir) {
             Ok(names) => names,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -420,26 +420,34 @@ pub fn scan_hooks(home: &Home) -> HookScan {
                 continue;
             }
         };
-        for name in names {
-            if !is_bundle_name(&name) {
-                let message = "moil never runs this file: a hook is named exactly after its \
-                               bundle, in lowercase letters, digits and hyphens, such as \
-                               hooks/transcribe";
-                scan.problems
-                    .push(problem(&hooks_dir.join(&name), message.into()));
-                continue;
+        let mut candidates: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for name in &names {
+            if let Some(bundle) = hook_bundle(name) {
+                candidates.entry(bundle).or_default().push(name);
             }
-            let path = home.hook(&id, &name);
-            let runnable = runnable(&path);
-            if let Err(why) = &runnable {
-                let message = format!("moil can't run this hook: {why}");
-                scan.problems.push(problem(&path, message));
+        }
+        for name in &names {
+            let path = hooks_dir.join(name);
+            let Some(bundle) = hook_bundle(name) else {
+                let message = "moil never runs this file: a hook is named after its bundle, in \
+                               lowercase letters, digits and hyphens, with at most one \
+                               extension of letters and digits, such as hooks/transcribe or \
+                               hooks/transcribe.py";
+                scan.problems.push(problem(&path, message.into()));
+                continue;
+            };
+            let runnable = match &candidates[bundle][..] {
+                [_] => runnable(&path).map_err(|why| format!("moil can't run this hook: {why}")),
+                several => Err(several_hooks(bundle, several)),
+            };
+            if let Err(message) = &runnable {
+                scan.problems.push(problem(&path, message.clone()));
             }
             scan.hooks.push(HookListing {
                 service: id.clone(),
                 hook: HookReport {
-                    log: home.hook_log(&id, &name),
-                    bundle: name,
+                    bundle: bundle.to_owned(),
+                    log: home.hook_log(&id, bundle),
                     path,
                     runnable: runnable.is_ok(),
                 },
@@ -447,6 +455,57 @@ pub fn scan_hooks(home: &Home) -> HookScan {
         }
     }
     scan
+}
+
+/// The bundle whose hook a file in a service's `hooks/` is, by the file's
+/// name: the bundle's name, alone or with one extension of ASCII letters
+/// and digits, as `transcribe` or `transcribe.py` (spec/machine.md §2).
+fn hook_bundle(name: &str) -> Option<&str> {
+    let (bundle, extension) = match name.split_once('.') {
+        Some((bundle, extension)) => (bundle, Some(extension)),
+        None => (name, None),
+    };
+    let extension_ok =
+        extension.is_none_or(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_alphanumeric()));
+    (is_bundle_name(bundle) && extension_ok).then_some(bundle)
+}
+
+/// Why moil runs none of `names`, the files in `hooks/` that could each be
+/// the hook for `bundle`.
+fn several_hooks(bundle: &str, names: &[impl AsRef<str>]) -> String {
+    let names: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
+    let (last, rest) = names.split_last().expect("several names");
+    format!(
+        "{bundle} has more than one hook, {} and {last}, so moil runs none of them. Remove all \
+         but one.",
+        rest.join(", ")
+    )
+}
+
+/// The hook for `bundle` in the folder of service `id` (spec/machine.md
+/// §2): `None` if it has none; or why moil runs none, when more than one
+/// file could be it or moil can't list `hooks/`. Hidden files are passed
+/// over.
+pub(crate) fn find_hook(
+    home: &Home,
+    id: &ServiceId,
+    bundle: &str,
+) -> Result<Option<PathBuf>, String> {
+    let dir = home.hooks_dir(id);
+    let names = match visible_names(&dir) {
+        Ok(names) => names,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("moil can't list {}: {e}", dir.display())),
+    };
+    let mut found: Vec<String> = names
+        .into_iter()
+        .filter(|name| hook_bundle(name) == Some(bundle))
+        .collect();
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop().map(|name| dir.join(name))),
+        _ => Err(several_hooks(bundle, &found)),
+    }
 }
 
 /// Why moil can't run what is at a hook's path (spec/machine.md §2.1).
