@@ -44,8 +44,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::Home;
-use crate::folders::runnable;
 pub use crate::folders::{HookScan, scan_hooks as scan};
+use crate::folders::{find_hook, runnable};
 use crate::fs::{PRIVATE, read_json, with_path, write_atomic};
 use crate::report::ServiceRef;
 
@@ -327,12 +327,9 @@ impl PendingHook {
     pub fn ready(mut self, result: JobResult, ended_at: SystemTime) {
         let dir = self.inner.entry_dir(self.number);
         let mut context = self.context.take().expect("an entry is readied once");
-        let hook = self
-            .inner
-            .home
-            .hook(&context.service.id, &context.bundle.name);
         // The file is the whole setup: without it, there is nothing to run.
-        if is_absent(&hook) {
+        let found = find_hook(&self.inner.home, &context.service.id, &context.bundle.name);
+        if let Ok(None) = found {
             return remove_entry(&dir);
         }
         context.meta = result.meta;
@@ -430,12 +427,13 @@ impl Inner {
         supervisor: Option<&Process>,
     ) -> Option<Ending> {
         let context = &queued.context;
-        let hook = self.home.hook(&context.service.id, &context.bundle.name);
         // Removing the file turns the hook off, for attempts that already
         // ended too.
-        if is_absent(&hook) {
-            return None;
-        }
+        let hook = match find_hook(&self.home, &context.service.id, &context.bundle.name) {
+            Ok(None) => return None,
+            Ok(Some(hook)) => Ok(hook),
+            Err(why) => Err(why),
+        };
         let mut log = Log::open(
             self.home
                 .hook_log(&context.service.id, &context.bundle.name),
@@ -457,9 +455,10 @@ impl Inner {
             context.job_id,
             context.attempt
         ));
-        let ending = match &queued.not_run {
-            Some(why) => Ending::NotRun(why.clone()),
-            None => self.run_hook(dir, context, &hook, &log, recorded).await,
+        let ending = match (&queued.not_run, hook) {
+            (Some(why), _) => Ending::NotRun(why.clone()),
+            (None, Err(why)) => Ending::NotRun(why),
+            (None, Ok(hook)) => self.run_hook(dir, context, &hook, &log, recorded).await,
         };
         end_run(dir, &mut log, &ending);
         Some(ending)
@@ -835,11 +834,6 @@ fn cant_start(error: &io::Error) -> String {
         ""
     };
     format!("moil couldn't start it: {error}{hint}")
-}
-
-/// Whether nothing at all is at `path`, not even a broken link.
-fn is_absent(path: &Path) -> bool {
-    matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
 /// The queue of `home` as a crash or quit left it: the entries ready to

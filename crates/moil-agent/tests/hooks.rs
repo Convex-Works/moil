@@ -673,7 +673,7 @@ async fn the_scan_lists_every_hook_by_service_and_bundle() {
     std::os::unix::fs::symlink(&hook, &elsewhere).unwrap();
     let hooks_dir = hook.parent().unwrap();
     fs::write(hooks_dir.join(".DS_Store"), "").unwrap();
-    fs::write(hooks_dir.join("transcribe.sh"), "").unwrap();
+    fs::write(hooks_dir.join("transcribe.tar.gz"), "").unwrap();
     std::os::unix::fs::symlink("missing", hooks_dir.join("broken")).unwrap();
     fs::create_dir_all(t.home.services_dir().join("Not A Service/hooks")).unwrap();
 
@@ -714,11 +714,111 @@ async fn the_scan_lists_every_hook_by_service_and_bundle() {
                 "moil can't run this hook: it's a symbolic link to a file that doesn't exist"
             ),
             (
-                "services/klisi.example.com/hooks/transcribe.sh",
-                "moil never runs this file: a hook is named exactly after its bundle, in \
-                 lowercase letters, digits and hyphens, such as hooks/transcribe"
+                "services/klisi.example.com/hooks/transcribe.tar.gz",
+                "moil never runs this file: a hook is named after its bundle, in lowercase \
+                 letters, digits and hyphens, with at most one extension of letters and \
+                 digits, such as hooks/transcribe or hooks/transcribe.py"
             ),
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_hook_may_have_an_extension() {
+    let t = Test::new();
+    let hook = t.hook("transcribe.sh", "#!/bin/sh\necho ran\ntouch REPORT/ran\n");
+    let hooks = t.start();
+    queue(&hooks, "transcribe", "recording-1", &[]);
+
+    // Its log is named after the bundle alone.
+    let log = t.closed("transcribe", 1).await;
+    assert!(log.contains("\nran\n"), "{log}");
+    assert!(exited(closing_lines(&log)[0], 0), "{log}");
+    t.reported("ran");
+    let scan = scan(&t.home);
+    assert_eq!(
+        scan.hooks[0].hook,
+        HookReport {
+            bundle: "transcribe".into(),
+            path: hook,
+            log: t.home.hook_log(&service(), "transcribe"),
+            runnable: true,
+        }
+    );
+    assert_eq!(scan.problems, []);
+}
+
+#[tokio::test]
+async fn a_bundle_with_more_than_one_hook_runs_none() {
+    let t = Test::new();
+    t.hook("transcribe", "#!/bin/sh\ntouch REPORT/plain\n");
+    t.hook("transcribe.py", "#!/bin/sh\ntouch REPORT/python\n");
+    let hooks = t.start();
+    queue(&hooks, "transcribe", "recording-1", &[]);
+
+    let why = "transcribe has more than one hook, transcribe and transcribe.py, so moil runs \
+               none of them. Remove all but one.";
+    let log = t.closed("transcribe", 1).await;
+    assert_eq!(closing_lines(&log), [format!("not run: {why}")], "{log}");
+    until("the entry to go", || t.queued().is_empty()).await;
+    assert!(
+        fs::read_dir(&t.report).unwrap().next().is_none(),
+        "a hook ran"
+    );
+
+    let scan = scan(&t.home);
+    let listed: Vec<(&str, &Path, bool)> = scan
+        .hooks
+        .iter()
+        .map(|l| {
+            (
+                l.hook.bundle.as_str(),
+                l.hook.path.as_path(),
+                l.hook.runnable,
+            )
+        })
+        .collect();
+    let hooks_dir = t.home.hooks_dir(&service());
+    assert_eq!(
+        listed,
+        [
+            ("transcribe", hooks_dir.join("transcribe").as_path(), false),
+            (
+                "transcribe",
+                hooks_dir.join("transcribe.py").as_path(),
+                false
+            ),
+        ]
+    );
+    let problems: Vec<(&str, &str)> = scan
+        .problems
+        .iter()
+        .map(|p| (p.path.to_str().unwrap(), p.message.as_str()))
+        .collect();
+    assert_eq!(
+        problems,
+        [
+            ("services/klisi.example.com/hooks/transcribe", why),
+            ("services/klisi.example.com/hooks/transcribe.py", why),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_file_with_two_extensions_isnt_a_hook() {
+    let t = Test::new();
+    t.hook("transcribe.tar.gz", "#!/bin/sh\ntouch REPORT/ran\n");
+    let hooks = t.start();
+    queue(&hooks, "transcribe", "recording-1", &[]);
+
+    until("the entry to go", || t.queued().is_empty()).await;
+    assert!(!t.report.join("ran").exists());
+    assert_eq!(t.log("transcribe"), "");
+    let scan = scan(&t.home);
+    assert_eq!(scan.hooks, []);
+    assert_eq!(
+        scan.problems[0].path,
+        Path::new("services/klisi.example.com/hooks/transcribe.tar.gz")
     );
 }
 

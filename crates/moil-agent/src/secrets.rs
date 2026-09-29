@@ -30,7 +30,7 @@ fn secrets_for(choice: Option<&str>, home: &Home) -> Result<Arc<dyn SecretStore>
 
 #[cfg(target_os = "macos")]
 fn keychain() -> Result<Arc<dyn SecretStore>, Error> {
-    Ok(Arc::new(KeychainSecrets))
+    Ok(Arc::new(KeychainSecrets::new(KeychainSecrets::TOKENS)))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -98,42 +98,138 @@ impl SecretStore for FileSecrets {
     }
 }
 
-/// Secrets in the macOS keychain, as generic passwords of the service
-/// `moil`.
 #[cfg(target_os = "macos")]
-#[derive(Debug, Default)]
-pub struct KeychainSecrets;
+pub use keychain::KeychainSecrets;
 
 #[cfg(target_os = "macos")]
-impl KeychainSecrets {
-    const SERVICE: &str = "moil";
+mod keychain {
+    use core_foundation::base::TCFType;
+    use security_framework::base::Error as OsError;
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
+    use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+    use security_framework::os::macos::keychain_item::SecKeychainItem;
+    use security_framework::os::macos::passwords::find_generic_password;
+    use security_framework_sys::base::errSecItemNotFound;
+    use security_framework_sys::keychain_item::SecKeychainItemDelete;
 
-    fn entry(key: &str) -> Result<keyring::Entry, Error> {
-        keyring::Entry::new(Self::SERVICE, key).map_err(|e| Error::Secrets(e.to_string()))
+    use super::SecretStore;
+    use crate::Error;
+
+    /// Secrets in the login keychain, as generic passwords of one service,
+    /// each keyed by its account.
+    ///
+    /// macOS ties a keychain item to the program that stored it, and moil
+    /// is signed ad hoc, so the app, `moil`, and each new build of either
+    /// are different programs to it (spec/machine.md §1.2). One program
+    /// reads what another stored only once the owner allows it.
+    /// `SecItemDelete`, which the `keyring` crate used, refuses outright to
+    /// delete it (errSecInvalidOwnerEdit), and changing it in place leaves
+    /// an item that neither program may read without asking. Deleting it
+    /// through its reference works, whoever stored it, without asking; so
+    /// this store deletes items that way, and replaces an item rather than
+    /// changing it.
+    #[derive(Debug)]
+    pub struct KeychainSecrets {
+        service: String,
     }
-}
 
-#[cfg(target_os = "macos")]
-impl SecretStore for KeychainSecrets {
-    fn get(&self, key: &str) -> Result<Option<String>, Error> {
-        match Self::entry(key)?.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(Error::Secrets(e.to_string())),
+    impl KeychainSecrets {
+        /// The service whose items hold machine tokens.
+        pub const TOKENS: &str = "moil";
+
+        /// The items of `service`, which is [`TOKENS`](Self::TOKENS) but in
+        /// tests.
+        pub fn new(service: impl Into<String>) -> Self {
+            Self {
+                service: service.into(),
+            }
+        }
+
+        fn keychain() -> Result<SecKeychain, Error> {
+            SecKeychain::default_for_domain(SecPreferencesDomain::User).map_err(failed)
+        }
+
+        /// The items for `key`, found without reading their secrets.
+        fn items(&self, key: &str) -> Result<Vec<SecKeychainItem>, Error> {
+            let key = named(key)?;
+            let found = ItemSearchOptions::new()
+                .keychains(&[Self::keychain()?])
+                .class(ItemClass::generic_password())
+                .service(&self.service)
+                .account(key)
+                .load_refs(true)
+                .limit(Limit::All)
+                .search();
+            match found {
+                Ok(found) => Ok(found
+                    .into_iter()
+                    .filter_map(|found| match found {
+                        SearchResult::Ref(Reference::KeychainItem(item)) => Some(item),
+                        _ => None,
+                    })
+                    .collect()),
+                Err(e) if e.code() == errSecItemNotFound => Ok(Vec::new()),
+                Err(e) => Err(failed(e)),
+            }
         }
     }
 
-    fn set(&self, key: &str, secret: &str) -> Result<(), Error> {
-        Self::entry(key)?
-            .set_password(secret)
-            .map_err(|e| Error::Secrets(e.to_string()))
+    impl SecretStore for KeychainSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>, Error> {
+            let key = named(key)?;
+            match find_generic_password(Some(&[Self::keychain()?]), &self.service, key) {
+                Ok((secret, _)) => String::from_utf8(secret.to_owned()).map(Some).map_err(|_| {
+                    Error::Secrets(format!("the item {key} of {} isn't text", self.service))
+                }),
+                Err(e) if e.code() == errSecItemNotFound => Ok(None),
+                Err(e) if REFUSED.contains(&e.code()) => Err(Error::Secrets(
+                    "macOS didn't let moil read its token. To macOS, the moil app, `moil` and \
+                     each new version of either are different programs, and it asks before one \
+                     reads what another stored: try again, and allow moil when macOS asks"
+                        .into(),
+                )),
+                Err(e) => Err(failed(e)),
+            }
+        }
+
+        /// If adding the new item fails, the old one is gone all the same.
+        fn set(&self, key: &str, secret: &str) -> Result<(), Error> {
+            self.delete(key)?;
+            Self::keychain()?
+                .add_generic_password(&self.service, key, secret.as_bytes())
+                .map_err(failed)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Error> {
+            for item in self.items(key)? {
+                // SAFETY: `item` is a live keychain item reference.
+                let status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
+                if status != 0 && status != errSecItemNotFound {
+                    return Err(failed(OsError::from_code(status)));
+                }
+            }
+            Ok(())
+        }
     }
 
-    fn delete(&self, key: &str) -> Result<(), Error> {
-        match Self::entry(key)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(Error::Secrets(e.to_string())),
+    /// What reading an item gives when the owner said no, or when macOS
+    /// couldn't ask: errSecAuthFailed, errSecInteractionNotAllowed and
+    /// userCanceledErr.
+    const REFUSED: [i32; 3] = [-25293, -25308, -128];
+
+    /// `key`, unless it's empty: the keychain takes an empty account for
+    /// any, and deleting would delete every item of the service.
+    fn named(key: &str) -> Result<&str, Error> {
+        match key {
+            "" => Err(Error::Secrets(
+                "a keychain item's name can't be empty".into(),
+            )),
+            key => Ok(key),
         }
+    }
+
+    fn failed(error: OsError) -> Error {
+        Error::Secrets(error.to_string())
     }
 }
 
@@ -224,19 +320,87 @@ mod tests {
         assert!(err.to_string().contains("\"vault\""), "{err}");
     }
 
-    /// Talks to the real keychain, which may ask for permission: run it by
-    /// hand with `cargo test -p moil-agent -- --ignored keychain`.
+    /// A service of throwaway items in the real keychain, apart from moil's.
+    #[cfg(target_os = "macos")]
+    fn throwaway_service(name: &str) -> String {
+        format!("moil-test-{name}-{}", std::process::id())
+    }
+
+    /// Talks to the real keychain: run it by hand with
+    /// `cargo test -p moil-agent -- --ignored keychain`.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
     fn keychain_round_trip() {
-        let key = format!("moil-test-{}", std::process::id());
-        let keychain = KeychainSecrets;
-        keychain.set(&key, "one").unwrap();
-        keychain.set(&key, "two").unwrap();
-        assert_eq!(keychain.get(&key).unwrap().as_deref(), Some("two"));
-        keychain.delete(&key).unwrap();
-        keychain.delete(&key).unwrap();
-        assert_eq!(keychain.get(&key).unwrap(), None);
+        let keychain = KeychainSecrets::new(throwaway_service("round-trip"));
+        keychain.set("token", "one").unwrap();
+        keychain.set("token", "two").unwrap();
+        assert_eq!(keychain.get("token").unwrap().as_deref(), Some("two"));
+        keychain.delete("token").unwrap();
+        keychain.delete("token").unwrap();
+        assert_eq!(keychain.get("token").unwrap(), None);
+    }
+
+    /// The app and `moil` are different programs to the keychain, as is
+    /// each new build of either. moil replaces and deletes a token another
+    /// program stored, here the `security` command, and macOS doesn't ask.
+    /// Talks to the real keychain, as `keychain_round_trip` does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn keychain_items_another_program_stored_are_replaced_and_deleted() {
+        use std::process::{Command, Stdio};
+
+        // Anything that would ask fails instead.
+        let _no_prompts =
+            security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
+                .unwrap();
+        let service = throwaway_service("another-program");
+        let security = |args: &[&str]| {
+            Command::new("/usr/bin/security")
+                .args(args)
+                .args(["-s", &service])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let keychain = KeychainSecrets::new(&service);
+
+        assert!(security(&[
+            "add-generic-password",
+            "-a",
+            "replaced",
+            "-w",
+            "theirs"
+        ]));
+        keychain.set("replaced", "ours").unwrap();
+        assert_eq!(keychain.get("replaced").unwrap().as_deref(), Some("ours"));
+
+        assert!(security(&[
+            "add-generic-password",
+            "-a",
+            "deleted",
+            "-w",
+            "theirs"
+        ]));
+        keychain.delete("deleted").unwrap();
+        assert!(!security(&["find-generic-password", "-a", "deleted"]));
+
+        keychain.delete("replaced").unwrap();
+        assert!(!security(&["find-generic-password", "-a", "replaced"]));
+
+        // Reading it is what asks, and here fails instead.
+        assert!(security(&[
+            "add-generic-password",
+            "-a",
+            "read",
+            "-w",
+            "theirs"
+        ]));
+        let refused = keychain.get("read").unwrap_err().to_string();
+        keychain.delete("read").unwrap();
+        assert!(refused.contains("allow moil when macOS asks"), "{refused}");
     }
 }

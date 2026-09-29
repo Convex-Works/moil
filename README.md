@@ -135,17 +135,17 @@ your editor or an LLM can read, and which you can keep in git
   services/klisi.example.com/
     service.json                 the service, and the bundles you approved for it
     bundles/transcribe/<hash>/   each approved bundle's files, read-only, checked before every run
-    hooks/transcribe             yours: runs after each transcribe job that succeeds here
+    hooks/transcribe.py          yours: runs after each transcribe job that succeeds here
     logs/transcribe.log          what that hook printed
 ```
 
 **Hooks** are how a job's results become yours. After a job of a bundle
 succeeds on your machine, moil runs your executable
-`services/<service>/hooks/<bundle>` with the job's context on stdin and
-its outputs in a folder. The service never learns a hook exists. The
-[example hook](examples/hooks/meeting-notes.py) turns a klisi transcript
-into meeting notes in an Obsidian vault; `moil hooks --help` has the whole
-contract.
+`services/<service>/hooks/<bundle>`, such as `hooks/transcribe.py`, with
+the job's context on stdin and its outputs in a folder. The service never
+learns a hook exists. The [example hook](examples/hooks/meeting-notes.py)
+turns a klisi transcript into meeting notes in an Obsidian vault; `moil
+hooks --help` has the whole contract.
 
 **The command line does everything the app does**, while the app runs
 too, so scripts and agents can drive moil: `moil status`, `pause`,

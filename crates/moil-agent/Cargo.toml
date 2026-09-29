@@ -31,7 +31,9 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = "4"
+core-foundation = "0.10"
+security-framework = "3"
+security-framework-sys = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

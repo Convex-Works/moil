@@ -21,7 +21,7 @@ another file.
       pairing.json            this machine's pairing with the service
       .gitignore              keeps pairing.json and logs/ out of git
       bundles/<name>/<hash>/  each approved bundle's three files, read-only
-      hooks/<name>            the owner's program to run after that bundle's jobs
+      hooks/<name>[.<ext>]    the owner's program to run after that bundle's jobs
       logs/<name>.log         what that hook printed
     .machine/                 moil's own
 
@@ -84,11 +84,12 @@ folder; delete the folder to forget its approvals and hooks too.
 
 ## Hooks
 
-A hook is the owner's own program, at `services/<id>/hooks/<bundle name>`.
-After a job of that bundle for that service succeeds here, moil runs the
-hook with the job's outputs. Nobody approves a hook: it runs as the owner,
-and removing the file turns it off. `moil hooks --help` explains what a
-hook gets and how it runs.
+A hook is the owner's own program, at `services/<id>/hooks/<bundle name>`,
+or with one extension, such as `hooks/transcribe.py`. After a job of that
+bundle for that service succeeds here, moil runs the hook with the job's
+outputs. Nobody approves a hook: it runs as the owner, and removing the
+file turns it off. `moil hooks --help` explains what a hook gets and how
+it runs.
 
 ## Keeping the home in git
 

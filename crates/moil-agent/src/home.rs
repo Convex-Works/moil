@@ -31,7 +31,7 @@ use crate::{Error, ServiceId};
 ///     pairing.json                 this machine's pairing with it
 ///     .gitignore                   written when missing (SERVICE_GITIGNORE)
 ///     bundles/<name>/<hash>/       each approved bundle's files, read-only
-///     hooks/<name>                 the owner's hook for a bundle
+///     hooks/<name>[.<ext>]         the owner's hook for a bundle
 ///     logs/<name>.log              what that hook printed
 ///   .machine/                      what only moil reads, in a layout that may change:
 ///     agent.lock                   held by the process that has the home open
@@ -143,11 +143,18 @@ impl Home {
         self.services_dir().join(id.as_str())
     }
 
-    /// The owner's hook for a service's bundle: `services/<id>/hooks/<bundle>`.
-    /// `bundle` is a bundle name (protocol §2), so it is a plain file name.
+    /// Where the owner puts a service's hooks: `services/<id>/hooks`.
+    pub fn hooks_dir(&self, id: &ServiceId) -> PathBuf {
+        self.service_dir(id).join("hooks")
+    }
+
+    /// The owner's hook for a service's bundle, without an extension:
+    /// `services/<id>/hooks/<bundle>`. It may have one instead
+    /// (spec/machine.md §2), as `hooks/<bundle>.py` does. `bundle` is a
+    /// bundle name (protocol §2), so it is a plain file name.
     pub fn hook(&self, id: &ServiceId, bundle: &str) -> PathBuf {
         debug_assert!(is_file_name(bundle), "{bundle:?} isn't a bundle name");
-        self.service_dir(id).join("hooks").join(bundle)
+        self.hooks_dir(id).join(bundle)
     }
 
     /// What a hook printed: `services/<id>/logs/<bundle>.log`.

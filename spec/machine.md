@@ -44,7 +44,7 @@ option names. moil creates it readable only by the owner.
       pairing.json                   this machine's pairing with the service
       .gitignore                     written by moil when missing
       bundles/transcribe/<hash>/     each approved bundle's three files
-      hooks/transcribe               the owner's hook for that bundle (§2)
+      hooks/transcribe.py            the owner's hook for that bundle (§2)
       logs/transcribe.log            what that hook printed
   .machine/                          moil's own
 ```
@@ -141,6 +141,12 @@ with it is kept in the keychain on macOS, and in `.machine/` elsewhere,
 together with the base URL it was issued for. It is never kept in the
 service's folder.
 
+macOS asks the owner before one program reads a keychain item that
+another stored. moil is signed ad hoc, so the app, `moil` and each new
+version of either are different programs to it, and reading a token may
+ask the owner first. moil MUST replace and delete a token without reading
+it: that works whichever program stored it, and doesn't ask.
+
 A service is **paired** on this machine when its folder has a
 `pairing.json` whose `base_url` is the one in `service.json`. moil
 connects to it only while it also holds a token issued for that URL; a
@@ -205,10 +211,21 @@ removed or replaced, not an edit deeper down.
 ## 2. Hooks
 
 A hook is an executable the owner puts at
-`services/<service>/hooks/<bundle name>`. After an attempt of that bundle
-for that service succeeds on this machine, moil runs the hook with the
-attempt's outputs, if the hook's file is there when the attempt ends. The file is the whole setup: there is nothing to
+`services/<service>/hooks/<bundle name>` or
+`services/<service>/hooks/<bundle name>.<extension>`, where the extension
+is one or more ASCII letters and digits, such as `transcribe.py`. After an
+attempt of that bundle for that service succeeds on this machine, moil
+runs the hook with the attempt's outputs, if the hook's file is there when
+the attempt ends. The file is the whole setup: there is nothing to
 register, and removing the file turns the hook off.
+
+The extension tells the owner, an editor or an LLM what the file is. It
+doesn't change how moil runs it (§2.1). A bundle has at most one hook: if
+more than one file in `hooks/` could be it, such as `transcribe` and
+`transcribe.py`, moil runs none of them, says why in the hook's log
+(§2.3), and reports each as a problem (§3.3). A file in `hooks/` named
+otherwise, such as `transcribe.tar.gz`, is never run and is a problem too.
+Hidden files are passed over.
 
 ### 2.1 When a hook runs
 
@@ -292,7 +309,8 @@ The hook runs:
 ### 2.3 What a hook leaves
 
 What a hook prints to stdout and stderr is appended to
-`services/<service>/logs/<bundle name>.log`, between two lines moil writes:
+`services/<service>/logs/<bundle name>.log`, whatever the hook's
+extension, between two lines moil writes:
 
 ```
 == 2026-09-27T22:41:08Z recording-d07aa27961e839c14bb0a099bd971df0 attempt 1
@@ -484,7 +502,7 @@ A service, in `status` and as each element of `moil services --json`:
   "hooks": [
     {
       "bundle": "transcribe",
-      "path": "/Users/ada/.moil/services/klisi.convex.works/hooks/transcribe",
+      "path": "/Users/ada/.moil/services/klisi.convex.works/hooks/transcribe.py",
       "log": "/Users/ada/.moil/services/klisi.convex.works/logs/transcribe.log",
       "runnable": true
     }
@@ -504,6 +522,9 @@ A service, in `status` and as each element of `moil services --json`:
 - `approvals` lists only approvals that count (§1.2).
 - `offered` is what the service offers, as it describes it. A bundle with
   `approved` set to `false` is waiting for the owner's review.
+- `hooks` lists each file in the service's `hooks/` that is named as a
+  hook (§2), with its actual `path`. Each of several files that could be
+  one bundle's hook is listed, with `runnable` set to `false`.
 
 Each element of `moil hooks --json` is a hook, as in `hooks` above, with
 `service` added.
