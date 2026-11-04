@@ -64,7 +64,7 @@ or an LLM can read it, and you can keep it in git.
 ```
 ~/.moil/
   settings.json
-  services/tide.example.com/
+  services/acme.example.com/
     service.json                 the service, and the bundles you approved for it
     bundles/transcribe/<hash>/   each approved bundle's files, read-only, checked before every run
     hooks/transcribe.py          yours: runs after each transcribe job that succeeds here
@@ -76,8 +76,8 @@ runs your executable `services/<service>/hooks/<bundle>`. The hook gets the
 job's context on stdin and its outputs in a folder. The service never learns
 that a hook exists.
 
-The [example hook](examples/hooks/meeting-notes.py) turns a tide transcript
-into meeting notes in an Obsidian vault. Run `moil hooks --help` for the whole
+The [example hook](examples/hooks/meeting-notes.py) turns a transcript into
+meeting notes in an Obsidian vault. Run `moil hooks --help` for the whole
 contract.
 
 ## Write a bundle
@@ -95,15 +95,13 @@ moves the inputs and outputs.
 
 Start from [examples/bundles/echo](examples/bundles/echo), which uses every
 part of the script contract.
-[examples/bundles/transcribe](examples/bundles/transcribe) transcribes a
-meeting with speaker labels, using Nemotron 3 Diarization and Parakeet.
 
 The bundle author makes the script work on each platform (CUDA, Apple MPS, CPU).
 
 ## Add moil to a service
 
 ```go
-srv, _ := moil.NewServer(moil.Config{Name: "tide", VerificationURL: "https://tide.example.com/machines/pair", Store: store})
+srv, _ := moil.NewServer(moil.Config{Name: "acme", VerificationURL: "https://acme.example.com/machines/pair", Store: store})
 mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
 
 bundle, _ := moil.LoadBundle(os.DirFS("bundles/transcribe"))

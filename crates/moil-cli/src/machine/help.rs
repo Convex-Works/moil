@@ -23,13 +23,13 @@ Examples:
 
 pub const PAIR: &str = "\
 Examples:
-  moil pair https://tide.convex.works/moil
-  moil pair tide.convex.works     # a service the home knows, such as a clone from git
-  moil pair https://tide.convex.works/moil --name \"Ada's MacBook Pro\" --no-browser --json";
+  moil pair https://acme.example.com/moil
+  moil pair acme.example.com     # a service the home knows, such as a clone from git
+  moil pair https://acme.example.com/moil --name \"Ada's MacBook Pro\" --no-browser --json";
 
 pub const UNPAIR: &str = "\
 Example:
-  moil unpair tide.convex.works";
+  moil unpair acme.example.com";
 
 pub const SERVICES: &str = "\
 Examples:
@@ -38,24 +38,24 @@ Examples:
 
 pub const REVIEW: &str = "\
 Examples:
-  moil review tide
-  moil review tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
-  moil review tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --json";
+  moil review acme
+  moil review acme 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
+  moil review acme 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --json";
 
 pub const APPROVE: &str = "\
 Examples:
-  moil approve tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
-  moil approve tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --yes --json";
+  moil approve acme 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
+  moil approve acme 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --yes --json";
 
 pub const REVOKE: &str = "\
 Example:
-  moil revoke tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6";
+  moil revoke acme 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6";
 
 pub const LOGS: &str = "\
 Examples:
   moil logs -n 50                 # the agent's last 50 lines
   moil logs -f                    # the agent's log, as it is written
-  moil logs tide transcribe -f    # tide's hook for transcribe";
+  moil logs acme transcribe -f    # acme's hook for transcribe";
 
 pub const HOME: &str = "\
 Examples:
@@ -89,7 +89,7 @@ WHERE IT LIVES
   <home>/services/<service ID>/hooks/<bundle name>
   <home>/services/<service ID>/hooks/<bundle name>.<extension>
 
-such as ~/.moil/services/tide.convex.works/hooks/transcribe.py, for the attempts of tide's bundle named transcribe. `moil home` prints the home, and `moil services` the services' IDs. A hook is named after its bundle, with at most one extension of letters and digits, such as .py or .sh, which tells you and your editor what it is; moil runs it the same way whatever its extension. A bundle has at most one hook: if two files could be its hook, such as transcribe and transcribe.py, moil runs neither. Files named otherwise, and hidden files, are never run.
+such as ~/.moil/services/acme.example.com/hooks/transcribe.py, for the attempts of acme's bundle named transcribe. `moil home` prints the home, and `moil services` the services' IDs. A hook is named after its bundle, with at most one extension of letters and digits, such as .py or .sh, which tells you and your editor what it is; moil runs it the same way whatever its extension. A bundle has at most one hook: if two files could be its hook, such as transcribe and transcribe.py, moil runs neither. Files named otherwise, and hidden files, are never run.
 
 WHEN IT RUNS
 
@@ -104,9 +104,9 @@ On stdin, the hook context: one line of JSON, then end-of-file. For example (spr
   {
     "v": 1,
     "service": {
-      "id": "tide.convex.works",
-      "name": "tide",
-      "base_url": "https://tide.convex.works/moil"
+      "id": "acme.example.com",
+      "name": "acme",
+      "base_url": "https://acme.example.com/moil"
     },
     "bundle": {
       "name": "transcribe",
@@ -175,7 +175,7 @@ Some of what a hook gets comes from the service: title, params, meta and job_id,
 
 AN EXAMPLE
 
-~/.moil/services/tide.convex.works/hooks/transcribe.py, made executable with chmod +x, keeps each transcript in ~/Transcripts:
+~/.moil/services/acme.example.com/hooks/transcribe.py, made executable with chmod +x, keeps each transcript in ~/Transcripts:
 
   #!/usr/bin/env -S uv run --script
   # /// script

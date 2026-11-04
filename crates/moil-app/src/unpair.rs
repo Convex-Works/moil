@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::page::tests::assert_locked_down;
 
-    fn tide() -> ServiceStatus {
+    fn acme() -> ServiceStatus {
         let bundle = |hash: &str, approved| BundleStatus {
             info: BundleInfo {
                 hash: hash.parse().unwrap(),
@@ -140,9 +140,9 @@ mod tests {
             approved,
         };
         ServiceStatus {
-            id: "tide.example.com".parse().unwrap(),
-            name: "tide".into(),
-            base_url: "https://tide.example.com/moil".parse().unwrap(),
+            id: "acme.example.com".parse().unwrap(),
+            name: "acme".into(),
+            base_url: "https://acme.example.com/moil".parse().unwrap(),
             connection: Connection::Connected,
             bundles: vec![
                 bundle(&"a".repeat(64), true),
@@ -155,24 +155,24 @@ mod tests {
 
     #[test]
     fn says_what_unpairing_forgets_and_what_it_keeps() {
-        let page = UnpairWindow::new(&tide()).render();
+        let page = UnpairWindow::new(&acme()).render();
         assert_locked_down(&page);
-        assert!(page.contains("Unpair tide?"));
-        assert!(page.contains(r#"<a href="https://tide.example.com/moil">"#));
+        assert!(page.contains("Unpair acme?"));
+        assert!(page.contains(r#"<a href="https://acme.example.com/moil">"#));
         assert!(page.contains("forgets its token."));
         assert!(page.contains("The 2 bundles you approved for it stay approved"));
         assert!(
-            page.contains("choose Open moil Folder in the menu and delete <code>services/tide.example.com</code>"),
+            page.contains("choose Open moil Folder in the menu and delete <code>services/acme.example.com</code>"),
             "where to forget it altogether"
         );
     }
 
     #[test]
     fn confirming_unpairs_once() {
-        let mut window = UnpairWindow::new(&tide());
+        let mut window = UnpairWindow::new(&acme());
         assert_eq!(
             window.on_message(ConfirmMessage::Confirm {}),
-            Some(UnpairEffect::Unpair("tide.example.com".parse().unwrap()))
+            Some(UnpairEffect::Unpair("acme.example.com".parse().unwrap()))
         );
         assert_eq!(window.on_message(ConfirmMessage::Confirm {}), None);
         assert!(
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_shown_and_can_be_retried() {
-        let mut window = UnpairWindow::new(&tide());
+        let mut window = UnpairWindow::new(&acme());
         window.on_message(ConfirmMessage::Confirm {});
         assert_eq!(
             window.finished(Err("couldn't delete the token".into())),

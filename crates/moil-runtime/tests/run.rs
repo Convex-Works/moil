@@ -1287,7 +1287,7 @@ mod transfers {
         // service that listens only on the owner's machine.
         let h = Harness::new().await;
         let policy =
-            UrlPolicy::for_service(&"https://tide.example.com/moil".parse().unwrap(), false);
+            UrlPolicy::for_service(&"https://acme.example.com/moil".parse().unwrap(), false);
         h.server.serve("/local/secret", "the owner's");
 
         let mut job = h.job(&probe(), steps(json!([{"emit": {"type": "result"}}])));

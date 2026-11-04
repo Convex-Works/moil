@@ -250,7 +250,7 @@ fn enter(address: &str, from_link: bool, error: Option<&str>) -> Markup {
                 div {
                     label for="address" { "Service address" }
                     input #address type="text" name="url" value=(address)
-                        placeholder="https://tide.example.com/moil"
+                        placeholder="https://acme.example.com/moil"
                         autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
                         autofocus;
                 }
@@ -364,10 +364,10 @@ mod tests {
     fn code(now: Instant) -> PairingCode {
         PairingCode {
             user_code: "WDJB-MJHT".into(),
-            verification_uri: "https://tide.example.com/machines/pair".into(),
-            verification_uri_complete: "https://tide.example.com/machines/pair?code=WDJB-MJHT"
+            verification_uri: "https://acme.example.com/machines/pair".into(),
+            verification_uri_complete: "https://acme.example.com/machines/pair?code=WDJB-MJHT"
                 .into(),
-            service_name: "tide".into(),
+            service_name: "acme".into(),
             expires_at: now + Duration::from_secs(600),
         }
     }
@@ -383,12 +383,12 @@ mod tests {
 
     #[test]
     fn a_link_fills_in_the_address_but_waits_for_the_owner() {
-        let url: Url = "https://tide.example.com/moil".parse().unwrap();
+        let url: Url = "https://acme.example.com/moil".parse().unwrap();
         let window = PairWindow::from_link(&url);
         assert!(!window.is_pairing());
         let page = window.render(Instant::now());
         assert_locked_down(&page);
-        assert!(page.contains(r#"value="https://tide.example.com/moil""#));
+        assert!(page.contains(r#"value="https://acme.example.com/moil""#));
         assert!(page.contains("A link asked to pair this Mac"));
         assert!(page.contains(r#"<form data-action="start">"#));
     }
@@ -400,19 +400,19 @@ mod tests {
         assert!(!window.render(now).contains("A link asked"));
 
         let Some(PairEffect::Start { url, attempt }) = window.on_message(PairMessage::Start {
-            url: " tide.example.com/moil ".into(),
+            url: " acme.example.com/moil ".into(),
         }) else {
             panic!("pairing should start");
         };
-        assert_eq!(url.as_str(), "https://tide.example.com/moil");
+        assert_eq!(url.as_str(), "https://acme.example.com/moil");
         assert!(window.is_pairing());
-        assert!(window.render(now).contains("Contacting tide.example.com…"));
+        assert!(window.render(now).contains("Contacting acme.example.com…"));
 
         // The code arrives: the browser opens on the confirmation page.
         assert_eq!(
             window.started(attempt, Ok(code(now))),
             Some(PairEffect::OpenBrowser(
-                "https://tide.example.com/machines/pair?code=WDJB-MJHT"
+                "https://acme.example.com/machines/pair?code=WDJB-MJHT"
                     .parse()
                     .unwrap()
             ))
@@ -420,7 +420,7 @@ mod tests {
         let page = window.render(now + Duration::from_secs(30));
         assert!(page.contains(r#"<div class="user-code">WDJB-MJHT</div>"#));
         assert!(page.contains(
-            r#"<a href="https://tide.example.com/machines/pair?code=WDJB-MJHT">tide.example.com/machines/pair</a>"#
+            r#"<a href="https://acme.example.com/machines/pair?code=WDJB-MJHT">acme.example.com/machines/pair</a>"#
         ));
         assert!(page.contains(r#"The code expires in <span data-countdown="570">10 min</span>."#));
         assert!(matches!(
@@ -428,10 +428,10 @@ mod tests {
             Some(PairEffect::OpenBrowser(_))
         ));
 
-        window.finished(attempt, Ok("tide".into()));
+        window.finished(attempt, Ok("acme".into()));
         assert!(!window.is_pairing());
         let page = window.render(now);
-        assert!(page.contains("Paired with tide"));
+        assert!(page.contains("Paired with acme"));
         assert!(page.contains("review each job bundle"));
     }
 
@@ -440,33 +440,33 @@ mod tests {
         let mut window = PairWindow::new(None);
         assert_eq!(
             window.on_message(PairMessage::Start {
-                url: "ftp://tide.example.com".into()
+                url: "ftp://acme.example.com".into()
             }),
             None
         );
         let page = window.render(Instant::now());
         assert!(page.contains("moil services have https addresses, not ftp:// ones."));
-        assert!(page.contains(r#"value="ftp://tide.example.com""#));
+        assert!(page.contains(r#"value="ftp://acme.example.com""#));
     }
 
     #[test]
     fn a_service_that_refuses_to_start_sends_the_owner_back_to_the_address() {
         let mut window = PairWindow::new(None);
-        let attempt = start(&mut window, "https://tide.example.com/wrong");
+        let attempt = start(&mut window, "https://acme.example.com/wrong");
         window.started(
             attempt,
-            Err("https://tide.example.com/wrong isn't a moil service: 404".into()),
+            Err("https://acme.example.com/wrong isn't a moil service: 404".into()),
         );
         let page = window.render(Instant::now());
         assert!(page.contains("isn't a moil service: 404"));
-        assert!(page.contains(r#"value="https://tide.example.com/wrong""#));
+        assert!(page.contains(r#"value="https://acme.example.com/wrong""#));
     }
 
     #[test]
     fn rejection_offers_to_try_again() {
         let now = Instant::now();
         let mut window = PairWindow::new(None);
-        let attempt = start(&mut window, "https://tide.example.com/moil");
+        let attempt = start(&mut window, "https://acme.example.com/moil");
         window.started(attempt, Ok(code(now)));
         window.finished(
             attempt,
@@ -479,7 +479,7 @@ mod tests {
         assert!(
             window
                 .render(now)
-                .contains(r#"value="https://tide.example.com/moil""#)
+                .contains(r#"value="https://acme.example.com/moil""#)
         );
     }
 
@@ -503,7 +503,7 @@ mod tests {
     fn links_do_not_interrupt_a_pairing() {
         let now = Instant::now();
         let mut window = PairWindow::new(None);
-        let attempt = start(&mut window, "https://tide.example.com/moil");
+        let attempt = start(&mut window, "https://acme.example.com/moil");
         window.started(attempt, Ok(code(now)));
         window.link(&"https://evil.example/moil".parse().unwrap());
         assert!(window.render(now).contains("WDJB-MJHT"));
@@ -519,13 +519,13 @@ mod tests {
         );
         for _ in 0..2 {
             let bad = PairMessage::Start {
-                url: "ftp://tide.example.com".into(),
+                url: "ftp://acme.example.com".into(),
             };
             window.on_message(bad);
             // The form disabled its buttons when it was sent.
             assert!(window.needs_render(), "every refusal brings a fresh form");
         }
-        let attempt = start(&mut window, "https://tide.example.com/moil");
+        let attempt = start(&mut window, "https://acme.example.com/moil");
         assert!(window.needs_render());
         window.started(attempt, Ok(code(now)));
         assert!(window.needs_render());
@@ -540,7 +540,7 @@ mod tests {
     fn only_web_pages_open_in_the_browser() {
         let now = Instant::now();
         let mut window = PairWindow::new(None);
-        let attempt = start(&mut window, "https://tide.example.com/moil");
+        let attempt = start(&mut window, "https://acme.example.com/moil");
         let mut sneaky = code(now);
         sneaky.verification_uri_complete = "file:///Applications/Calculator.app".into();
         assert_eq!(window.started(attempt, Ok(sneaky)), None);

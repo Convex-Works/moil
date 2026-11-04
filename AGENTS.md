@@ -54,7 +54,6 @@ contract**. Read them before changing anything that crosses a boundary.
 | `sdk/go/README.md` | Changing the SDK's public API |
 | `crates/moil-app/README.md` | Changing the app: its modules, build and tests |
 | `e2e/README.md` | Adding or changing an end-to-end test |
-| `examples/bundles/transcribe/README.md` | Changing the transcribe bundle. Any change to its `job.py`, `job.py.lock` or `manifest.json` changes the bundle hash |
 
 ## Style
 

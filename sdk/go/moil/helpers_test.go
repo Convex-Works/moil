@@ -25,8 +25,8 @@ import (
 func newServer(t *testing.T, configure ...func(*moil.Config)) *moil.Server {
 	t.Helper()
 	cfg := moil.Config{
-		Name:            "tide",
-		VerificationURL: "https://tide.example.com/machines/pair",
+		Name:            "acme",
+		VerificationURL: "https://acme.example.com/machines/pair",
 		Store:           moil.NewMemoryStore(),
 		Logger:          slog.New(slog.NewTextHandler(testLog{t}, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		PairingInterval: time.Nanosecond, // advertised as 1s; tests poll back to back

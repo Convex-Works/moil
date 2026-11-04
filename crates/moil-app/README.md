@@ -14,11 +14,11 @@ cargo run -p moil-app -- --demo    # a simulated agent; touches nothing on this 
 cargo run -p moil-app              # the real agent, on $MOIL_HOME or ~/.moil
 ```
 
-The demo has two services: tide, connected, offering `transcribe 0.3.0` to
+The demo has two services: acme, connected, offering `transcribe 0.3.0` to
 replace an approved 0.2.0 (so the review opens with a diff), and lab, which
-keeps failing to connect. Jobs for tide come and go through every phase,
+keeps failing to connect. Jobs for acme come and go through every phase,
 and one in three runs out of GPU memory, so the menu has a failure to show.
-tide has a hook; lab has one that isn't executable, which the menu shows as
+acme has a hook; lab has one that isn't executable, which the menu shows as
 a problem until lab is unpaired. Pairing with any address succeeds after a
 few seconds with the code `WDJB-MJHT`; hosts starting with `deny` are
 refused, and hosts ending in `.invalid` aren't moil services. The demo
@@ -59,7 +59,7 @@ the bundle with `SMAppService`. When it starts, the app links
 `~/.local/bin/moil` to its `Contents/MacOS/moil`, if nothing is there or a
 link into a `Moil.app` is; it never replaces anything else, and logs why it
 left the path alone. Try a link with
-`open 'moil://pair?url=https://tide.example.com/moil'`: it opens the pair
+`open 'moil://pair?url=https://acme.example.com/moil'`: it opens the pair
 window with the address filled in, and nothing happens until the owner
 presses Continue.
 

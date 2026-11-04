@@ -1,11 +1,11 @@
 //! `moil-app --demo`: the app on a simulated agent, to try every screen
 //! without a service.
 //!
-//! It simulates two services: tide, connected, which offers transcribe
+//! It simulates two services: acme, connected, which offers transcribe
 //! 0.3.0 to replace the approved 0.2.0 (so the review shows a diff), and
-//! lab, which keeps failing to connect. Jobs for tide come and go through
+//! lab, which keeps failing to connect. Jobs for acme come and go through
 //! every phase, and one in three runs out of GPU memory; stopping one
-//! takes a moment, as a real script's would. tide has a hook for
+//! takes a moment, as a real script's would. acme has a hook for
 //! transcribe; lab has one for minimal that isn't executable, which is a
 //! problem with the home. Pairing with any address
 //! succeeds after a few seconds with the code WDJB-MJHT, unless its host
@@ -129,14 +129,14 @@ impl Demo {
             version: bundle.manifest().version.clone(),
             approved_at: days_ago(days),
         };
-        let tide_url: Url = "https://tide.example.com/moil".parse().expect("a URL");
-        let tide = Service {
-            id: ServiceId::derive(&tide_url, |_| false),
-            base_url: tide_url.clone(),
-            name: "tide".into(),
+        let acme_url: Url = "https://acme.example.com/moil".parse().expect("a URL");
+        let acme = Service {
+            id: ServiceId::derive(&acme_url, |_| false),
+            base_url: acme_url.clone(),
+            name: "acme".into(),
             approvals: vec![approval(&v2, 23)],
             pairing: Some(moil_agent::Pairing {
-                base_url: tide_url,
+                base_url: acme_url,
                 machine_id: "m_7Hq2Xk9Lw3".into(),
                 paired_at: days_ago(64),
             }),
@@ -169,7 +169,7 @@ impl Demo {
         // The owner's hooks, which the demo never runs.
         let mut home_state = HomeState::default();
         home_state.hooks = vec![
-            hook(&tide, "transcribe", true),
+            hook(&acme, "transcribe", true),
             hook(&lab, "minimal", false),
         ];
         home_state.problems = vec![Problem {
@@ -179,7 +179,7 @@ impl Demo {
         let snapshot = Snapshot {
             paused: false,
             services: vec![
-                status(&tide, Connection::Connected, &[&v2, &v3]),
+                status(&acme, Connection::Connected, &[&v2, &v3]),
                 status(
                     &lab,
                     Connection::Disconnected {
@@ -191,7 +191,7 @@ impl Demo {
             ],
             job: None,
             last_job: Some(JobReport {
-                service: tide.id.clone(),
+                service: acme.id.clone(),
                 job_id: JobId::new("j_4099").expect("a job ID"),
                 attempt: 1,
                 title: Some(MEETINGS[2].0.into()),
@@ -201,16 +201,16 @@ impl Demo {
             }),
             home: Arc::new(home_state),
         };
-        let (tide_id, lab_id) = (tide.id.clone(), lab.id.clone());
+        let (acme_id, lab_id) = (acme.id.clone(), lab.id.clone());
         let state = Arc::new(State {
             snapshot: watch::Sender::new(snapshot),
-            paired: Mutex::new(vec![tide, lab]),
+            paired: Mutex::new(vec![acme, lab]),
             stop: watch::Sender::new(false),
             running: Mutex::new(None),
             bundles: vec![v2, v3, minimal],
             home: root,
         });
-        tokio::spawn(state.clone().run_jobs(tide_id));
+        tokio::spawn(state.clone().run_jobs(acme_id));
         tokio::spawn(state.clone().keep_reconnecting(lab_id));
         Self(state)
     }
@@ -245,22 +245,22 @@ impl State {
         self.stop.send_replace(true);
     }
 
-    /// Runs a job for `tide` now and then, while not paused.
-    async fn run_jobs(self: Arc<Self>, tide: ServiceId) {
+    /// Runs a job for `acme` now and then, while not paused.
+    async fn run_jobs(self: Arc<Self>, acme: ServiceId) {
         let mut paused = self.snapshot.subscribe();
         for (n, (meeting, fails_at)) in MEETINGS.into_iter().cycle().enumerate() {
             sleep(pace::IDLE).await;
             if paused.wait_for(|s| !s.paused).await.is_err() {
                 return;
             }
-            let Some(bundle) = self.approved_bundles(&tide).pop() else {
+            let Some(bundle) = self.approved_bundles(&acme).pop() else {
                 continue;
             };
             self.stop.send_replace(false);
             *self.running.lock().expect("the demo's state") = Some(bundle.hash());
             self.update(|s| {
                 s.job = Some(JobStatus {
-                    service: tide.clone(),
+                    service: acme.clone(),
                     job_id: JobId::new(format!("j_{}", 4100 + n)).expect("a job ID"),
                     attempt: 1,
                     title: Some(meeting.into()),
@@ -615,19 +615,19 @@ mod tests {
     async fn starts_with_an_update_to_review_and_a_service_offline() {
         let demo = Demo::start();
         let snapshot = snapshot(&demo);
-        let [tide, lab] = &snapshot.services[..] else {
+        let [acme, lab] = &snapshot.services[..] else {
             panic!("two services: {snapshot:?}");
         };
-        assert_eq!(tide.connection, Connection::Connected);
+        assert_eq!(acme.connection, Connection::Connected);
         assert!(matches!(lab.connection, Connection::Disconnected { .. }));
         let pending: Vec<_> = snapshot
             .pending_reviews()
             .map(|(s, b)| (s.name.as_str(), b.info.hash))
             .collect();
-        assert_eq!(pending, [("tide", transcribe_0_3().hash())]);
+        assert_eq!(pending, [("acme", transcribe_0_3().hash())]);
 
         let review = demo
-            .review(tide.id.clone(), transcribe_0_3().hash())
+            .review(acme.id.clone(), transcribe_0_3().hash())
             .await
             .unwrap();
         assert!(!review.approved);
@@ -758,7 +758,7 @@ mod tests {
             Err(Error::PairingDenied)
         ));
         assert!(matches!(
-            demo.pair("http://tide.example.com/moil".into()).await,
+            demo.pair("http://acme.example.com/moil".into()).await,
             Err(Error::InsecureUrl(_))
         ));
     }
@@ -766,20 +766,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn approving_the_update_settles_the_review() {
         let demo = Demo::start();
-        let tide: ServiceId = "tide.example.com".parse().unwrap();
+        let acme: ServiceId = "acme.example.com".parse().unwrap();
         let review = demo
-            .review(tide.clone(), transcribe_0_3().hash())
+            .review(acme.clone(), transcribe_0_3().hash())
             .await
             .unwrap();
         demo.approve(review).await.unwrap();
         assert_eq!(snapshot(&demo).pending_reviews().count(), 0);
         let again = demo
-            .review(tide.clone(), transcribe_0_3().hash())
+            .review(acme.clone(), transcribe_0_3().hash())
             .await
             .unwrap();
         assert!(again.approved);
 
-        demo.revoke(tide, transcribe_0_3().hash()).await.unwrap();
+        demo.revoke(acme, transcribe_0_3().hash()).await.unwrap();
         assert_eq!(snapshot(&demo).pending_reviews().count(), 1);
     }
 
@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(
             hooks,
             [
-                ("tide.example.com", "transcribe", true),
+                ("acme.example.com", "transcribe", true),
                 ("lab.example.org", "minimal", false)
             ]
         );
@@ -818,17 +818,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn revoking_the_running_bundle_stops_its_job() {
         let demo = Demo::start();
-        let tide: ServiceId = "tide.example.com".parse().unwrap();
+        let acme: ServiceId = "acme.example.com".parse().unwrap();
         let mut snapshots = demo.subscribe();
         snapshots.wait_for(|s| s.job.is_some()).await.unwrap();
 
         // Not the bundle it runs: it carries on.
-        demo.revoke(tide.clone(), transcribe_0_3().hash())
+        demo.revoke(acme.clone(), transcribe_0_3().hash())
             .await
             .unwrap();
         assert!(!snapshot(&demo).job.unwrap().stopping);
 
-        demo.revoke(tide, transcribe_0_2().hash()).await.unwrap();
+        demo.revoke(acme, transcribe_0_2().hash()).await.unwrap();
         assert!(snapshot(&demo).job.unwrap().stopping);
         let ended = snapshots.wait_for(|s| s.job.is_none()).await.unwrap();
         assert_eq!(

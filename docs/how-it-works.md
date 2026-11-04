@@ -33,7 +33,7 @@ ports or trusting the service with anything they haven't read.
 
 ```
 ┌────────────────────┐        WebSocket        ┌──────────────────────┐
-│  Service (tide)    │◀── opened by machine ───│   moil app (Rust)    │
+│  Service           │◀── opened by machine ───│   moil app (Rust)    │
 │  + Go SDK          │                         │   tray, agent        │
 └────────────────────┘                         └──────────┬───────────┘
          │                                                │ stdin / stdout

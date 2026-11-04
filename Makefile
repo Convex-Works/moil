@@ -1,6 +1,6 @@
-.PHONY: check rust-check go-check e2e bundle-check fmt app
+.PHONY: check rust-check go-check e2e fmt app
 
-check: rust-check go-check e2e bundle-check
+check: rust-check go-check e2e
 
 rust-check:
 	cargo fmt --all --check
@@ -16,11 +16,6 @@ go-check:
 e2e:
 	cargo build -p moil-cli
 	cd e2e && test -z "$$(gofmt -l .)" && go vet ./... && go test -race -count=1 ./...
-
-# What the example bundles do, without their models. uv installs what the
-# test declares; moil ignores the test, so it isn't in the bundle's hash.
-bundle-check:
-	uv run --script examples/bundles/transcribe/test_job.py
 
 fmt:
 	cargo fmt --all

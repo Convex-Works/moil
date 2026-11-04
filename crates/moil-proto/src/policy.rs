@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn a_remote_service_gets_https_only() {
-        let policy = UrlPolicy::for_service(&url("https://tide.example.com/moil"), false);
+        let policy = UrlPolicy::for_service(&url("https://acme.example.com/moil"), false);
         assert!(policy.check(&url("https://s3.example.com/a")).is_ok());
         for refused in [
             "http://s3.example.com/a",
@@ -157,12 +157,12 @@ mod tests {
     fn base_urls_may_be_loopback_http() {
         let policy = UrlPolicy::for_base_urls(false);
         assert!(policy.check(&url("http://localhost:8787/moil")).is_ok());
-        assert!(policy.check(&url("http://tide.example.com/moil")).is_err());
+        assert!(policy.check(&url("http://acme.example.com/moil")).is_err());
     }
 
     #[test]
     fn the_owner_can_allow_http_anywhere_but_nothing_else() {
-        let policy = UrlPolicy::for_service(&url("https://tide.example.com/moil"), true);
+        let policy = UrlPolicy::for_service(&url("https://acme.example.com/moil"), true);
         assert!(policy.check(&url("http://minio:9000/a")).is_ok());
         assert!(policy.check(&url("file:///etc/passwd")).is_err());
     }
