@@ -281,14 +281,14 @@ mod tests {
     fn the_confirmation_page_may_be_anywhere_on_the_services_origin() {
         for (base, page) in [
             (
-                "https://klisi.example.com/moil",
-                "https://klisi.example.com/machines/pair?code=WDJB-MJHT",
+                "https://acme.example.com/moil",
+                "https://acme.example.com/machines/pair?code=WDJB-MJHT",
             ),
             (
-                "https://klisi.example.com/moil",
-                "https://KLISI.example.com:443/machines",
+                "https://acme.example.com/moil",
+                "https://ACME.example.com:443/machines",
             ),
-            ("https://klisi.example.com/", "https://klisi.example.com"),
+            ("https://acme.example.com/", "https://acme.example.com"),
             ("http://127.0.0.1:8787/moil", "http://127.0.0.1:8787/pair"),
             ("http://[::1]:8787/moil", "http://[0:0::1]:8787/pair"),
         ] {
@@ -298,22 +298,22 @@ mod tests {
 
     #[test]
     fn a_page_on_another_origin_is_refused() {
-        let klisi = "https://klisi.example.com/moil";
+        let acme = "https://acme.example.com/moil";
         let local = "http://127.0.0.1:8787/moil";
         for (base, page, site) in [
             // A relay, passing on the page of the service it relays to.
             (
                 "https://evil.example/moil",
-                "https://klisi.example.com/machines/pair?code=WDJB-MJHT",
-                "https://klisi.example.com",
+                "https://acme.example.com/machines/pair?code=WDJB-MJHT",
+                "https://acme.example.com",
             ),
             // Other hosts, however related.
             (
-                klisi,
-                "https://machines.klisi.example.com/pair",
-                "https://machines.klisi.example.com",
+                acme,
+                "https://machines.acme.example.com/pair",
+                "https://machines.acme.example.com",
             ),
-            (klisi, "https://example.com/pair", "https://example.com"),
+            (acme, "https://example.com/pair", "https://example.com"),
             (
                 "http://localhost:8787/moil",
                 "http://127.0.0.1:8787/pair",
@@ -321,16 +321,16 @@ mod tests {
             ),
             // Other ports.
             (
-                klisi,
-                "https://klisi.example.com:8443/pair",
-                "https://klisi.example.com:8443",
+                acme,
+                "https://acme.example.com:8443/pair",
+                "https://acme.example.com:8443",
             ),
             (local, "http://127.0.0.1:8788/pair", "http://127.0.0.1:8788"),
             // Other schemes.
             (
-                klisi,
-                "http://klisi.example.com/pair",
-                "http://klisi.example.com",
+                acme,
+                "http://acme.example.com/pair",
+                "http://acme.example.com",
             ),
             (
                 local,
@@ -339,13 +339,13 @@ mod tests {
             ),
             // A user name that reads like the service's host.
             (
-                klisi,
-                "https://klisi.example.com@evil.example/pair",
+                acme,
+                "https://acme.example.com@evil.example/pair",
                 "https://evil.example",
             ),
             (
-                klisi,
-                "https://klisi.example.com:443@evil.example/pair",
+                acme,
+                "https://acme.example.com:443@evil.example/pair",
                 "https://evil.example",
             ),
         ] {
@@ -362,14 +362,14 @@ mod tests {
     fn the_owner_learns_where_they_were_sent() {
         let err = check(
             "https://evil.example/moil",
-            "https://klisi.example.com/machines/pair?code=WDJB-MJHT",
+            "https://acme.example.com/machines/pair?code=WDJB-MJHT",
         )
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "https://evil.example/moil wants you to confirm on https://klisi.example.com, \
+            "https://evil.example/moil wants you to confirm on https://acme.example.com, \
              another site, which is how a service would get you to pair its own machine with \
-             your account there; to pair with https://klisi.example.com, use the address it \
+             your account there; to pair with https://acme.example.com, use the address it \
              shows for moil"
         );
     }
@@ -378,7 +378,7 @@ mod tests {
     fn a_disguised_page_or_one_that_isnt_on_the_web_is_refused() {
         for (page, why) in [
             (
-                "https://klisi.example.com@evil.example/pair",
+                "https://acme.example.com@evil.example/pair",
                 "has a user name or password in it",
             ),
             (

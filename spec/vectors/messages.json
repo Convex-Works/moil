@@ -293,7 +293,7 @@
         "protocol": 1,
         "machine_id": "m_7Hq2Xk9Lw3",
         "service": {
-          "name": "klisi"
+          "name": "acme"
         },
         "bundles": [
           {
@@ -324,7 +324,7 @@
         "protocol": 1,
         "machine_id": "m_7Hq2Xk9Lw3",
         "service": {
-          "name": "klisi"
+          "name": "acme"
         },
         "bundles": [],
         "resume": []
@@ -432,7 +432,7 @@
   "http": {
     "info_response": {
       "protocol": 1,
-      "name": "klisi"
+      "name": "acme"
     },
     "pair_request": {
       "name": "Ada's MacBook Pro",
@@ -443,12 +443,12 @@
     "pair_response": {
       "device_code": "0V8i3Yl5tE9c7mNcA4Qe2wBv",
       "user_code": "WDJB-MJHT",
-      "verification_uri": "https://klisi.example.com/machines/pair",
-      "verification_uri_complete": "https://klisi.example.com/machines/pair?code=WDJB-MJHT",
+      "verification_uri": "https://acme.example.com/machines/pair",
+      "verification_uri_complete": "https://acme.example.com/machines/pair?code=WDJB-MJHT",
       "expires_in": 600,
       "interval": 2,
       "service": {
-        "name": "klisi"
+        "name": "acme"
       }
     },
     "token_request": {
@@ -458,7 +458,7 @@
       "machine_id": "m_7Hq2Xk9Lw3",
       "token": "moil_3q2-7wX9vKp0Lr8sT1uY4zA6bC5dE7fG9hJ2kM4nP6q",
       "service": {
-        "name": "klisi"
+        "name": "acme"
       }
     },
     "error_responses": [

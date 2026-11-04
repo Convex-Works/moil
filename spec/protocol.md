@@ -20,9 +20,9 @@ The key words MUST, SHOULD and MAY are used as in RFC 2119.
 
 ## 1. Roles and terms
 
-- **Service:** a web application (e.g. klisi) that embeds the server SDK.
+- **Service:** a web application (e.g. acme) that embeds the server SDK.
   It has a **base URL**, the URL where the SDK's HTTP handler is mounted,
-  e.g. `https://klisi.example.com/moil`.
+  e.g. `https://acme.example.com/moil`.
 - **Machine:** a computer running the moil app (or the headless `moil
   agent`). It is paired with zero or more services. What it keeps on disk, and
   what it runs for its owner, is in [machine.md](machine.md).
@@ -94,7 +94,7 @@ is submitted, URLs that machines would refuse.
 
 ```json
 GET /v1/info
-→ 200 {"protocol": 1, "name": "klisi"}
+→ 200 {"protocol": 1, "name": "acme"}
 ```
 
 The app calls this when the user enters a base URL, to confirm it points
@@ -127,11 +127,11 @@ POST /v1/pair
 {
   "device_code": "0V8i3Yl5tE9c7mNcA4Qe2wBv",
   "user_code": "WDJB-MJHT",
-  "verification_uri": "https://klisi.example.com/machines/pair",
-  "verification_uri_complete": "https://klisi.example.com/machines/pair?code=WDJB-MJHT",
+  "verification_uri": "https://acme.example.com/machines/pair",
+  "verification_uri_complete": "https://acme.example.com/machines/pair?code=WDJB-MJHT",
   "expires_in": 600,
   "interval": 2,
-  "service": {"name": "klisi"}
+  "service": {"name": "acme"}
 }
 ```
 
@@ -166,7 +166,7 @@ it.
 POST /v1/pair/token
 {"device_code": "0V8i3Yl5tE9c7mNcA4Qe2wBv"}
 
-→ 200 {"machine_id": "m_7Hq2Xk9Lw3", "token": "moil_…", "service": {"name": "klisi"}}
+→ 200 {"machine_id": "m_7Hq2Xk9Lw3", "token": "moil_…", "service": {"name": "acme"}}
 → 400 {"error": "authorization_pending"}
 → 400 {"error": "slow_down"}
 → 400 {"error": "access_denied"}
@@ -441,7 +441,7 @@ or revokes a bundle.
   "type": "welcome",
   "protocol": 1,
   "machine_id": "m_7Hq2Xk9Lw3",
-  "service": {"name": "klisi"},
+  "service": {"name": "acme"},
   "bundles": [{"hash": "…", "name": "transcribe", "version": "0.3.0", "description": "…"}],
   "resume": [{"job_id": "j_42", "attempt": 1, "seq": 7}]
 }

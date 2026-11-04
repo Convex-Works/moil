@@ -106,10 +106,10 @@ mod tests {
     fn labels_are_keys_in_lowercase_with_underscores() {
         let labels = Labels::new()
             .with("Open at login", true)
-            .with("URL", "https://klisi.example.com/pair\u{202e}");
+            .with("URL", "https://acme.example.com/pair\u{202e}");
         assert_eq!(
             json_line(&labels),
-            r#"{"open_at_login":true,"url":"https://klisi.example.com/pair\u202e"}"#
+            r#"{"open_at_login":true,"url":"https://acme.example.com/pair\u202e"}"#
         );
     }
 }

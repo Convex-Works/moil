@@ -122,11 +122,11 @@ mod tests {
     #[test]
     fn the_command_line_takes_the_demo_flag_and_links() {
         assert_eq!(
-            parse(&["--demo", "moil://pair?url=https://klisi.example.com/moil"]),
+            parse(&["--demo", "moil://pair?url=https://acme.example.com/moil"]),
             Ok(Options {
                 demo: true,
                 help: false,
-                links: vec!["moil://pair?url=https://klisi.example.com/moil".into()],
+                links: vec!["moil://pair?url=https://acme.example.com/moil".into()],
             })
         );
         assert_eq!(parse(&["-psn_0_12345"]), Ok(Options::default()));
@@ -135,6 +135,6 @@ mod tests {
             parse(&["--dmeo"]),
             Err("unexpected argument \"--dmeo\"".into())
         );
-        assert!(parse(&["https://klisi.example.com"]).is_err());
+        assert!(parse(&["https://acme.example.com"]).is_err());
     }
 }

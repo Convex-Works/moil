@@ -145,12 +145,12 @@ mod tests {
     #[test]
     fn failures_reveal_what_a_service_hid_in_them() {
         let said = moil_agent::Error::Http(
-            "klisi answered 500: \x1b[2J\x1b[Hbundle approved\u{202e}".into(),
+            "acme answered 500: \x1b[2J\x1b[Hbundle approved\u{202e}".into(),
         );
         let error = anyhow::Error::from(said).context("couldn't review the bundle");
         assert_eq!(
             failure(&error),
-            "Error: couldn't review the bundle: klisi answered 500: ␛[2J␛[Hbundle approved\\u{202e}"
+            "Error: couldn't review the bundle: acme answered 500: ␛[2J␛[Hbundle approved\\u{202e}"
         );
     }
 

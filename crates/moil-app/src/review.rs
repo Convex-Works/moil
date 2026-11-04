@@ -603,11 +603,11 @@ mod tests {
 
     fn service(approved: &[&Bundle]) -> Service {
         Service {
-            id: "klisi.example.com".parse().unwrap(),
-            base_url: "https://klisi.example.com/moil".parse().unwrap(),
-            name: "klisi".into(),
+            id: "acme.example.com".parse().unwrap(),
+            base_url: "https://acme.example.com/moil".parse().unwrap(),
+            name: "acme".into(),
             pairing: Some(Pairing {
-                base_url: "https://klisi.example.com/moil".parse().unwrap(),
+                base_url: "https://acme.example.com/moil".parse().unwrap(),
                 machine_id: "m_7Hq2Xk9Lw3".into(),
                 paired_at: now() - Duration::from_secs(90 * 86400),
             }),
@@ -659,7 +659,7 @@ mod tests {
     fn hostile_bundles_render_inert() {
         let bundle = hostile_bundle();
         let mut service = service(&[]);
-        service.name = "<b onmouseover=alert(1)>klisi</b>".into();
+        service.name = "<b onmouseover=alert(1)>acme</b>".into();
         let page = window_for(Review {
             service,
             bundle,
@@ -694,8 +694,8 @@ mod tests {
         assert_locked_down(&page);
 
         // Who asks, and for what, from the verified manifest.
-        assert!(page.contains("Offered by <strong>klisi</strong>"));
-        assert!(page.contains(r#"<a href="https://klisi.example.com/moil">"#));
+        assert!(page.contains("Offered by <strong>acme</strong>"));
+        assert!(page.contains(r#"<a href="https://acme.example.com/moil">"#));
         assert!(page.contains("transcribe <span class=\"version\">0.3.0</span>"));
         assert!(page.contains("Transcribe a meeting recording with speaker labels"));
 
@@ -785,7 +785,7 @@ mod tests {
         .render(now());
         assert!(!page.contains(r#"id="changes""#));
         assert!(!page.contains("href=\"#changes\""));
-        assert!(page.contains("Job bundle from klisi"));
+        assert!(page.contains("Job bundle from acme"));
     }
 
     #[test]
@@ -898,11 +898,11 @@ mod tests {
         window.on_message(ReviewMessage::Approve { hash });
         assert!(
             window
-                .finished(Err("couldn't reach klisi: timed out".into()))
+                .finished(Err("couldn't reach acme: timed out".into()))
                 .is_none()
         );
         let page = window.render(now());
-        assert!(page.contains(r#"<p class="note bad">couldn't reach klisi: timed out</p>"#));
+        assert!(page.contains(r#"<p class="note bad">couldn't reach acme: timed out</p>"#));
         assert!(!page.contains(" disabled>"));
         assert!(matches!(
             window.on_message(ReviewMessage::Approve { hash }),
@@ -937,7 +937,7 @@ mod tests {
         let review = update();
         let mut window = ReviewWindow::new(
             review.service.id.clone(),
-            "klisi",
+            "acme",
             demo::transcribe_0_2().hash(),
         );
         window.loaded(Ok(review));
@@ -949,14 +949,14 @@ mod tests {
     #[test]
     fn loading_and_failure_pages_let_the_owner_leave() {
         let mut window = ReviewWindow::new(
-            "klisi.example.com".parse().unwrap(),
-            "klisi",
+            "acme.example.com".parse().unwrap(),
+            "acme",
             demo::transcribe_0_3().hash(),
         );
         assert!(
             window
                 .render(now())
-                .contains("Fetching the bundle from klisi")
+                .contains("Fetching the bundle from acme")
         );
         assert!(
             window

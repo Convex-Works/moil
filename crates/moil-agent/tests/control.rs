@@ -59,7 +59,7 @@ impl HostControls for AgentCommand {
     }
 }
 
-/// An agent serving its control socket, on a machine paired with `klisi`
+/// An agent serving its control socket, on a machine paired with `acme`
 /// with `transcribe` approved, unless it was set up unpaired.
 struct Setup {
     _dir: TempDir,
@@ -110,7 +110,7 @@ impl Setup {
         options: AgentOptions,
     ) -> Self {
         let machine = open_machine(root);
-        let service = FakeService::start("klisi").await;
+        let service = FakeService::start("acme").await;
         let bundle = bundle("transcribe", "1.0.0", "print('hi')");
         let paired = if paired {
             let paired = pair(&machine, &service).await;
@@ -238,7 +238,7 @@ async fn the_status_over_the_socket_is_the_agents() {
     };
     assert_eq!(
         (&service.id, service.name.as_str(), service.paired),
-        (&setup.paired().id, "klisi", true)
+        (&setup.paired().id, "acme", true)
     );
     assert_eq!(service.connection, Some(ConnectionReport::Connected));
     assert_eq!(service.approvals, setup.paired().approvals);
@@ -386,7 +386,7 @@ async fn a_status_asked_for_during_a_checkout_waits_for_it_to_end() {
 #[tokio::test]
 async fn the_status_is_the_same_whether_or_not_an_agent_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("acme").await;
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
     let bundle = bundle("transcribe", "1.0.0", "print('hi')");
@@ -520,7 +520,7 @@ async fn approving_over_the_socket_reaches_the_service_and_the_agent() {
     let mut conn = setup.connect(&[&v1, &v2]).await;
     let mut client = setup.client().await;
 
-    let listing = client.bundles("klisi").await.unwrap();
+    let listing = client.bundles("acme").await.unwrap();
     assert_eq!(listing.service.id, setup.paired().id);
     let listed = |b: &Bundle, approved| ListedBundle {
         hash: b.hash(),
@@ -532,29 +532,29 @@ async fn approving_over_the_socket_reaches_the_service_and_the_agent() {
     };
     assert_eq!(listing.bundles, [listed(&v1, true), listed(&v2, false)]);
 
-    let review = client.review("klisi", v2.hash()).await.unwrap();
+    let review = client.review("acme", v2.hash()).await.unwrap();
     assert_eq!(review.bundle, v2);
     assert_eq!(review.previous.as_ref(), Some(&v1));
     assert_eq!(review.service.id, setup.paired().id);
     assert!(!review.approved);
 
-    client.approve("klisi", v2.hash()).await.unwrap();
+    client.approve("acme", v2.hash()).await.unwrap();
     assert_eq!(conn.recv().await, approved(&[v1.hash(), v2.hash()]));
     assert_eq!(setup.runs.prepared().await, v2.hash());
     assert_eq!(setup.agent.snapshot().pending_reviews().count(), 0);
-    assert!(client.review("klisi", v2.hash()).await.unwrap().approved);
+    assert!(client.review("acme", v2.hash()).await.unwrap().approved);
 
     // The agent approves only what hashes to the hash it was given,
     // whatever the service sends for it.
     let v3 = bundle("transcribe", "3.0.0", "print('three')");
     let claimed = bundle("transcribe", "3.0.0", "print('something else')").hash();
     setup.service.serve_bundle(claimed, v3.to_response());
-    let error = client.approve("klisi", claimed).await.unwrap_err();
+    let error = client.approve("acme", claimed).await.unwrap_err();
     assert!(
         matches!(&error, ClientError::Agent(e) if e.contains(&claimed.to_string())),
         "{error}"
     );
-    let error = client.review("klisi", claimed).await.unwrap_err();
+    let error = client.review("acme", claimed).await.unwrap_err();
     assert!(matches!(error, ClientError::Agent(_)), "{error}");
     let status = client.status().await.unwrap();
     assert_eq!(status.services[0].approvals.len(), 2);
@@ -636,12 +636,12 @@ async fn pairing_over_the_socket_sends_the_code_then_the_service() {
     assert_eq!(code.base_url.as_str(), service.base_url);
     assert_eq!(
         (code.service_name.as_str(), code.machine_name.as_str()),
-        ("klisi", "Ada's test box")
+        ("acme", "Ada's test box")
     );
     assert!(code.expires_at > SystemTime::now());
 
     let paired = within("the pairing", pairing.confirmed()).await.unwrap();
-    assert_eq!(paired.name, "klisi");
+    assert_eq!(paired.name, "acme");
     assert_eq!(service.pair_requests()[0].name, "Ada's test box");
     let conn = service.accept().await;
     assert_eq!(conn.token, "moil_token_1");
@@ -658,7 +658,7 @@ async fn pairing_over_the_socket_sends_the_code_then_the_service() {
     let error = setup
         .client()
         .await
-        .pair("ftp://klisi.example.com", None)
+        .pair("ftp://acme.example.com", None)
         .await
         .unwrap_err();
     assert!(matches!(error, ClientError::Agent(_)), "{error}");

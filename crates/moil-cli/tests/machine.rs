@@ -91,7 +91,7 @@ struct Nothing {}
 fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
     for with in [With::Home, With::Agent] {
         let home = Home::new();
-        let service = FakeService::start("klisi");
+        let service = FakeService::start("acme");
         let transcribe = bundle("transcribe", "1.0.0", "print('hi')");
         service.host(&transcribe);
         let (hash, text_hash) = (transcribe.hash(), transcribe.hash().to_string());
@@ -111,7 +111,7 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
         // The agent connects to the service at once.
         let channel = (with == With::Agent).then(|| service.accept());
 
-        let listed: Vec<ListedBundle> = home.run(&["review", "klisi", "--json"]).success().json();
+        let listed: Vec<ListedBundle> = home.run(&["review", "acme", "--json"]).success().json();
         assert_eq!(listed.len(), 1, "{with:?}");
         assert_eq!((listed[0].hash, listed[0].approved), (hash, false));
         let review: BundleReview = home
@@ -129,13 +129,13 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
 
         // As text, the bundle in full before the result.
         let approved = home
-            .run(&["approve", "klisi", &text_hash, "--yes"])
+            .run(&["approve", "acme", &text_hash, "--yes"])
             .success();
         let shown = approved.stdout();
         assert!(shown.contains("==> job.py <==\n"), "{shown}");
         assert!(shown.ends_with(&format!("Approved: {hash}\n")), "{shown}");
         let again = home
-            .run(&["approve", "klisi", &text_hash, "--yes", "--json"])
+            .run(&["approve", "acme", &text_hash, "--yes", "--json"])
             .success();
         assert_eq!(again.json::<Approved>(), Approved { approved: hash });
         assert_label_rule(&shown, &again.stdout());
@@ -161,7 +161,7 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
             }
         }
 
-        let revoked = home.run(&["revoke", "klisi", &text_hash]).success();
+        let revoked = home.run(&["revoke", "acme", &text_hash]).success();
         assert_eq!(revoked.stdout(), format!("Revoked: {hash}\n"));
         if let Some(channel) = &channel {
             channel.received(
@@ -169,20 +169,20 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
                 |m| matches!(m, MachineMessage::Approved { hashes } if hashes.is_empty()),
             );
         }
-        home.run(&["approve", "klisi", &text_hash, "--yes", "--json"])
+        home.run(&["approve", "acme", &text_hash, "--yes", "--json"])
             .success();
         let json = home
-            .run(&["revoke", "klisi", &text_hash, "--json"])
+            .run(&["revoke", "acme", &text_hash, "--json"])
             .success();
         assert_eq!(json.json::<Revoked>(), Revoked { revoked: hash });
         assert_label_rule(&revoked.stdout(), &json.stdout());
         let run = home
-            .run(&["revoke", "klisi", &text_hash, "--json"])
+            .run(&["revoke", "acme", &text_hash, "--json"])
             .failure(1);
         assert!(run.stderr().contains("isn't approved"), "{}", run.stderr());
         assert_eq!(run.stdout(), "");
 
-        let unpaired = home.run(&["unpair", "klisi", "--json"]).success();
+        let unpaired = home.run(&["unpair", "acme", "--json"]).success();
         assert_eq!(unpaired.json::<Unpaired>(), Unpaired { unpaired: id });
         assert_eq!(service.forgotten().len(), 1, "{with:?}");
         let services: Vec<ServiceReport> = home.run(&["services", "--json"]).success().json();
@@ -195,7 +195,7 @@ fn pairing_reviewing_approving_and_unpairing_work_with_or_without_an_agent() {
 #[test]
 fn pairing_again_without_an_agent_has_the_old_token_forgotten_before_it_ends() {
     let home = Home::new();
-    let service = FakeService::start("klisi");
+    let service = FakeService::start("acme");
     let args = [service.base_url.as_str(), "--no-browser", "--json"];
     let mut pairing = Pairing::start(&home, &args);
     parse::<Code>(&pairing.next_line());
@@ -330,7 +330,7 @@ fn what_needs_an_agent_works_with_one() {
 #[test]
 fn stop_stops_the_running_job() {
     let home = Home::with_uv();
-    let service = FakeService::start("klisi");
+    let service = FakeService::start("acme");
     let sleeper = bundle("sleeper", "1.0.0", "import time\ntime.sleep(600)");
     service.host(&sleeper);
     let id = home.pair(&service, &service.base_url);
@@ -380,10 +380,10 @@ fn cloned_folder(home: &Home, service: &FakeService, bundle: &moil_bundle::Bundl
         "version": bundle.manifest().version,
         "approved_at": "2026-09-27T22:20:11Z",
     });
-    home.service_folder("klisi", &service.base_url, "klisi", json!([approval]));
+    home.service_folder("acme", &service.base_url, "acme", json!([approval]));
     let dir = home
         .path()
-        .join("services/klisi/bundles")
+        .join("services/acme/bundles")
         .join(&bundle.manifest().name)
         .join(bundle.hash().to_string());
     std::fs::create_dir_all(&dir).unwrap();
@@ -391,7 +391,7 @@ fn cloned_folder(home: &Home, service: &FakeService, bundle: &moil_bundle::Bundl
         std::fs::write(dir.join(name), text).unwrap();
     }
     home.hook(
-        "klisi",
+        "acme",
         &bundle.manifest().name,
         "#!/bin/sh\ncat >/dev/null\n",
     );
@@ -401,14 +401,14 @@ fn cloned_folder(home: &Home, service: &FakeService, bundle: &moil_bundle::Bundl
 fn pairing_with_a_folder_from_git_keeps_its_approvals_and_hooks() {
     for with in [With::Home, With::Agent] {
         let home = Home::new();
-        let service = FakeService::start("klisi");
+        let service = FakeService::start("acme");
         let transcribe = bundle("transcribe", "1.0.0", "print('hi')");
         service.host(&transcribe);
         cloned_folder(&home, &service, &transcribe);
         let _agent = with.start(&home);
 
         // Named as the home knows it, not by its URL.
-        assert_eq!(home.pair(&service, "klisi"), "klisi", "{with:?}");
+        assert_eq!(home.pair(&service, "acme"), "acme", "{with:?}");
         let services: Vec<ServiceReport> = home.run(&["services", "--json"]).success().json();
         assert_eq!(services.len(), 1, "the folder is adopted: {services:?}");
         assert!(services[0].paired);
@@ -442,22 +442,22 @@ fn changes_also_work_while_the_agent_runs() {
     let hash = "0".repeat(64);
     let approval = json!({"hash": hash, "name": "transcribe", "version": "1.0.0",
         "approved_at": "2026-09-21T14:13:20Z"});
-    let base_url = "https://klisi.example.com/moil";
-    home.service_folder("klisi.example.com", base_url, "klisi", json!([approval]));
+    let base_url = "https://acme.example.com/moil";
+    home.service_folder("acme.example.com", base_url, "acme", json!([approval]));
     let pairing = json!({"base_url": base_url, "machine_id": "m_1",
         "paired_at": "2026-09-21T14:13:20Z"});
-    let folder = home.path().join("services/klisi.example.com");
+    let folder = home.path().join("services/acme.example.com");
     std::fs::write(folder.join("pairing.json"), pairing.to_string()).unwrap();
     let mut agent = home.agent();
-    agent.logged("moil has no token for klisi");
+    agent.logged("moil has no token for acme");
 
     let listed = home.run(&["services"]).success().stdout();
-    assert!(listed.contains("klisi.example.com"), "{listed}");
+    assert!(listed.contains("acme.example.com"), "{listed}");
     assert_eq!(home.run(&["pause"]).success().stdout(), "Paused: true\n");
     let status: Status = home.run(&["status", "--json"]).success().json();
     assert!(status.paused && status.agent.is_some());
     // An approval that doesn't count is the owner's to remove too.
-    let revoked = home.run(&["revoke", "klisi", &hash]).success();
+    let revoked = home.run(&["revoke", "acme", &hash]).success();
     assert_eq!(revoked.stdout(), format!("Revoked: {hash}\n"));
     let file = std::fs::read_to_string(folder.join("service.json")).unwrap();
     assert!(!file.contains(&hash), "{file}");
@@ -482,7 +482,7 @@ fn a_change_made_as_an_agent_starts_works_either_way() {
 #[test]
 fn approve_asks_only_at_a_terminal() {
     let home = Home::new();
-    let service = FakeService::start("klisi");
+    let service = FakeService::start("acme");
     let transcribe = bundle("transcribe", "1.0.0", "print('hi')");
     service.host(&transcribe);
     home.pair(&service, &service.base_url);
@@ -490,7 +490,7 @@ fn approve_asks_only_at_a_terminal() {
 
     // Stdin stays open, and isn't a terminal: moil doesn't wait on it.
     let mut approving = home
-        .moil(&["approve", "klisi", &hash])
+        .moil(&["approve", "acme", &hash])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -505,7 +505,7 @@ fn approve_asks_only_at_a_terminal() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert_eq!(status.code(), Some(1), "{stdout}{stderr}");
-    let way = format!("moil approve klisi {hash} --yes");
+    let way = format!("moil approve acme {hash} --yes");
     assert!(stderr.contains(&way), "{stderr}");
     assert!(
         stdout.contains("==> job.py <=="),
@@ -514,7 +514,7 @@ fn approve_asks_only_at_a_terminal() {
 
     // A wrong command line, whose error names what's missing.
     let stderr = home
-        .run(&["approve", "klisi", &hash, "--json"])
+        .run(&["approve", "acme", &hash, "--json"])
         .failure(2)
         .stderr();
     let (error, _usage) = stderr.split_once("Usage:").unwrap();
@@ -564,10 +564,10 @@ fn a_cleanup_that_fails_is_a_warning_as_in_the_app() {
 #[test]
 fn hooks_are_listed_from_the_home_alone() {
     let home = Home::new();
-    let base_url = "https://klisi.example.com/moil";
-    home.service_folder("klisi", base_url, "klisi", json!([]));
-    home.hook("klisi", "transcribe", "#!/bin/sh\nexit 0\n");
-    home.hook("klisi", "summarize", "echo nothing says what runs this\n");
+    let base_url = "https://acme.example.com/moil";
+    home.service_folder("acme", base_url, "acme", json!([]));
+    home.hook("acme", "transcribe", "#!/bin/sh\nexit 0\n");
+    home.hook("acme", "summarize", "echo nothing says what runs this\n");
 
     let hooks: Vec<HookListing> = home.run(&["hooks", "--json"]).success().json();
     let summary: Vec<(&str, &str, bool)> = hooks
@@ -576,17 +576,17 @@ fn hooks_are_listed_from_the_home_alone() {
         .collect();
     assert_eq!(
         summary,
-        [("klisi", "summarize", false), ("klisi", "transcribe", true)]
+        [("acme", "summarize", false), ("acme", "transcribe", true)]
     );
     let services = home.path().join("services");
     let hook = &hooks[1].hook;
-    assert_eq!(hook.path, services.join("klisi/hooks/transcribe"));
-    assert_eq!(hook.log, services.join("klisi/logs/transcribe.log"));
+    assert_eq!(hook.path, services.join("acme/hooks/transcribe"));
+    assert_eq!(hook.log, services.join("acme/logs/transcribe.log"));
 
     let text = home.run(&["hooks"]).success().stdout();
-    assert!(text.contains("Hook: klisi transcribe\n"), "{text}");
+    assert!(text.contains("Hook: acme transcribe\n"), "{text}");
     assert!(
-        text.contains("Problem: services/klisi/hooks/summarize: moil can't run this hook"),
+        text.contains("Problem: services/acme/hooks/summarize: moil can't run this hook"),
         "{text}"
     );
 }
@@ -615,15 +615,10 @@ fn a_home_whose_path_isnt_utf8_is_shown_nearly() {
 #[test]
 fn problem_paths_are_shown_with_hidden_characters_revealed() {
     let home = Home::new();
-    home.service_folder(
-        "klisi",
-        "https://klisi.example.com/moil",
-        "klisi",
-        json!([]),
-    );
+    home.service_folder("acme", "https://acme.example.com/moil", "acme", json!([]));
     let sneaky = "fine\u{1b}[2K\rProblem: none\u{202e}";
     std::fs::write(home.path().join("services").join(sneaky), "").unwrap();
-    home.hook("klisi", sneaky, "#!/bin/sh\n");
+    home.hook("acme", sneaky, "#!/bin/sh\n");
 
     let shown = |dir: &str| format!("Problem: {dir}/fine␛[2K␍Problem: none\\u{{202e}}: ");
     let status = home.run(&["status"]).success().stdout();
@@ -632,8 +627,8 @@ fn problem_paths_are_shown_with_hidden_characters_revealed() {
         assert!(!text.contains(['\u{1b}', '\r', '\u{202e}']), "{text:?}");
     }
     assert!(status.contains(&shown("services")), "{status}");
-    assert!(status.contains(&shown("services/klisi/hooks")), "{status}");
-    assert!(hooks.contains(&shown("services/klisi/hooks")), "{hooks}");
+    assert!(status.contains(&shown("services/acme/hooks")), "{status}");
+    assert!(hooks.contains(&shown("services/acme/hooks")), "{hooks}");
 }
 
 #[test]
@@ -678,13 +673,13 @@ fn logs_prints_the_last_lines_and_follows_across_rotation() {
     following.wait().unwrap();
 
     // A hook's log.
-    let base_url = "https://klisi.example.com/moil";
-    home.service_folder("klisi", base_url, "klisi", json!([]));
-    let hook_log = home.path().join("services/klisi/logs/transcribe.log");
+    let base_url = "https://acme.example.com/moil";
+    home.service_folder("acme", base_url, "acme", json!([]));
+    let hook_log = home.path().join("services/acme/logs/transcribe.log");
     std::fs::create_dir_all(hook_log.parent().unwrap()).unwrap();
     let written = "== 2026-09-27T22:41:08Z j1 attempt 1\nkept\n== exited 0 after 1s\n";
     std::fs::write(&hook_log, written).unwrap();
-    let printed = home.run(&["logs", "klisi", "transcribe"]).success();
+    let printed = home.run(&["logs", "acme", "transcribe"]).success();
     assert_eq!(printed.stdout(), written);
     home.run(&["logs", "nobody", "transcribe"]).failure(1);
 }
@@ -697,13 +692,8 @@ fn logs_reads_only_a_regular_file() {
     use std::io::Read;
 
     let home = Home::new();
-    home.service_folder(
-        "klisi",
-        "https://klisi.example.com/moil",
-        "klisi",
-        json!([]),
-    );
-    let logs = home.path().join("services/klisi/logs");
+    home.service_folder("acme", "https://acme.example.com/moil", "acme", json!([]));
+    let logs = home.path().join("services/acme/logs");
     std::fs::create_dir_all(&logs).unwrap();
     std::os::unix::fs::symlink("/dev/zero", logs.join("transcribe.log")).unwrap();
     let fifo = logs.join("summarize.log");
@@ -715,7 +705,7 @@ fn logs_reads_only_a_regular_file() {
         ("summarize", "it isn't a regular file"),
     ] {
         for follow in [false, true] {
-            let mut args = vec!["logs", "klisi", bundle];
+            let mut args = vec!["logs", "acme", bundle];
             args.extend(follow.then_some("-f"));
             let mut logging = home
                 .moil(&args)
@@ -738,9 +728,9 @@ fn a_wrong_command_line_exits_with_2() {
     let home = Home::new();
     for args in [
         &["review"][..],
-        &["logs", "klisi"],
-        &["logs", "klisi", "Not A Bundle"],
-        &["approve", "klisi", "not-a-hash"],
+        &["logs", "acme"],
+        &["logs", "acme", "Not A Bundle"],
+        &["approve", "acme", "not-a-hash"],
         &["login-item", "maybe"],
         &["status", "--no-such-option"],
     ] {

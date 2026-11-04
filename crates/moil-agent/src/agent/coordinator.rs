@@ -1456,7 +1456,7 @@ mod tests {
         .unwrap();
         let base_url = Url::parse(base_url).unwrap();
         let (paired, _) = machine
-            .record_pairing(&base_url, "klisi".into(), "m_1".into(), "moil_token")
+            .record_pairing(&base_url, "acme".into(), "m_1".into(), "moil_token")
             .unwrap();
         let bundle = Bundle::new(
             "# /// script\n# requires-python = \">=3.12\"\n# dependencies = []\n# ///\n",
@@ -1497,7 +1497,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             machine_id: "m_1".into(),
             service: ServiceInfo {
-                name: "klisi".into(),
+                name: "acme".into(),
             },
             bundles: vec![],
             resume: vec![],
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_remote_services_jobs_cant_use_http_to_this_machine() {
-        let job = job_from("https://klisi.example.com/moil").await;
+        let job = job_from("https://acme.example.com/moil").await;
         assert!(allows(&job, "https://s3.example.com/meeting.ogg"));
         for refused in [
             "http://127.0.0.1:6379/",

@@ -345,15 +345,15 @@ mod tests {
                         \"description\": \"Harmless.\u{200b}\"}";
         let bundle = Bundle::new(script, lockfile, manifest).unwrap();
         let pairing = Pairing {
-            base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            base_url: "https://acme.example.com/moil".parse().unwrap(),
             machine_id: "m_1".into(),
             paired_at: SystemTime::now(),
         };
         Review {
             service: Service {
-                id: ServiceId::new("klisi.example.com").unwrap(),
+                id: ServiceId::new("acme.example.com").unwrap(),
                 base_url: pairing.base_url.clone(),
-                name: format!("klisi{clear}\u{2066}"),
+                name: format!("acme{clear}\u{2066}"),
                 approvals: vec![],
                 pairing: Some(pairing),
             },
@@ -371,7 +371,7 @@ mod tests {
         let hidden: Vec<char> = shown.chars().filter(|&c| is_hidden(c)).collect();
         assert!(hidden.is_empty(), "{hidden:?} in\n{shown}");
         for revealed in [
-            "Service: klisi␛[2J␛[H\\u{2066} (https://klisi.example.com/moil)",
+            "Service: acme␛[2J␛[H\\u{2066} (https://acme.example.com/moil)",
             "Bundle: echo 1.0\\u{3164}",
             "Description: Harmless.\\u{200b}",
             "import os␛[2J␛[H",

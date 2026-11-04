@@ -85,10 +85,10 @@ fn menu() -> String {
     };
     let now = Instant::now();
     let clock = SystemTime::now();
-    let klisi = ServiceStatus {
-        id: "klisi.example.com".parse().unwrap(),
-        name: "klisi".into(),
-        base_url: "https://klisi.example.com/moil".parse().unwrap(),
+    let acme = ServiceStatus {
+        id: "acme.example.com".parse().unwrap(),
+        name: "acme".into(),
+        base_url: "https://acme.example.com/moil".parse().unwrap(),
         connection: Connection::Connected,
         bundles: vec![info(&v2, true), info(&v3, false)],
         insecure: false,
@@ -104,9 +104,9 @@ fn menu() -> String {
         bundles: Vec::new(),
         insecure: false,
     };
-    let root = Path::new("/Users/ada/.moil/services/klisi.example.com");
+    let root = Path::new("/Users/ada/.moil/services/acme.example.com");
     let hook = |bundle: &str, runnable| HookListing {
-        service: klisi.id.clone(),
+        service: acme.id.clone(),
         hook: HookReport {
             bundle: bundle.into(),
             path: root.join("hooks").join(bundle),
@@ -117,13 +117,13 @@ fn menu() -> String {
     let mut home = HomeState::default();
     home.hooks = vec![hook("summarize", false), hook("transcribe", true)];
     home.problems = vec![Problem {
-        path: "services/klisi.example.com/hooks/summarize".into(),
+        path: "services/acme.example.com/hooks/summarize".into(),
         message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
     }];
     let snapshot = Snapshot {
         paused: false,
         job: Some(JobStatus {
-            service: klisi.id.clone(),
+            service: acme.id.clone(),
             job_id: JobId::new("j_4100").unwrap(),
             attempt: 1,
             title: Some("Weekly sync".into()),
@@ -135,7 +135,7 @@ fn menu() -> String {
             stopping: false,
         }),
         last_job: Some(JobReport {
-            service: klisi.id.clone(),
+            service: acme.id.clone(),
             job_id: JobId::new("j_4099").unwrap(),
             attempt: 1,
             title: Some("Design review".into()),
@@ -146,7 +146,7 @@ fn menu() -> String {
             },
             ended_at: clock - Duration::from_secs(300),
         }),
-        services: vec![klisi.clone(), lab],
+        services: vec![acme.clone(), lab],
         home: Arc::new(home),
     };
     let view = TrayView::new(
@@ -245,14 +245,14 @@ const MENU_STYLE: &str = "
     }
 ";
 
-fn klisi(approved: &[&Bundle]) -> Service {
+fn acme(approved: &[&Bundle]) -> Service {
     let now = SystemTime::now();
     Service {
-        id: "klisi.example.com".parse().unwrap(),
-        base_url: "https://klisi.example.com/moil".parse().unwrap(),
-        name: "klisi".into(),
+        id: "acme.example.com".parse().unwrap(),
+        base_url: "https://acme.example.com/moil".parse().unwrap(),
+        name: "acme".into(),
         pairing: Some(Pairing {
-            base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            base_url: "https://acme.example.com/moil".parse().unwrap(),
             machine_id: "m_7Hq2Xk9Lw3".into(),
             paired_at: now - Duration::from_secs(64 * 86400),
         }),
@@ -311,7 +311,7 @@ fn gallery() {
         "review-update",
         review_page(
             Review {
-                service: klisi(&[&v2]),
+                service: acme(&[&v2]),
                 bundle: v3.clone(),
                 previous: Some(v2.clone()),
                 approved: false,
@@ -323,7 +323,7 @@ fn gallery() {
         "review-first",
         review_page(
             Review {
-                service: klisi(&[]),
+                service: acme(&[]),
                 bundle: v2.clone(),
                 previous: None,
                 approved: false,
@@ -335,7 +335,7 @@ fn gallery() {
         "review-approved",
         review_page(
             Review {
-                service: klisi(&[&v2]),
+                service: acme(&[&v2]),
                 bundle: v2.clone(),
                 previous: None,
                 approved: true,
@@ -347,18 +347,18 @@ fn gallery() {
         "review-error",
         review_page(
             Review {
-                service: klisi(&[&v2]),
+                service: acme(&[&v2]),
                 bundle: v3.clone(),
                 previous: Some(v2.clone()),
                 approved: false,
             },
             |window| {
                 window.on_message(ReviewMessage::Approve { hash: v3.hash() });
-                window.finished(Err("Couldn't reach klisi: the connection timed out.".into()));
+                window.finished(Err("Couldn't reach acme: the connection timed out.".into()));
             },
         ),
     );
-    let mut service = klisi(&[]);
+    let mut service = acme(&[]);
     service.base_url = "http://lab.local:8080/moil".parse().unwrap();
     write(
         "review-hostile",
@@ -372,38 +372,38 @@ fn gallery() {
             |_| {},
         ),
     );
-    let loading = ReviewWindow::new("klisi.example.com".parse().unwrap(), "klisi", v3.hash());
+    let loading = ReviewWindow::new("acme.example.com".parse().unwrap(), "acme", v3.hash());
     write("review-loading", loading.render(SystemTime::now()));
-    let mut failed = ReviewWindow::new("klisi.example.com".parse().unwrap(), "klisi", v3.hash());
+    let mut failed = ReviewWindow::new("acme.example.com".parse().unwrap(), "acme", v3.hash());
     failed.loaded(Err(format!("the service has no bundle {}", v3.hash())));
     write("review-failed", failed.render(SystemTime::now()));
 
     let now = Instant::now();
     let code = PairingCode {
         user_code: "WDJB-MJHT".into(),
-        verification_uri: "https://klisi.example.com/machines/pair".into(),
-        verification_uri_complete: "https://klisi.example.com/machines/pair?code=WDJB-MJHT".into(),
-        service_name: "klisi".into(),
+        verification_uri: "https://acme.example.com/machines/pair".into(),
+        verification_uri_complete: "https://acme.example.com/machines/pair?code=WDJB-MJHT".into(),
+        service_name: "acme".into(),
         expires_at: now + Duration::from_secs(600),
     };
     write("pair-enter", PairWindow::new(None).render(now));
-    let link = "https://klisi.example.com/moil".parse().unwrap();
+    let link = "https://acme.example.com/moil".parse().unwrap();
     write("pair-link", PairWindow::from_link(&link).render(now));
     let mut bad = PairWindow::new(None);
     bad.on_message(PairMessage::Start {
-        url: "ftp://klisi.example.com".into(),
+        url: "ftp://acme.example.com".into(),
     });
     write("pair-bad-address", bad.render(now));
     let mut flow = PairWindow::new(None);
     flow.on_message(PairMessage::Start {
-        url: "klisi.example.com/moil".into(),
+        url: "acme.example.com/moil".into(),
     });
     write("pair-starting", flow.render(now));
     flow.started(1, Ok(code));
     write("pair-confirming", flow.render(now));
     let mut failed = PairWindow::new(None);
     failed.on_message(PairMessage::Start {
-        url: "klisi.example.com/moil".into(),
+        url: "acme.example.com/moil".into(),
     });
     failed.started(
         1,
@@ -411,19 +411,19 @@ fn gallery() {
             user_code: "WDJB-MJHT".into(),
             verification_uri: String::new(),
             verification_uri_complete: String::new(),
-            service_name: "klisi".into(),
+            service_name: "acme".into(),
             expires_at: now,
         }),
     );
     failed.finished(1, Err("the pairing was rejected on the service".into()));
     write("pair-failed", failed.render(now));
-    flow.finished(1, Ok("klisi".into()));
+    flow.finished(1, Ok("acme".into()));
     write("pair-paired", flow.render(now));
 
     let status = ServiceStatus {
-        id: "klisi.example.com".parse().unwrap(),
-        name: "klisi".into(),
-        base_url: "https://klisi.example.com/moil".parse().unwrap(),
+        id: "acme.example.com".parse().unwrap(),
+        name: "acme".into(),
+        base_url: "https://acme.example.com/moil".parse().unwrap(),
         connection: Connection::Connected,
         bundles: vec![BundleStatus {
             info: BundleInfo {

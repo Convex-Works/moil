@@ -1009,9 +1009,9 @@ mod tests {
         let mut context = HookContext {
             v: HOOK_CONTRACT_VERSION,
             service: ServiceRef {
-                id: crate::ServiceId::new("klisi.example.com").unwrap(),
-                name: "klisi".into(),
-                base_url: "https://klisi.example.com/moil".parse().unwrap(),
+                id: crate::ServiceId::new("acme.example.com").unwrap(),
+                name: "acme".into(),
+                base_url: "https://acme.example.com/moil".parse().unwrap(),
             },
             bundle: BundleRef {
                 name: "transcribe".into(),

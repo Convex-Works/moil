@@ -33,7 +33,7 @@ struct Setup {
 
 impl Setup {
     async fn new() -> Self {
-        Self::build(&["klisi"], fast(), |_, _| {}).await
+        Self::build(&["acme"], fast(), |_, _| {}).await
     }
 
     async fn build(
@@ -113,7 +113,7 @@ fn welcome(resume: Vec<moil_proto::Resume>) -> ServiceMessage {
         protocol: 1,
         machine_id: "m_1".into(),
         service: ServiceInfo {
-            name: "klisi".into(),
+            name: "acme".into(),
         },
         bundles: vec![],
         resume,
@@ -187,7 +187,7 @@ fn failure(message: MachineMessage) -> (u64, moil_proto::JobError) {
 
 #[tokio::test]
 async fn hello_describes_the_machine_and_what_it_approved_for_that_service() {
-    let setup = Setup::build(&["klisi", "notes"], fast(), |machine, services| {
+    let setup = Setup::build(&["acme", "notes"], fast(), |machine, services| {
         machine
             .update_settings(|s| {
                 s.machine_name = Some("Ada's test box".into());
@@ -222,7 +222,7 @@ async fn hello_describes_the_machine_and_what_it_approved_for_that_service() {
 #[tokio::test]
 async fn a_service_is_told_of_its_1024_most_recent_approvals_at_most() {
     let mut approved = Vec::new();
-    let setup = Setup::build(&["klisi"], fast(), |machine, services| {
+    let setup = Setup::build(&["acme"], fast(), |machine, services| {
         // Approved one after another, after the setup's own: each with its
         // files in the service's folder, or it wouldn't count.
         let id = &services[0].1.id;
@@ -352,7 +352,7 @@ async fn jobs_run_the_verified_copy_and_only_while_the_files_match_it() {
 
 #[tokio::test]
 async fn an_approval_whose_files_changed_takes_no_jobs_until_approved_again() {
-    let mut setup = Setup::build(&["klisi"], fast(), |machine, services| {
+    let mut setup = Setup::build(&["acme"], fast(), |machine, services| {
         let dir = machine.home().approved_bundle_dir(
             &services[0].1.id,
             "transcribe",
@@ -387,7 +387,7 @@ async fn an_approval_whose_files_changed_takes_no_jobs_until_approved_again() {
 
 #[tokio::test]
 async fn a_keychain_that_keeps_moil_waiting_doesnt_hold_up_the_agent() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("acme").await;
     let dir = tempfile::tempdir().unwrap();
     let keychain = Arc::new(SlowSecrets::new(Home::new(dir.path()).secrets_file()));
     let machine = Machine::open(MachineConfig {
@@ -789,13 +789,13 @@ async fn a_stopping_job_shows_as_stopping_until_it_ends() {
 
 #[tokio::test]
 async fn one_attempt_runs_at_a_time_across_services() {
-    let mut setup = Setup::build(&["klisi", "notes"], fast(), |_, _| {}).await;
-    let mut klisi = connect(&setup.services[0].0, &setup.bundle).await;
+    let mut setup = Setup::build(&["acme", "notes"], fast(), |_, _| {}).await;
+    let mut acme = connect(&setup.services[0].0, &setup.bundle).await;
     let mut notes = connect(&setup.services[1].0, &setup.bundle).await;
     let hash = setup.hash();
 
-    klisi.send(assign("k1", 1, hash, 30_000));
-    assert_eq!(klisi.recv().await, state(MachineState::Busy));
+    acme.send(assign("k1", 1, hash, 30_000));
+    assert_eq!(acme.recv().await, state(MachineState::Busy));
     assert_eq!(
         notes.recv().await,
         state(MachineState::Busy),
@@ -810,8 +810,8 @@ async fn one_attempt_runs_at_a_time_across_services() {
     assert_eq!(error.code, ErrorCode::Busy);
 
     run.finish(succeeded());
-    assert_eq!(klisi.recv().await, done("k1", 1, 1, succeeded()));
-    assert_eq!(klisi.recv().await, state(MachineState::Idle));
+    assert_eq!(acme.recv().await, done("k1", 1, 1, succeeded()));
+    assert_eq!(acme.recv().await, state(MachineState::Idle));
     assert_eq!(notes.recv().await, state(MachineState::Idle));
     notes.send(offer("n2", hash));
     assert_eq!(notes.recv().await, bid("n2"));
@@ -913,7 +913,7 @@ async fn an_offline_attempt_keeps_its_newest_events_and_always_its_done() {
         max_kept_bytes: 2_000,
         ..fast()
     };
-    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut setup = Setup::build(&["acme"], options, |_, _| {}).await;
     let mut conn = setup.connect().await;
     conn.send(assign("j1", 1, setup.hash(), 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
@@ -963,7 +963,7 @@ async fn a_chatty_attempt_is_relayed_as_briskly_as_a_quiet_one() {
         channel_timeout: Duration::from_secs(60),
         ..fast()
     };
-    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut setup = Setup::build(&["acme"], options, |_, _| {}).await;
     let mut conn = setup.connect().await;
     conn.send(assign("j1", 1, setup.hash(), 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
@@ -1028,7 +1028,7 @@ async fn a_replaced_connection_stops_reconnecting() {
 
 #[tokio::test]
 async fn a_401_when_connecting_means_the_machine_was_removed() {
-    let setup = Setup::build(&["klisi"], fast(), |_, _| {}).await;
+    let setup = Setup::build(&["acme"], fast(), |_, _| {}).await;
     setup.service().remove_machine("moil_token_1");
     snapshot_where(&setup.agent, "the service to be marked unpaired", |s| {
         s.services[0].connection == Connection::Unpaired
@@ -1072,7 +1072,7 @@ async fn a_silent_service_is_given_up_on_but_pings_keep_it_alive() {
         channel_timeout: Duration::from_millis(300),
         ..fast()
     };
-    let setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let setup = Setup::build(&["acme"], options, |_, _| {}).await;
     let conn = setup.connect().await;
     setup.wait_until_connected().await;
 
@@ -1115,7 +1115,7 @@ async fn a_service_that_stops_reading_is_given_up_on_even_while_it_pings() {
         channel_timeout: Duration::from_millis(500),
         ..fast()
     };
-    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut setup = Setup::build(&["acme"], options, |_, _| {}).await;
     let mut conn = setup.connect().await;
     conn.send(assign("j1", 1, setup.hash(), 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
@@ -1163,7 +1163,7 @@ async fn a_slow_service_gets_every_message_in_order_once_it_reads_again() {
         max_kept_bytes: 64 << 20,
         ..fast()
     };
-    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut setup = Setup::build(&["acme"], options, |_, _| {}).await;
     let mut conn = setup.connect().await;
     conn.send(assign("j1", 1, setup.hash(), 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
@@ -1189,12 +1189,12 @@ async fn a_slow_service_gets_every_message_in_order_once_it_reads_again() {
 
 #[tokio::test]
 async fn pausing_is_told_to_every_service_and_remembered() {
-    let setup = Setup::build(&["klisi", "notes"], fast(), |_, _| {}).await;
-    let mut klisi = connect(&setup.services[0].0, &setup.bundle).await;
+    let setup = Setup::build(&["acme", "notes"], fast(), |_, _| {}).await;
+    let mut acme = connect(&setup.services[0].0, &setup.bundle).await;
     let mut notes = connect(&setup.services[1].0, &setup.bundle).await;
 
     setup.agent.set_paused(true).await.unwrap();
-    assert_eq!(klisi.recv().await, state(MachineState::Paused));
+    assert_eq!(acme.recv().await, state(MachineState::Paused));
     assert_eq!(notes.recv().await, state(MachineState::Paused));
     assert!(setup.agent.snapshot().paused);
     let saved = || -> Option<Settings> {
@@ -1202,11 +1202,11 @@ async fn pausing_is_told_to_every_service_and_remembered() {
         serde_json::from_str(&text).ok()
     };
     assert!(saved().is_some_and(|s| s.paused), "saved once it answers");
-    klisi.send(offer("j1", setup.hash()));
-    assert_eq!(klisi.recv().await, decline("j1", DeclineReason::Paused));
+    acme.send(offer("j1", setup.hash()));
+    assert_eq!(acme.recv().await, decline("j1", DeclineReason::Paused));
 
     setup.agent.set_paused(false).await.unwrap();
-    assert_eq!(klisi.recv().await, state(MachineState::Idle));
+    assert_eq!(acme.recv().await, state(MachineState::Idle));
     assert_eq!(notes.recv().await, state(MachineState::Idle));
     assert!(saved().is_some_and(|s| !s.paused));
     assert!(!setup.agent.machine().settings().paused);
@@ -1281,16 +1281,16 @@ async fn approvals_through_the_agent_reach_the_service() {
 
 #[tokio::test]
 async fn revoking_a_bundle_stops_its_running_attempt() {
-    let mut setup = Setup::build(&["klisi", "notes"], fast(), |_, _| {}).await;
-    let mut klisi = connect(&setup.services[0].0, &setup.bundle).await;
+    let mut setup = Setup::build(&["acme", "notes"], fast(), |_, _| {}).await;
+    let mut acme = connect(&setup.services[0].0, &setup.bundle).await;
     let mut notes = connect(&setup.services[1].0, &setup.bundle).await;
-    let (klisi_id, notes_id) = (
+    let (acme_id, notes_id) = (
         setup.services[0].1.id.clone(),
         setup.services[1].1.id.clone(),
     );
     let hash = setup.hash();
-    klisi.send(assign("j1", 1, hash, 30_000));
-    assert_eq!(klisi.recv().await, state(MachineState::Busy));
+    acme.send(assign("j1", 1, hash, 30_000));
+    assert_eq!(acme.recv().await, state(MachineState::Busy));
     assert_eq!(notes.recv().await, state(MachineState::Busy));
     let mut run = setup.runs.next().await;
 
@@ -1298,27 +1298,27 @@ async fn revoking_a_bundle_stops_its_running_attempt() {
     // leaves the attempt alone: approvals are per bundle and per service.
     let v2 = bundle("transcribe", "2.0.0", "print('two')");
     setup.services[0].0.host(&v2);
-    let review = setup.agent.review(&klisi_id, v2.hash()).await.unwrap();
+    let review = setup.agent.review(&acme_id, v2.hash()).await.unwrap();
     setup.agent.approve(&review).await.unwrap();
     let approved = |hashes: &[moil_proto::BundleHash]| MachineMessage::Approved {
         hashes: hashes.to_vec(),
     };
-    assert_eq!(klisi.recv().await, approved(&[hash, v2.hash()]));
+    assert_eq!(acme.recv().await, approved(&[hash, v2.hash()]));
     setup.agent.revoke(&notes_id, hash).await.unwrap();
     assert_eq!(notes.recv().await, approved(&[]));
     run.emit(log("still running"));
-    assert_eq!(klisi.recv().await, event("j1", 1, 1, log("still running")));
+    assert_eq!(acme.recv().await, event("j1", 1, 1, log("still running")));
 
-    setup.agent.revoke(&klisi_id, hash).await.unwrap();
+    setup.agent.revoke(&acme_id, hash).await.unwrap();
     assert_eq!(run.stopped().await, StopReason::Interrupted);
-    assert_eq!(klisi.recv().await, approved(&[v2.hash()]));
-    let (seq, error) = failure(klisi.recv().await);
+    assert_eq!(acme.recv().await, approved(&[v2.hash()]));
+    let (seq, error) = failure(acme.recv().await);
     assert_eq!(
         (seq, error.code, error.retryable),
         (2, ErrorCode::Interrupted, true),
         "another machine may take the job"
     );
-    assert_eq!(klisi.recv().await, state(MachineState::Idle));
+    assert_eq!(acme.recv().await, state(MachineState::Idle));
     assert_eq!(last_outcome(&setup.agent).await, JobOutcome::Interrupted);
 }
 
@@ -1345,7 +1345,7 @@ async fn pairing_through_the_agent_connects_to_the_new_service() {
     let agent = Agent::start_with(open_machine(dir.path()), executor, fast());
     assert_eq!(agent.snapshot().services, []);
 
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("acme").await;
     service.script_pairing([TokenReply::Grant]);
     let session = agent.pair(&service.base_url).await.unwrap();
     let paired = within("pairing", session.wait()).await.unwrap();
@@ -1432,7 +1432,7 @@ async fn unpairing_through_the_agent_disconnects_and_keeps_the_folder() {
 async fn pairing_through_the_agent_takes_the_jobs_a_cloned_folder_approves() {
     // Another machine's folder for the service, as git would bring it:
     // service.json and the approved bundle's files, without a pairing.
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("acme").await;
     let bundle = bundle("transcribe", "1.0.0", "print('hi')");
     service.host(&bundle);
     let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1481,8 +1481,8 @@ async fn pairing_through_the_agent_takes_the_jobs_a_cloned_folder_approves() {
 /// (spec/machine.md §1.2).
 #[tokio::test]
 async fn a_service_whose_folder_names_another_url_isnt_connected() {
-    let moved_to = FakeService::start("klisi").await;
-    let setup = Setup::build(&["klisi", "notes"], fast(), |machine, services| {
+    let moved_to = FakeService::start("acme").await;
+    let setup = Setup::build(&["acme", "notes"], fast(), |machine, services| {
         let path = machine.home().service_file(&services[0].1.id);
         let text = std::fs::read_to_string(&path).unwrap();
         let text = text.replace(&services[0].0.base_url, &moved_to.base_url);
@@ -1537,7 +1537,7 @@ async fn shutting_down_gives_a_silent_service_only_so_long() {
         shutdown_grace: Duration::from_millis(200),
         ..fast()
     };
-    let mut setup = Setup::build(&["klisi"], options, |_, _| {}).await;
+    let mut setup = Setup::build(&["acme"], options, |_, _| {}).await;
     let mut conn = setup.connect().await;
     conn.send(assign("j1", 1, setup.hash(), 30_000));
     assert_eq!(conn.recv().await, state(MachineState::Busy));
@@ -1556,7 +1556,7 @@ async fn the_snapshot_follows_the_connection() {
     let setup = Setup::new().await;
     let status = &setup.agent.snapshot().services[0];
     assert_eq!(status.connection, Connection::Connecting);
-    assert_eq!((status.name.as_str(), status.insecure), ("klisi", true));
+    assert_eq!((status.name.as_str(), status.insecure), ("acme", true));
 
     let mut conn = setup.service().accept().await;
     conn.hello().await;
@@ -1568,7 +1568,7 @@ async fn the_snapshot_follows_the_connection() {
         protocol: 1,
         machine_id: "m_1".into(),
         service: ServiceInfo {
-            name: "klisi".into(),
+            name: "acme".into(),
         },
         bundles: vec![info(&setup.bundle)],
         resume: vec![],
@@ -1649,7 +1649,7 @@ impl moil_runtime::Executor for Panicking {
 
 #[tokio::test]
 async fn a_crashing_runtime_fails_the_attempt_instead_of_hanging() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("acme").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;

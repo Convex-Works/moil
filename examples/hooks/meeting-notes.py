@@ -3,13 +3,14 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""Meeting notes from a klisi transcript, written into an Obsidian vault.
+"""Meeting notes from a transcript, written into an Obsidian vault.
 
-A moil hook (spec/machine.md §2): moil runs it after a klisi `transcribe`
-job succeeds on this machine. Install it as that bundle's hook:
+A moil hook (spec/machine.md §2): moil runs it after a job succeeds on this
+machine. It works with any bundle that outputs transcript.txt. Install it as
+that bundle's hook, here a service's `transcribe`:
 
-    cp meeting-notes.py ~/.moil/services/<klisi's ID>/hooks/transcribe.py
-    chmod +x ~/.moil/services/<klisi's ID>/hooks/transcribe.py
+    cp meeting-notes.py ~/.moil/services/<service>/hooks/transcribe.py
+    chmod +x ~/.moil/services/<service>/hooks/transcribe.py
 
 then set the four values below. It asks Codex for the notes with a
 read-only sandbox, and writes the note itself, so Codex never writes into

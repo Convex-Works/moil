@@ -302,7 +302,7 @@ func TestLeasesAndTimeLimitsReachTheMachine(t *testing.T) {
 }
 
 func TestConfigIsChecked(t *testing.T) {
-	valid := moil.Config{Name: "klisi", VerificationURL: "https://klisi.example.com/pair", Store: moil.NewMemoryStore()}
+	valid := moil.Config{Name: "acme", VerificationURL: "https://acme.example.com/pair", Store: moil.NewMemoryStore()}
 	for _, c := range []struct {
 		name string
 		edit func(*moil.Config)
@@ -310,8 +310,8 @@ func TestConfigIsChecked(t *testing.T) {
 	}{
 		{"no name", func(c *moil.Config) { c.Name = "" }, "Name"},
 		{"relative verification URL", func(c *moil.Config) { c.VerificationURL = "/pair" }, "VerificationURL"},
-		{"verification URL off the web", func(c *moil.Config) { c.VerificationURL = "ftp://klisi.example.com/pair" }, "VerificationURL"},
-		{"verification URL with a user name", func(c *moil.Config) { c.VerificationURL = "https://klisi.example.com@evil.example/pair" }, "VerificationURL"},
+		{"verification URL off the web", func(c *moil.Config) { c.VerificationURL = "ftp://acme.example.com/pair" }, "VerificationURL"},
+		{"verification URL with a user name", func(c *moil.Config) { c.VerificationURL = "https://acme.example.com@evil.example/pair" }, "VerificationURL"},
 		{"no store", func(c *moil.Config) { c.Store = nil }, "Store"},
 		{"negative duration", func(c *moil.Config) { c.BidWindow = -time.Second }, "negative"},
 		{"pings too rare for machines", func(c *moil.Config) { c.PingInterval = 21 * time.Second }, "PingInterval"},
