@@ -241,11 +241,17 @@ class Matching(unittest.TestCase):
         self.assertEqual(below.meta["speaker_map"], [])
 
     def test_seconds_threshold(self):
-        at_least = run([(0, 0, 10)], timeline(Ada=[[0, 2]]))
+        at_least = run([(0, 0, 4)], timeline(Ada=[[0, 2]]))
         self.assertEqual(at_least.meta["speaker_map"], [{"id": "S1", "name": "Ada"}])
-        below = run([(0, 0, 10)], timeline(Ada=[[0, 1.9]]))
+        below = run([(0, 0, 4)], timeline(Ada=[[0, 1.9]]))
         self.assertEqual(below.meta["speaker_map"], [])
         self.assertEqual(set(below.speakers_in_text()), {"Speaker 1"})
+
+    def test_coverage_threshold(self):
+        at_least = run([(0, 0, 20)], timeline(Ada=[[0, 5]]))
+        self.assertEqual(at_least.meta["speaker_map"], [{"id": "S1", "name": "Ada"}])
+        below = run([(0, 0, 20)], timeline(Ada=[[0, 4.9]]))
+        self.assertEqual(below.meta["speaker_map"], [])
 
     def test_a_dropped_speakers_speech_counts_for_who_the_transcript_gives_it_to(self):
         # With max_speakers 1, Bob's words go to speaker 0, so the transcript
@@ -255,8 +261,14 @@ class Matching(unittest.TestCase):
         self.assertEqual(result.meta["speakers"], 1)
         self.assertEqual(result.meta["speaker_map"], [])
 
-    def test_speech_outside_the_timeline_doesnt_count_against_a_name(self):
-        result = run([(0, 0, 60)], timeline(Ada=[[0, 3]]))
+    def test_a_voice_the_timeline_never_saw_keeps_no_name_from_someone_talking_over_it(self):
+        # A shared video talks for a minute; Ada says something over it.
+        result = run([(0, 0, 60)], timeline(Ada=[[10, 13]]))
+        self.assertEqual(result.meta["speaker_map"], [])
+        self.assertEqual(set(result.speakers_in_text()), {"Speaker 1"})
+
+    def test_extreme_times_clamp_to_the_recording(self):
+        result = run([(0, 0, 10)], timeline(Ada=[[0, 10], [1.7e308, 1.7e308], [-1.7e308, -1.7e308]]))
         self.assertEqual(result.meta["speaker_map"], [{"id": "S1", "name": "Ada"}])
 
     def test_silence_in_a_span_doesnt_count(self):
