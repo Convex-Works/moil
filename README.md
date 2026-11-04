@@ -3,7 +3,7 @@
 Lend your machine to the services you use, one approved job at a time.
 
 moil is a small protocol, a server SDK and a tray app. A web service (e.g.
-[klisi], a self-hosted video meeting app) posts a job, such as "transcribe
+[tide], a self-hosted video meeting app) posts a job, such as "transcribe
 this meeting with speaker labels". One of the machines its users have
 paired picks up the job, runs a script the machine's owner has read and
 approved, and streams progress and results back.
@@ -40,7 +40,7 @@ ports or trusting the service with anything they haven't read.
 
 ```
 ┌────────────────────┐        WebSocket        ┌──────────────────────┐
-│  Service (klisi)   │◀── opened by machine ───│   moil app (Rust)    │
+│  Service (tide)    │◀── opened by machine ───│   moil app (Rust)    │
 │  + Go SDK          │                         │   tray, agent        │
 └────────────────────┘                         └──────────┬───────────┘
          │                                                │ stdin / stdout
@@ -132,7 +132,7 @@ your editor or an LLM can read, and which you can keep in git
 ```
 ~/.moil/
   settings.json
-  services/klisi.example.com/
+  services/tide.example.com/
     service.json                 the service, and the bundles you approved for it
     bundles/transcribe/<hash>/   each approved bundle's files, read-only, checked before every run
     hooks/transcribe.py          yours: runs after each transcribe job that succeeds here
@@ -144,7 +144,7 @@ succeeds on your machine, moil runs your executable
 `services/<service>/hooks/<bundle>`, such as `hooks/transcribe.py`, with
 the job's context on stdin and its outputs in a folder. The service never
 learns a hook exists. The [example hook](examples/hooks/meeting-notes.py)
-turns a klisi transcript into meeting notes in an Obsidian vault; `moil
+turns a tide transcript into meeting notes in an Obsidian vault; `moil
 hooks --help` has the whole contract.
 
 **The command line does everything the app does**, while the app runs
@@ -176,7 +176,7 @@ bundle author's job.
 ## Add moil to a service
 
 ```go
-srv, _ := moil.NewServer(moil.Config{Name: "klisi", VerificationURL: "https://klisi.example.com/machines/pair", Store: store})
+srv, _ := moil.NewServer(moil.Config{Name: "tide", VerificationURL: "https://tide.example.com/machines/pair", Store: store})
 mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
 
 bundle, _ := moil.LoadBundle(os.DirFS("bundles/transcribe"))
@@ -253,7 +253,7 @@ the end-to-end suite.
 - Jobs that survive a service restart; server SDKs in other languages.
 - Bundles in languages other than Python.
 
-[klisi]: ../klisi
+[tide]: https://github.com/Convex-Works/tide
 
 ## License
 

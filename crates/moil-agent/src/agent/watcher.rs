@@ -421,7 +421,7 @@ mod tests {
     fn the_fingerprint_follows_what_moil_reads_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::new(dir.path());
-        let service = home.services_dir().join("klisi.example.com");
+        let service = home.services_dir().join("tide.example.com");
         write(&service.join("service.json"), "{}");
         let before = fingerprint(&home);
         assert_eq!(fingerprint(&home), before, "it's stable");
@@ -460,7 +460,7 @@ mod tests {
     fn the_fingerprint_doesnt_look_into_linked_folders() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::new(dir.path().join("home"));
-        let service = home.services_dir().join("klisi.example.com");
+        let service = home.services_dir().join("tide.example.com");
         write(&service.join("service.json"), "{}");
         let elsewhere = dir.path().join("elsewhere");
         write(&elsewhere.join("deep/file"), "one");

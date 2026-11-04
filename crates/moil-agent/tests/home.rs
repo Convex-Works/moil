@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use support::*;
 use tempfile::TempDir;
 
-/// A machine paired with `klisi` with `transcribe` approved, running an
+/// A machine paired with `tide` with `transcribe` approved, running an
 /// agent with a fake executor, and a place for hooks to report to.
 struct Setup {
     dir: TempDir,
@@ -35,7 +35,7 @@ impl Setup {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let machine = open_machine(dir.path());
-        let service = FakeService::start("klisi").await;
+        let service = FakeService::start("tide").await;
         let paired = pair(&machine, &service).await;
         let bundle = bundle("transcribe", "1.0.0", "print('hi')");
         service.host(&bundle);
@@ -251,7 +251,7 @@ echo "transcribed $(wc -c < "$out/transcript.txt" | tr -d ' ') bytes"
             "v": 1,
             "service": {
                 "id": setup.paired.id,
-                "name": "klisi",
+                "name": "tide",
                 "base_url": setup.service.base_url,
             },
             "bundle": {
@@ -554,7 +554,7 @@ fn point_files_at(home: &Home, id: &ServiceId, url: &str) {
 async fn files_pulled_from_git_never_send_the_token_elsewhere() {
     let setup = Setup::new().await;
     let mut conn = setup.connect().await;
-    let elsewhere = FakeService::start("klisi").await;
+    let elsewhere = FakeService::start("tide").await;
     let id = setup.paired.id.clone();
 
     point_files_at(&setup.home(), &id, &elsewhere.base_url);
@@ -585,7 +585,7 @@ async fn files_pulled_from_git_while_moil_was_off_never_send_the_token_elsewhere
     let _conn = setup.connect().await;
     within("the agent to shut down", setup.agent.shutdown()).await;
     drop(setup.agent);
-    let elsewhere = FakeService::start("klisi").await;
+    let elsewhere = FakeService::start("tide").await;
     let id = setup.paired.id.clone();
     point_files_at(&Home::new(setup.dir.path()), &id, &elsewhere.base_url);
 

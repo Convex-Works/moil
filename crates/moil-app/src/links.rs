@@ -113,12 +113,12 @@ mod tests {
     #[test]
     fn pair_links_name_the_service() {
         assert_eq!(
-            pair_url("moil://pair?url=https%3A%2F%2Fklisi.example.com%2Fmoil"),
-            "https://klisi.example.com/moil"
+            pair_url("moil://pair?url=https%3A%2F%2Ftide.example.com%2Fmoil"),
+            "https://tide.example.com/moil"
         );
         assert_eq!(
-            pair_url("moil://pair/?url=https://klisi.example.com/moil&utm_source=mail"),
-            "https://klisi.example.com/moil"
+            pair_url("moil://pair/?url=https://tide.example.com/moil&utm_source=mail"),
+            "https://tide.example.com/moil"
         );
         assert_eq!(
             pair_url("moil:pair?url=http://localhost:8787/moil"),
@@ -129,14 +129,14 @@ mod tests {
     #[test]
     fn malformed_links_are_refused() {
         for link in [
-            "https://pair?url=https://klisi.example.com",
+            "https://pair?url=https://tide.example.com",
             "moil://pair",
             "moil://pair?url=",
             "moil://pair?url=https://a.example&url=https://b.example",
             "moil://pair?url=file:///etc/passwd",
             "moil://pair?url=javascript:alert(1)",
-            "moil://pair?url=https://user:pw@klisi.example.com",
-            "moil://pair/extra?url=https://klisi.example.com",
+            "moil://pair?url=https://user:pw@tide.example.com",
+            "moil://pair/extra?url=https://tide.example.com",
             "moil://approve?hash=a00a65c1",
             "not a url",
         ] {

@@ -1,7 +1,7 @@
 # transcribe
 
 Meeting transcription with speaker labels, run on the machine of someone who
-lent it: who said what, and when. This is the bundle klisi sends when a
+lent it: who said what, and when. This is the bundle tide sends when a
 meeting's recording is ready, and the example to copy for a real, model-heavy
 moil job.
 
@@ -162,7 +162,7 @@ use a line such as:
 > OpenMDW-1.1 (https://openmdw.ai/license/1-1/).
 
 If you change the weights, say so. A service built on this bundle, such as
-klisi, does well to show that credit too, for example on an about page.
+tide, does well to show that credit too, for example on an about page.
 
 This is a summary, not legal advice. The license texts are what count.
 

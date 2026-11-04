@@ -91,7 +91,7 @@ func TestPairingConfirmedEndToEnd(t *testing.T) {
 	base := moiltest.Serve(t, srv)
 
 	status, info := request(t, http.MethodGet, base+"/v1/info", "", nil)
-	if status != http.StatusOK || info["protocol"] != 1.0 || info["name"] != "klisi" {
+	if status != http.StatusOK || info["protocol"] != 1.0 || info["name"] != "tide" {
 		t.Fatalf("GET /v1/info: %d %v", status, info)
 	}
 
@@ -108,9 +108,9 @@ func TestPairingConfirmedEndToEnd(t *testing.T) {
 	if len(deviceCode) < 40 {
 		t.Errorf("device code %q is too short to resist guessing", deviceCode)
 	}
-	if resp["verification_uri"] != "https://klisi.example.com/machines/pair" ||
-		resp["verification_uri_complete"] != "https://klisi.example.com/machines/pair?code="+userCode ||
-		resp["expires_in"] != 600.0 || resp["interval"] != 1.0 || resp["service"].(map[string]any)["name"] != "klisi" {
+	if resp["verification_uri"] != "https://tide.example.com/machines/pair" ||
+		resp["verification_uri_complete"] != "https://tide.example.com/machines/pair?code="+userCode ||
+		resp["expires_in"] != 600.0 || resp["interval"] != 1.0 || resp["service"].(map[string]any)["name"] != "tide" {
 		t.Errorf("pair response %v", resp)
 	}
 
@@ -362,10 +362,10 @@ func TestMoiltestPairsThroughTheServicePage(t *testing.T) {
 func TestMoiltestRefusesAConfirmationPageElsewhere(t *testing.T) {
 	mux := http.NewServeMux()
 	site := httptestServer(t, mux)
-	srv := newServer(t) // its page is on https://klisi.example.com
+	srv := newServer(t) // its page is on https://tide.example.com
 	mux.Handle("/moil/", http.StripPrefix("/moil", srv.Handler()))
 
-	want := `moiltest: machines refuse to pair: the confirmation page "https://klisi.example.com/machines/pair" is on https://klisi.example.com:443, not on ` +
+	want := `moiltest: machines refuse to pair: the confirmation page "https://tide.example.com/machines/pair" is on https://tide.example.com:443, not on ` +
 		site + `, the origin of the base URL (spec §4)`
 	tb := &failureRecorder{TB: t}
 	for name, pair := range map[string]func(){

@@ -76,7 +76,7 @@ fn a_home_is_open_in_one_process_at_a_time() {
 
 #[tokio::test]
 async fn a_machine_can_be_read_while_another_process_has_it_open() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -88,14 +88,14 @@ async fn a_machine_can_be_read_while_another_process_has_it_open() {
         Err(Error::AlreadyRunning(_))
     ));
     let reader = Machine::open_read_only(config(dir.path())).unwrap();
-    assert_eq!(reader.find_service("klisi").unwrap(), paired);
+    assert_eq!(reader.find_service("tide").unwrap(), paired);
     assert_eq!(reader.bundles(&paired.id).await.unwrap(), [info(&bundle)]);
     let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
     assert_eq!((&review.bundle, review.approved), (&bundle, false));
 
     // It sees what the process that has the machine open changes.
     machine.approve(&review).unwrap();
-    let known = reader.find_service("klisi").unwrap();
+    let known = reader.find_service("tide").unwrap();
     assert!(known.is_approved(&bundle.hash()));
     let review = reader.review(&paired.id, bundle.hash()).await.unwrap();
     assert!(review.approved);
@@ -130,8 +130,8 @@ fn opening_creates_the_home() {
 fn the_home_explains_itself_and_keeps_this_machines_files_out_of_git() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let klisi = root.join("services/klisi.example.com");
-    std::fs::create_dir_all(&klisi).unwrap();
+    let tide = root.join("services/tide.example.com");
+    std::fs::create_dir_all(&tide).unwrap();
     drop(open_machine(root));
     assert_eq!(
         std::fs::read_to_string(root.join("README.md")).unwrap(),
@@ -142,7 +142,7 @@ fn the_home_explains_itself_and_keeps_this_machines_files_out_of_git() {
         GITIGNORE
     );
     assert_eq!(
-        std::fs::read_to_string(klisi.join(".gitignore")).unwrap(),
+        std::fs::read_to_string(tide.join(".gitignore")).unwrap(),
         SERVICE_GITIGNORE
     );
 
@@ -150,7 +150,7 @@ fn the_home_explains_itself_and_keeps_this_machines_files_out_of_git() {
     // owner's once written.
     std::fs::write(root.join("README.md"), "an older moil's words\n").unwrap();
     std::fs::write(root.join(".gitignore"), "/.machine/\n").unwrap();
-    std::fs::remove_file(klisi.join(".gitignore")).unwrap();
+    std::fs::remove_file(tide.join(".gitignore")).unwrap();
     drop(open_machine(root));
     assert_eq!(
         std::fs::read_to_string(root.join("README.md")).unwrap(),
@@ -161,7 +161,7 @@ fn the_home_explains_itself_and_keeps_this_machines_files_out_of_git() {
         "/.machine/\n"
     );
     assert_eq!(
-        std::fs::read_to_string(klisi.join(".gitignore")).unwrap(),
+        std::fs::read_to_string(tide.join(".gitignore")).unwrap(),
         SERVICE_GITIGNORE
     );
 }
@@ -181,8 +181,8 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
     }
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let klisi = root.join("services/klisi.example.com");
-    std::fs::create_dir_all(&klisi).unwrap();
+    let tide = root.join("services/tide.example.com");
+    std::fs::create_dir_all(&tide).unwrap();
     drop(open_machine(root));
     let ignored = |repository: &Path, path: &str| {
         let git = |args: &[&str]| {
@@ -205,20 +205,20 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
         (".machine/secrets.json", true),
         ("settings.json", true),
         ("logs/moil.log", true),
-        ("services/klisi.example.com/pairing.json", true),
-        ("services/klisi.example.com/logs/transcribe.log", true),
+        ("services/tide.example.com/pairing.json", true),
+        ("services/tide.example.com/logs/transcribe.log", true),
         ("README.md", false),
         (".gitignore", false),
-        ("services/klisi.example.com/service.json", false),
+        ("services/tide.example.com/service.json", false),
         (
-            "services/klisi.example.com/bundles/transcribe/abc/job.py",
+            "services/tide.example.com/bundles/transcribe/abc/job.py",
             false,
         ),
-        ("services/klisi.example.com/hooks/transcribe", false),
+        ("services/tide.example.com/hooks/transcribe", false),
         // A bundle's name may be one of those the file names.
-        ("services/klisi.example.com/bundles/logs/abc/job.py", false),
-        ("services/klisi.example.com/hooks/logs", false),
-        ("services/klisi.example.com/logs/logs.log", true),
+        ("services/tide.example.com/bundles/logs/abc/job.py", false),
+        ("services/tide.example.com/hooks/logs", false),
+        ("services/tide.example.com/logs/logs.log", true),
     ] {
         assert_eq!(
             ignored(root, path),
@@ -236,7 +236,7 @@ fn git_keeps_out_what_belongs_to_this_machine_alone() {
         ("hooks/logs", false),
     ] {
         assert_eq!(
-            ignored(&klisi, path),
+            ignored(&tide, path),
             expected,
             "{path} in the service's repository"
         );
@@ -365,7 +365,7 @@ fn info_describes_this_machine() {
 
 #[tokio::test]
 async fn pairing_stores_the_service_and_its_token() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     machine
@@ -378,7 +378,7 @@ async fn pairing_stores_the_service_and_its_token() {
         .await
         .unwrap();
     assert_eq!(session.user_code, "WDJB-MJHT");
-    assert_eq!(session.service_name, "klisi");
+    assert_eq!(session.service_name, "tide");
     assert_eq!(
         session.verification_uri_complete,
         format!("{}/pair?code=WDJB-MJHT", service.base_url)
@@ -406,7 +406,7 @@ async fn pairing_stores_the_service_and_its_token() {
         service.base_url,
         "the trailing slash is dropped"
     );
-    assert_eq!(paired.name, "klisi");
+    assert_eq!(paired.name, "tide");
     let pairing = paired.pairing.as_ref().expect("paired");
     assert_eq!(pairing.machine_id, "m_1");
     assert_eq!(pairing.base_url, paired.base_url);
@@ -425,7 +425,7 @@ async fn pairing_stores_the_service_and_its_token() {
     };
     assert_eq!(
         read("service.json"),
-        serde_json::json!({"base_url": service.base_url, "name": "klisi", "approvals": []})
+        serde_json::json!({"base_url": service.base_url, "name": "tide", "approvals": []})
     );
     let pairing_file = read("pairing.json");
     assert_eq!(pairing_file["base_url"], service.base_url.as_str());
@@ -460,7 +460,7 @@ async fn pairing_stores_the_service_and_its_token() {
 
 #[tokio::test]
 async fn a_service_learns_the_machines_name_cut_to_64_characters() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let name = format!("Ada's {}", "very ".repeat(20));
@@ -473,7 +473,7 @@ async fn a_service_learns_the_machines_name_cut_to_64_characters() {
 
 #[tokio::test]
 async fn a_rejected_pairing_stores_nothing() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
 
@@ -487,7 +487,7 @@ async fn a_rejected_pairing_stores_nothing() {
 
 #[tokio::test]
 async fn an_expired_code_ends_the_pairing() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
 
@@ -509,7 +509,7 @@ async fn an_expired_code_ends_the_pairing() {
 
 #[tokio::test]
 async fn slow_down_lengthens_every_later_interval() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
 
@@ -538,7 +538,7 @@ async fn slow_down_lengthens_every_later_interval() {
 
 #[tokio::test]
 async fn a_struggling_service_doesnt_end_the_pairing() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
 
@@ -549,12 +549,12 @@ async fn a_struggling_service_doesnt_end_the_pairing() {
     ]);
     let session = machine.pair(&service.base_url).await.unwrap();
     let paired = within("pairing", session.wait()).await.unwrap();
-    assert_eq!(paired.name, "klisi");
+    assert_eq!(paired.name, "tide");
 }
 
 #[tokio::test]
 async fn pairing_only_starts_with_a_moil_service() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
 
@@ -578,12 +578,7 @@ async fn pairing_only_starts_with_a_moil_service() {
 async fn a_service_is_paired_only_under_a_name_that_hides_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
-    for name in [
-        "klisi\x1b[2J\x1b[Hyour-bank",
-        "klisi\r",
-        "",
-        &"x".repeat(65),
-    ] {
+    for name in ["tide\x1b[2J\x1b[Hyour-bank", "tide\r", "", &"x".repeat(65)] {
         let service = FakeService::start(name).await;
         match machine.pair(&service.base_url).await {
             Err(Error::NotAService { reason, .. }) => {
@@ -597,7 +592,7 @@ async fn a_service_is_paired_only_under_a_name_that_hides_nothing() {
 
     // What isn't a control character is shown revealed instead (spec
     // §5.5).
-    for name in ["é".repeat(64), "klisi\u{202e}".to_owned()] {
+    for name in ["é".repeat(64), "tide\u{202e}".to_owned()] {
         let service = FakeService::start(&name).await;
         assert_eq!(pair(&machine, &service).await.name, name);
     }
@@ -608,21 +603,21 @@ async fn a_service_is_paired_only_under_a_name_that_hides_nothing() {
 /// the relay's machine with their account there (spec §4).
 #[tokio::test]
 async fn pairing_is_confirmed_only_on_the_services_own_origin() {
-    let klisi = FakeService::start("klisi").await;
-    let relay = FakeService::start("klisi").await;
+    let tide = FakeService::start("tide").await;
+    let relay = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
 
-    let theirs = format!("{}/pair", klisi.base_url);
+    let theirs = format!("{}/pair", tide.base_url);
     let own = format!("{}/pair", relay.base_url);
-    let klisi_site = url::Url::parse(&klisi.base_url)
+    let tide_site = url::Url::parse(&tide.base_url)
         .unwrap()
         .origin()
         .ascii_serialization();
     for (page, complete) in [(&theirs, &theirs), (&own, &theirs), (&theirs, &own)] {
         relay.pairing_pages(page, &format!("{complete}?code=WDJB-MJHT"));
         match machine.pair(&relay.base_url).await {
-            Err(Error::ForeignPairingPage { site, .. }) => assert_eq!(site, klisi_site),
+            Err(Error::ForeignPairingPage { site, .. }) => assert_eq!(site, tide_site),
             other => panic!("paired with {page} and {complete}: {other:?}"),
         }
     }
@@ -634,7 +629,7 @@ async fn pairing_is_confirmed_only_on_the_services_own_origin() {
 /// owner is sent to the page as moil parsed it to check its origin.
 #[tokio::test]
 async fn the_confirmation_page_checked_is_the_one_opened() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let origin = service.base_url.trim_end_matches("/moil");
@@ -673,7 +668,7 @@ async fn plain_http_is_refused_except_to_loopback_or_when_allowed() {
 
 #[tokio::test]
 async fn pairing_again_replaces_the_token_and_keeps_the_approvals() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let first = pair(&machine, &service).await;
@@ -702,8 +697,8 @@ async fn pairing_again_replaces_the_token_and_keeps_the_approvals() {
 
 #[tokio::test]
 async fn services_are_found_by_id_host_url_or_name() {
-    let one = FakeService::start("klisi").await;
-    let two = FakeService::start("klisi").await;
+    let one = FakeService::start("tide").await;
+    let two = FakeService::start("tide").await;
     let other = FakeService::start("notes").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
@@ -719,7 +714,7 @@ async fn services_are_found_by_id_host_url_or_name() {
     assert_eq!(found(&host_port).unwrap(), one.0.id);
     assert_eq!(found("NOTES").unwrap(), other.id);
 
-    match found("klisi") {
+    match found("tide") {
         Err(Error::AmbiguousService { matches, .. }) => {
             assert!(matches.contains(one.0.id.as_str()), "{matches}")
         }
@@ -734,7 +729,7 @@ async fn services_are_found_by_id_host_url_or_name() {
 
 #[tokio::test]
 async fn what_moil_cant_make_sense_of_under_services_is_reported_and_ignored() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -742,8 +737,8 @@ async fn what_moil_cant_make_sense_of_under_services_is_reported_and_ignored() {
 
     // A folder name that isn't an ID could have moil write outside its
     // home, or confuse two services on a file system that ignores case.
-    std::fs::create_dir(services.join("Klisi.Example.com")).unwrap();
-    std::fs::write(services.join("klisi.json"), "{}").unwrap();
+    std::fs::create_dir(services.join("Tide.Example.com")).unwrap();
+    std::fs::write(services.join("tide.json"), "{}").unwrap();
     std::fs::create_dir(services.join("notes.example.com")).unwrap();
     std::fs::create_dir(services.join(".git")).unwrap();
 
@@ -751,12 +746,12 @@ async fn what_moil_cant_make_sense_of_under_services_is_reported_and_ignored() {
     let problems = problems(dir.path());
     assert_eq!(problems.len(), 3, "{problems:#?}");
     assert!(
-        problem_at(&problems, "services/Klisi.Example.com")
+        problem_at(&problems, "services/Tide.Example.com")
             .message
             .contains("isn't one"),
         "{problems:#?}"
     );
-    problem_at(&problems, "services/klisi.json");
+    problem_at(&problems, "services/tide.json");
     assert!(
         problem_at(&problems, "services/notes.example.com")
             .message
@@ -767,7 +762,7 @@ async fn what_moil_cant_make_sense_of_under_services_is_reported_and_ignored() {
 
 #[tokio::test]
 async fn review_shows_the_verified_bundle() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -790,7 +785,7 @@ async fn review_shows_the_verified_bundle() {
 
 #[tokio::test]
 async fn a_tampered_bundle_is_rejected() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -817,7 +812,7 @@ async fn a_tampered_bundle_is_rejected() {
 
 #[tokio::test]
 async fn approval_is_for_exactly_the_reviewed_bundle() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -882,7 +877,7 @@ async fn approval_is_for_exactly_the_reviewed_bundle() {
 
 #[tokio::test]
 async fn a_review_is_no_approval_once_the_services_url_changed() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -908,7 +903,7 @@ async fn a_review_is_no_approval_once_the_services_url_changed() {
 
 #[tokio::test]
 async fn review_compares_with_the_last_approved_version() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -961,7 +956,7 @@ async fn review_compares_with_the_last_approved_version() {
 
 #[tokio::test]
 async fn revoking_deletes_the_bundle_and_its_runtime_copy_once_unused() {
-    let one = FakeService::start("klisi").await;
+    let one = FakeService::start("tide").await;
     let two = FakeService::start("notes").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
@@ -1005,7 +1000,7 @@ async fn revoking_deletes_the_bundle_and_its_runtime_copy_once_unused() {
 
 #[tokio::test]
 async fn opening_the_home_prunes_the_runtime_copies_nothing_approves() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -1025,7 +1020,7 @@ async fn opening_the_home_prunes_the_runtime_copies_nothing_approves() {
 
 #[tokio::test]
 async fn unpairing_tells_the_service_and_keeps_the_folder() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -1066,7 +1061,7 @@ async fn unpairing_tells_the_service_and_keeps_the_folder() {
 
 #[tokio::test]
 async fn unpairing_works_even_when_the_service_already_forgot_the_machine() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -1099,7 +1094,7 @@ fn clone_folder(from: &Path, to: &Path) {
 
 #[tokio::test]
 async fn pairing_adopts_a_folder_cloned_from_another_machine() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let laptop = open_machine(first.path());
     let paired = pair(&laptop, &service).await;
@@ -1144,7 +1139,7 @@ async fn pairing_adopts_a_folder_cloned_from_another_machine() {
 
 #[tokio::test]
 async fn a_new_service_gets_an_id_no_folder_uses() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let url = url::Url::parse(&service.base_url).unwrap();
@@ -1165,7 +1160,7 @@ async fn a_new_service_gets_an_id_no_folder_uses() {
 
 #[tokio::test]
 async fn approvals_that_dont_count_are_ignored_and_reported() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -1261,8 +1256,8 @@ async fn approvals_that_dont_count_are_ignored_and_reported() {
 /// (spec/machine.md §1.2).
 #[tokio::test]
 async fn a_pairing_for_another_base_url_doesnt_count() {
-    let old = FakeService::start("klisi").await;
-    let new = FakeService::start("klisi").await;
+    let old = FakeService::start("tide").await;
+    let new = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &old).await;
@@ -1326,13 +1321,13 @@ fn point_files_at(machine: &Machine, service: &Service, url: &str) {
 /// home's files say (spec/machine.md §1.2).
 #[tokio::test]
 async fn files_naming_another_url_never_get_the_token_sent_there() {
-    let klisi = FakeService::start("klisi").await;
-    let elsewhere = FakeService::start("klisi").await;
+    let tide = FakeService::start("tide").await;
+    let elsewhere = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
-    let paired = pair(&machine, &klisi).await;
+    let paired = pair(&machine, &tide).await;
     let bundle = bundle("transcribe", "1.0.0", "print('hi')");
-    klisi.host(&bundle);
+    tide.host(&bundle);
     elsewhere.host(&bundle);
 
     point_files_at(&machine, &paired, &elsewhere.base_url);
@@ -1347,30 +1342,30 @@ async fn files_naming_another_url_never_get_the_token_sent_there() {
 
     // Unpairing tells the service that issued the token, and only it.
     machine.unpair(&paired.id).await.unwrap();
-    assert_eq!(klisi.forgotten(), ["moil_token_1"]);
+    assert_eq!(tide.forgotten(), ["moil_token_1"]);
     assert_eq!(elsewhere.presented(), [] as [String; 0]);
     assert!(tokens(dir.path()).is_empty());
 }
 
 #[tokio::test]
 async fn pairing_again_tells_only_the_service_that_issued_the_old_token() {
-    let klisi = FakeService::start("klisi").await;
-    let elsewhere = FakeService::start("klisi").await;
+    let tide = FakeService::start("tide").await;
+    let elsewhere = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
-    pair(&machine, &klisi).await;
+    pair(&machine, &tide).await;
     // So that the token kept, moil_token_2, is one `elsewhere` never issues.
-    let paired = pair(&machine, &klisi).await;
-    until("klisi to forget the first token", || {
-        klisi.forgotten() == ["moil_token_1"]
+    let paired = pair(&machine, &tide).await;
+    until("tide to forget the first token", || {
+        tide.forgotten() == ["moil_token_1"]
     })
     .await;
 
     point_files_at(&machine, &paired, &elsewhere.base_url);
     let adopted = pair(&machine, &elsewhere).await;
     assert_eq!(adopted.id, paired.id);
-    until("klisi to forget the token it issued", || {
-        klisi.forgotten() == ["moil_token_1", "moil_token_2"]
+    until("tide to forget the token it issued", || {
+        tide.forgotten() == ["moil_token_1", "moil_token_2"]
     })
     .await;
     assert!(!elsewhere.presented().contains(&"moil_token_2".to_owned()));
@@ -1403,7 +1398,7 @@ fn mkfifo(path: &Path) {
 /// neither hangs nor reads anything else.
 #[tokio::test]
 async fn links_and_fifos_in_a_service_folder_are_problems_not_hangs() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;
@@ -1467,7 +1462,7 @@ fn a_readme_that_isnt_a_file_is_written_anew_without_hanging() {
 
 #[tokio::test]
 async fn service_and_pairing_files_are_strict() {
-    let service = FakeService::start("klisi").await;
+    let service = FakeService::start("tide").await;
     let dir = tempfile::tempdir().unwrap();
     let machine = open_machine(dir.path());
     let paired = pair(&machine, &service).await;

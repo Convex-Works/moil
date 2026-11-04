@@ -39,7 +39,7 @@ fn uv() -> PathBuf {
 }
 
 fn service() -> ServiceId {
-    ServiceId::new("klisi.example.com").unwrap()
+    ServiceId::new("tide.example.com").unwrap()
 }
 
 /// Short limits, so that tests of them are quick.
@@ -133,8 +133,8 @@ fn closing_lines(log: &str) -> Vec<&str> {
 fn entry(hooks: &Hooks, bundle: &str, job_id: &str) -> PendingHook {
     let service = ServiceRef {
         id: service(),
-        name: "klisi".into(),
-        base_url: "https://klisi.example.com/moil".parse().unwrap(),
+        name: "tide".into(),
+        base_url: "https://tide.example.com/moil".parse().unwrap(),
     };
     let bundle = BundleRef {
         name: bundle.into(),
@@ -271,9 +271,9 @@ exit 3
         json!({
             "v": 1,
             "service": {
-                "id": "klisi.example.com",
-                "name": "klisi",
-                "base_url": "https://klisi.example.com/moil"
+                "id": "tide.example.com",
+                "name": "tide",
+                "base_url": "https://tide.example.com/moil"
             },
             "bundle": {
                 "name": "transcribe",
@@ -656,7 +656,7 @@ async fn hooks_moil_cant_run_are_logged_and_reported() {
     assert_eq!(
         scan.problems[2],
         Problem {
-            path: "services/klisi.example.com/hooks/not-executable".into(),
+            path: "services/tide.example.com/hooks/not-executable".into(),
             message: "moil can't run this hook: it isn't executable. Run chmod +x on it.".into(),
         }
     );
@@ -687,13 +687,13 @@ async fn the_scan_lists_every_hook_by_service_and_bundle() {
     assert_eq!(
         listed,
         [
-            ("klisi.example.com", "broken", false),
-            ("klisi.example.com", "transcribe", true),
             ("localhost-8787", "summarize", true),
+            ("tide.example.com", "broken", false),
+            ("tide.example.com", "transcribe", true),
         ]
     );
     assert_eq!(
-        scan.hooks[2].hook,
+        scan.hooks[0].hook,
         HookReport {
             bundle: "summarize".into(),
             path: elsewhere,
@@ -710,11 +710,11 @@ async fn the_scan_lists_every_hook_by_service_and_bundle() {
         problems,
         [
             (
-                "services/klisi.example.com/hooks/broken",
+                "services/tide.example.com/hooks/broken",
                 "moil can't run this hook: it's a symbolic link to a file that doesn't exist"
             ),
             (
-                "services/klisi.example.com/hooks/transcribe.tar.gz",
+                "services/tide.example.com/hooks/transcribe.tar.gz",
                 "moil never runs this file: a hook is named after its bundle, in lowercase \
                  letters, digits and hyphens, with at most one extension of letters and \
                  digits, such as hooks/transcribe or hooks/transcribe.py"
@@ -798,8 +798,8 @@ async fn a_bundle_with_more_than_one_hook_runs_none() {
     assert_eq!(
         problems,
         [
-            ("services/klisi.example.com/hooks/transcribe", why),
-            ("services/klisi.example.com/hooks/transcribe.py", why),
+            ("services/tide.example.com/hooks/transcribe", why),
+            ("services/tide.example.com/hooks/transcribe.py", why),
         ]
     );
 }
@@ -818,7 +818,7 @@ async fn a_file_with_two_extensions_isnt_a_hook() {
     assert_eq!(scan.hooks, []);
     assert_eq!(
         scan.problems[0].path,
-        Path::new("services/klisi.example.com/hooks/transcribe.tar.gz")
+        Path::new("services/tide.example.com/hooks/transcribe.tar.gz")
     );
 }
 
@@ -840,7 +840,7 @@ fn a_hooks_folder_moil_cant_read_is_a_problem() {
     let [problem] = &scan.problems[..] else {
         panic!("{:?}", scan.problems);
     };
-    assert_eq!(problem.path, Path::new("services/klisi.example.com/hooks"));
+    assert_eq!(problem.path, Path::new("services/tide.example.com/hooks"));
     assert!(
         problem
             .message

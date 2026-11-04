@@ -90,9 +90,9 @@ mod tests {
             Ok(ReviewMessage::Close {})
         );
         assert_eq!(
-            parse::<PairMessage>(r#"{"type":"start","url":"klisi.example.com"}"#),
+            parse::<PairMessage>(r#"{"type":"start","url":"tide.example.com"}"#),
             Ok(PairMessage::Start {
-                url: "klisi.example.com".into()
+                url: "tide.example.com".into()
             })
         );
         assert_eq!(

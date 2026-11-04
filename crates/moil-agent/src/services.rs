@@ -13,7 +13,7 @@ use crate::Error;
 use crate::report::ServiceRef;
 
 /// The home's name for a service, which names its folder: derived from the
-/// service's host and port (`klisi.example.com`, `localhost-8787`) when
+/// service's host and port (`tide.example.com`, `localhost-8787`) when
 /// the machine first pairs with it, unique among the home's services, and
 /// safe as a file name. An ID is 1 to 128
 /// lowercase ASCII letters, digits, dots and hyphens, starting and ending
@@ -39,7 +39,7 @@ impl ServiceId {
     }
 
     /// The ID for a new service at `base_url`, skipping IDs `taken` says are
-    /// in use: `klisi.example.com`, then `klisi.example.com-2`, and so on.
+    /// in use: `tide.example.com`, then `tide.example.com-2`, and so on.
     pub fn derive(base_url: &Url, taken: impl Fn(&str) -> bool) -> Self {
         let host = base_url.host_str().unwrap_or_default();
         let mut stem = match base_url.port() {
@@ -140,7 +140,7 @@ pub fn parse_base_url(input: &str) -> Result<Url, Error> {
     let refuse = |why: String| Err(Error::InvalidAddress(why));
     if input.is_empty() {
         return refuse(
-            "Enter the service's address, such as https://klisi.example.com/moil.".into(),
+            "Enter the service's address, such as https://tide.example.com/moil.".into(),
         );
     }
     let with_scheme;
@@ -204,9 +204,9 @@ const MAX_NAME_CHARS: usize = 64;
 pub struct Service {
     /// The name of the service's folder.
     pub id: ServiceId,
-    /// Where the service's moil endpoints live, e.g. `https://klisi.example.com/moil`.
+    /// Where the service's moil endpoints live, e.g. `https://tide.example.com/moil`.
     pub base_url: Url,
-    /// The name the service gave itself when pairing, e.g. `klisi`.
+    /// The name the service gave itself when pairing, e.g. `tide`.
     pub name: String,
     /// The approvals that count (spec/machine.md §1.2), oldest first.
     /// Those that don't are left out, and reported as problems.
@@ -348,13 +348,10 @@ mod tests {
 
     #[test]
     fn ids_come_from_host_and_port() {
+        assert_eq!(id("https://tide.example.com/moil", &[]), "tide.example.com");
         assert_eq!(
-            id("https://klisi.example.com/moil", &[]),
-            "klisi.example.com"
-        );
-        assert_eq!(
-            id("https://Klisi.Example.com:443/moil", &[]),
-            "klisi.example.com"
+            id("https://Tide.Example.com:443/moil", &[]),
+            "tide.example.com"
         );
         assert_eq!(id("http://localhost:8787/moil", &[]), "localhost-8787");
         assert_eq!(id("http://127.0.0.1:9000", &[]), "127.0.0.1-9000");
@@ -363,10 +360,10 @@ mod tests {
 
     #[test]
     fn ids_are_unique_among_the_machines_services() {
-        let taken = ["klisi.example.com", "klisi.example.com-2"];
+        let taken = ["tide.example.com", "tide.example.com-2"];
         assert_eq!(
-            id("https://klisi.example.com/other", &taken),
-            "klisi.example.com-3"
+            id("https://tide.example.com/other", &taken),
+            "tide.example.com-3"
         );
     }
 
@@ -399,7 +396,7 @@ mod tests {
 
     #[test]
     fn written_ids_must_be_safe_file_names() {
-        for good in ["klisi.example.com", "localhost-8787", "1-9000", "a", "a..b"] {
+        for good in ["tide.example.com", "localhost-8787", "1-9000", "a", "a..b"] {
             assert_eq!(good.parse::<ServiceId>().unwrap().as_str(), good);
         }
         let longest = "x".repeat(ServiceId::MAX_LEN);
@@ -412,10 +409,10 @@ mod tests {
             ".hidden",
             "a/b",
             "a\\b",
-            "Klisi.example.com",
-            "klisi.example.com.",
-            "-klisi",
-            "klisi-",
+            "Tide.example.com",
+            "tide.example.com.",
+            "-tide",
+            "tide-",
             "kl isi",
             "bücher.example",
             &format!("{longest}x"),
@@ -429,12 +426,12 @@ mod tests {
     fn base_urls_come_from_what_the_owner_typed() {
         let url = |s| parse_base_url(s).unwrap().to_string();
         assert_eq!(
-            url("https://klisi.example.com/moil/"),
-            "https://klisi.example.com/moil"
+            url("https://tide.example.com/moil/"),
+            "https://tide.example.com/moil"
         );
         assert_eq!(
-            url("  klisi.example.com/moil \n"),
-            "https://klisi.example.com/moil"
+            url("  tide.example.com/moil \n"),
+            "https://tide.example.com/moil"
         );
         assert_eq!(
             url("http://127.0.0.1:8787/moil"),
@@ -456,8 +453,8 @@ mod tests {
 
     #[test]
     fn ids_are_checked_when_read_back() {
-        let id: ServiceId = serde_json::from_str("\"klisi.example.com\"").unwrap();
-        assert_eq!(serde_json::to_string(&id).unwrap(), "\"klisi.example.com\"");
+        let id: ServiceId = serde_json::from_str("\"tide.example.com\"").unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"tide.example.com\"");
         assert!(serde_json::from_str::<ServiceId>("\"../../etc/passwd\"").is_err());
     }
 }

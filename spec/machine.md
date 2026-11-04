@@ -39,7 +39,7 @@ option names. moil creates it readable only by the owner.
   settings.json                      this machine's preferences (§1.1)
   logs/moil.log                      the agent's log
   services/
-    klisi.convex.works/              one folder per service, named by its ID (§1.2)
+    tide.convex.works/               one folder per service, named by its ID (§1.2)
       service.json                   the service, and the bundles approved for it
       pairing.json                   this machine's pairing with the service
       .gitignore                     written by moil when missing
@@ -98,7 +98,7 @@ guess could take jobs the owner meant to pause.
 
 A service's ID names its folder. moil derives it from the host and port of
 the service's base URL when the machine first pairs with it
-(`klisi.example.com`, `localhost-8787`, then `-2`, `-3` and so on if the
+(`tide.example.com`, `localhost-8787`, then `-2`, `-3` and so on if the
 name is taken). An ID is 1 to 128 lowercase ASCII letters, digits, dots
 and hyphens, starting and ending with a letter or digit.
 
@@ -107,8 +107,8 @@ approved for it:
 
 ```json
 {
-  "base_url": "https://klisi.convex.works/moil",
-  "name": "klisi",
+  "base_url": "https://tide.convex.works/moil",
+  "name": "tide",
   "approvals": [
     {
       "hash": "42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6",
@@ -130,7 +130,7 @@ approved for it:
 
 ```json
 {
-  "base_url": "https://klisi.convex.works/moil",
+  "base_url": "https://tide.convex.works/moil",
   "machine_id": "m_7Hq2Xk9Lw3",
   "paired_at": "2026-09-27T22:10:00Z"
 }
@@ -250,9 +250,9 @@ end-of-file.
 {
   "v": 1,
   "service": {
-    "id": "klisi.convex.works",
-    "name": "klisi",
-    "base_url": "https://klisi.convex.works/moil"
+    "id": "tide.convex.works",
+    "name": "tide",
+    "base_url": "https://tide.convex.works/moil"
   },
   "bundle": {
     "name": "transcribe",
@@ -443,7 +443,7 @@ job runs; `stop --json` then prints `{}`, as `quit --json` does. `login-item` pr
   "agent": {"host": "app", "version": "0.2.0"},
   "paused": false,
   "job": {
-    "service": "klisi.convex.works",
+    "service": "tide.convex.works",
     "job_id": "recording-d07aa27961e839c14bb0a099bd971df0",
     "attempt": 1,
     "title": "Weekly sync",
@@ -455,7 +455,7 @@ job runs; `stop --json` then prints `{}`, as `quit --json` does. `login-item` pr
     "stopping": false
   },
   "last_job": {
-    "service": "klisi.convex.works",
+    "service": "tide.convex.works",
     "job_id": "recording-5b1e0c2f9a7d4e6b8c3a1f0e2d4c6b8a",
     "attempt": 2,
     "bundle": "transcribe",
@@ -466,7 +466,7 @@ job runs; `stop --json` then prints `{}`, as `quit --json` does. `login-item` pr
   "services": [],
   "problems": [
     {
-      "path": "services/klisi.convex.works/hooks/transcribe",
+      "path": "services/tide.convex.works/hooks/transcribe",
       "message": "moil can't run this hook: it isn't executable. Run chmod +x on it."
     }
   ]
@@ -488,9 +488,9 @@ A service, in `status` and as each element of `moil services --json`:
 
 ```json
 {
-  "id": "klisi.convex.works",
-  "name": "klisi",
-  "base_url": "https://klisi.convex.works/moil",
+  "id": "tide.convex.works",
+  "name": "tide",
+  "base_url": "https://tide.convex.works/moil",
   "paired": true,
   "connection": {"state": "offline", "error": "connection refused", "retry_at": "2026-09-27T22:33:10Z"},
   "approvals": [
@@ -502,8 +502,8 @@ A service, in `status` and as each element of `moil services --json`:
   "hooks": [
     {
       "bundle": "transcribe",
-      "path": "/Users/ada/.moil/services/klisi.convex.works/hooks/transcribe.py",
-      "log": "/Users/ada/.moil/services/klisi.convex.works/logs/transcribe.log",
+      "path": "/Users/ada/.moil/services/tide.convex.works/hooks/transcribe.py",
+      "log": "/Users/ada/.moil/services/tide.convex.works/logs/transcribe.log",
       "runnable": true
     }
   ]
@@ -537,7 +537,7 @@ Each element of `moil hooks --json` is a hook, as in `hooks` above, with
 
 ```json
 {
-  "service": {"id": "klisi.convex.works", "name": "klisi", "base_url": "https://klisi.convex.works/moil"},
+  "service": {"id": "tide.convex.works", "name": "tide", "base_url": "https://tide.convex.works/moil"},
   "hash": "9c1d77a0…",
   "approved": false,
   "files": {"job.py": "…", "job.py.lock": "…", "manifest.json": "…"},

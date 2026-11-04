@@ -590,11 +590,11 @@ mod tests {
         }
     }
 
-    fn klisi() -> ServiceStatus {
+    fn tide() -> ServiceStatus {
         ServiceStatus {
-            id: "klisi.example.com".parse().unwrap(),
-            name: "klisi".into(),
-            base_url: "https://klisi.example.com/moil".parse().unwrap(),
+            id: "tide.example.com".parse().unwrap(),
+            name: "tide".into(),
+            base_url: "https://tide.example.com/moil".parse().unwrap(),
             connection: Connection::Connected,
             bundles: vec![
                 bundle("transcribe", "0.2.0", 'a', true),
@@ -620,7 +620,7 @@ mod tests {
 
     fn job(phase: Phase, fraction: Option<f64>) -> JobStatus {
         JobStatus {
-            service: "klisi.example.com".parse().unwrap(),
+            service: "tide.example.com".parse().unwrap(),
             job_id: JobId::new("j_42").unwrap(),
             attempt: 1,
             title: Some("Weekly sync".into()),
@@ -636,7 +636,7 @@ mod tests {
     /// How "Design review" ended, `ago` before `clock`.
     fn report(outcome: JobOutcome, clock: SystemTime, ago: Duration) -> JobReport {
         JobReport {
-            service: "klisi.example.com".parse().unwrap(),
+            service: "tide.example.com".parse().unwrap(),
             job_id: JobId::new("j_41").unwrap(),
             attempt: 2,
             title: Some("Design review".into()),
@@ -646,11 +646,11 @@ mod tests {
         }
     }
 
-    /// A hook of klisi's.
+    /// A hook of tide's.
     fn hook(bundle: &str, runnable: bool) -> HookListing {
-        let service = "/Users/ada/.moil/services/klisi.example.com";
+        let service = "/Users/ada/.moil/services/tide.example.com";
         HookListing {
-            service: "klisi.example.com".parse().unwrap(),
+            service: "tide.example.com".parse().unwrap(),
             hook: HookReport {
                 bundle: bundle.into(),
                 path: format!("{service}/hooks/{bundle}").into(),
@@ -755,7 +755,7 @@ mod tests {
         let fx = Fixture::new();
         let snapshot = Snapshot {
             paused: false,
-            services: vec![klisi(), lab(fx.now)],
+            services: vec![tide(), lab(fx.now)],
             job: Some(job(Phase::Running, Some(0.42))),
             last_job: Some(report(out_of_memory(), fx.clock, Duration::from_secs(300))),
             ..Snapshot::default()
@@ -763,19 +763,19 @@ mod tests {
         assert_eq!(
             lines(&fx.view(&snapshot).menu),
             [
-                "Running “Weekly sync” for klisi — 42%",
+                "Running “Weekly sync” for tide — 42%",
                 "transcribe: diarizing",
                 "[Stop Current Job]",
                 "Last: “Design review” failed 5 minutes ago — CUDA out of memory",
                 "---",
-                "klisi — klisi.example.com ▸",
-                "  https://klisi.example.com/moil",
+                "tide — tide.example.com ▸",
+                "  https://tide.example.com/moil",
                 "  Connected",
                 "  ---",
                 "  [transcribe 0.2.0 — approved]",
                 "  [Review transcribe 0.3.0…]",
                 "  ---",
-                "  [Unpair klisi…]",
+                "  [Unpair tide…]",
                 "Connected",
                 "[Review transcribe 0.3.0…]",
                 "---",
@@ -808,11 +808,11 @@ mod tests {
         other.hook.path.set_extension("sh");
         fx.home.hooks = vec![hook("summarize", false), other, hook("transcribe", true)];
         fx.home.problems = vec![
-            problem("services/klisi.example.com/hooks/summarize"),
+            problem("services/tide.example.com/hooks/summarize"),
             problem("services/stray.txt"),
         ];
         let snapshot = Snapshot {
-            services: vec![klisi(), lab(fx.now)],
+            services: vec![tide(), lab(fx.now)],
             last_job: Some(report(
                 JobOutcome::Succeeded,
                 fx.clock,
@@ -821,14 +821,14 @@ mod tests {
             ..Snapshot::default()
         };
         let lines = lines(&fx.view(&snapshot).menu);
-        let first_service = lines.iter().position(|l| l.starts_with("klisi")).unwrap();
+        let first_service = lines.iter().position(|l| l.starts_with("tide")).unwrap();
         assert_eq!(
             lines[..first_service],
             [
                 "Idle — waiting for jobs",
                 "Last: “Design review” finished 5 minutes ago",
                 "2 problems in moil's home ▸",
-                "  services/klisi.example.com/hooks/summarize",
+                "  services/tide.example.com/hooks/summarize",
                 "  services/stray.txt",
                 "  ---",
                 "  Run “moil status” for details",
@@ -839,8 +839,8 @@ mod tests {
         assert_eq!(
             lines[first_service..first_service + 11],
             [
-                "klisi — klisi.example.com ▸",
-                "  https://klisi.example.com/moil",
+                "tide — tide.example.com ▸",
+                "  https://tide.example.com/moil",
                 "  Connected",
                 "  ---",
                 "  [transcribe 0.2.0 — approved]",
@@ -849,7 +849,7 @@ mod tests {
                 "  Hook for summarize — moil can't run it",
                 "  Hook for transcribe",
                 "  ---",
-                "  [Unpair klisi…]",
+                "  [Unpair tide…]",
             ]
         );
         let lab_menu: Vec<_> = lines
@@ -881,7 +881,7 @@ mod tests {
         let fx = Fixture::new();
         let snapshot = Snapshot {
             paused: true,
-            services: vec![klisi()],
+            services: vec![tide()],
             job: None,
             last_job: None,
             ..Snapshot::default()
@@ -890,14 +890,14 @@ mod tests {
         assert_eq!(
             menu.action("Review transcribe 0.3.0…"),
             Some(&Action::Review {
-                service: "klisi.example.com".parse().unwrap(),
+                service: "tide.example.com".parse().unwrap(),
                 hash: hash('b')
             })
         );
         assert_eq!(
             menu.action("transcribe 0.2.0 — approved"),
             Some(&Action::Review {
-                service: "klisi.example.com".parse().unwrap(),
+                service: "tide.example.com".parse().unwrap(),
                 hash: hash('a')
             })
         );
@@ -905,8 +905,8 @@ mod tests {
         assert_eq!(menu.action("Pause"), None);
         assert_eq!(menu.action("Stop Current Job"), None, "no job, no stop");
         assert_eq!(
-            menu.action("Unpair klisi…"),
-            Some(&Action::Unpair("klisi.example.com".parse().unwrap()))
+            menu.action("Unpair tide…"),
+            Some(&Action::Unpair("tide.example.com".parse().unwrap()))
         );
         assert_eq!(menu.action("Open moil Folder"), Some(&Action::OpenHome));
         assert_eq!(menu.action("Show Log in Finder"), Some(&Action::ShowLog));
@@ -929,7 +929,7 @@ mod tests {
             lines(
                 &fx.view(&Snapshot {
                     paused,
-                    services: vec![klisi()],
+                    services: vec![tide()],
                     job,
                     last_job: None,
                     ..Snapshot::default()
@@ -943,35 +943,35 @@ mod tests {
         let running = |phase, fraction| status(false, Some(job(phase, fraction)));
         assert_eq!(
             running(Phase::Preparing, None),
-            "Running “Weekly sync” for klisi — preparing"
+            "Running “Weekly sync” for tide — preparing"
         );
         assert_eq!(
             running(Phase::Downloading, None),
-            "Running “Weekly sync” for klisi — downloading inputs"
+            "Running “Weekly sync” for tide — downloading inputs"
         );
         assert_eq!(
             running(Phase::Running, None),
-            "Running “Weekly sync” for klisi"
+            "Running “Weekly sync” for tide"
         );
         assert_eq!(
             running(Phase::Running, Some(0.999)),
-            "Running “Weekly sync” for klisi — 99%"
+            "Running “Weekly sync” for tide — 99%"
         );
         assert_eq!(
             running(Phase::Uploading, Some(1.0)),
-            "Running “Weekly sync” for klisi — uploading results"
+            "Running “Weekly sync” for tide — uploading results"
         );
 
         let mut untitled = job(Phase::Running, Some(0.1));
         untitled.title = None;
         assert_eq!(
             status(false, Some(untitled)),
-            "Running “transcribe” for klisi — 10%"
+            "Running “transcribe” for tide — 10%"
         );
 
         let paused = fx.view(&Snapshot {
             paused: true,
-            services: vec![klisi()],
+            services: vec![tide()],
             job: Some(job(Phase::Running, Some(0.5))),
             last_job: None,
             ..Snapshot::default()
@@ -1016,7 +1016,7 @@ mod tests {
         let fx = Fixture::new();
         let line = |outcome, ago: u64| {
             let snapshot = Snapshot {
-                services: vec![klisi()],
+                services: vec![tide()],
                 last_job: Some(report(outcome, fx.clock, Duration::from_secs(ago))),
                 ..Snapshot::default()
             };
@@ -1032,7 +1032,7 @@ mod tests {
         );
         assert_eq!(
             line(JobOutcome::Cancelled, 60),
-            "Last: “Design review” was cancelled by klisi 1 minute ago"
+            "Last: “Design review” was cancelled by tide 1 minute ago"
         );
         assert_eq!(
             line(JobOutcome::Interrupted, 60),
@@ -1096,7 +1096,7 @@ mod tests {
     fn a_stopping_job_says_so_and_cant_be_stopped_again() {
         let fx = Fixture::new();
         let running = Snapshot {
-            services: vec![klisi()],
+            services: vec![tide()],
             job: Some(job(Phase::Running, Some(0.42))),
             ..Snapshot::default()
         };
@@ -1107,7 +1107,7 @@ mod tests {
         assert_eq!(
             lines(&after.menu)[..3],
             [
-                "Stopping “Weekly sync” for klisi…",
+                "Stopping “Weekly sync” for tide…",
                 "transcribe: diarizing",
                 "[Stop Current Job] (disabled)",
             ]
@@ -1138,9 +1138,9 @@ mod tests {
             .icon
             .attention
         };
-        assert!(attention(&fx, vec![klisi()]), "a review waits");
+        assert!(attention(&fx, vec![tide()]), "a review waits");
 
-        let mut reviewed = klisi();
+        let mut reviewed = tide();
         reviewed.bundles.retain(|b| b.approved);
         assert!(
             !attention(&fx, vec![reviewed.clone(), lab(fx.now)]),
@@ -1158,12 +1158,12 @@ mod tests {
         fx.home.problems.clear();
 
         fx.deferred
-            .insert(("klisi.example.com".parse().unwrap(), hash('b')));
-        assert!(!attention(&fx, vec![klisi()]), "put off with Not now");
+            .insert(("tide.example.com".parse().unwrap(), hash('b')));
+        assert!(!attention(&fx, vec![tide()]), "put off with Not now");
         let menu = fx
             .view(&Snapshot {
                 paused: false,
-                services: vec![klisi()],
+                services: vec![tide()],
                 job: None,
                 last_job: None,
                 ..Snapshot::default()
@@ -1200,7 +1200,7 @@ mod tests {
     #[test]
     fn an_unpaired_service_offers_pairing_again() {
         let fx = Fixture::new();
-        let mut service = klisi();
+        let mut service = tide();
         service.connection = Connection::Unpaired;
         let menu = fx
             .view(&Snapshot {
@@ -1213,9 +1213,9 @@ mod tests {
             .menu;
         assert!(lines(&menu).contains(&"Removed this Mac; pair again to use it".to_owned()));
         assert_eq!(
-            menu.action("Pair with klisi Again…"),
+            menu.action("Pair with tide Again…"),
             Some(&Action::PairAgain(
-                "https://klisi.example.com/moil".parse().unwrap()
+                "https://tide.example.com/moil".parse().unwrap()
             ))
         );
     }
@@ -1246,7 +1246,7 @@ mod tests {
         fx.quitting = true;
         let view = fx.view(&Snapshot {
             paused: false,
-            services: vec![klisi()],
+            services: vec![tide()],
             job: Some(job(Phase::Running, Some(0.3))),
             last_job: None,
             ..Snapshot::default()
@@ -1267,16 +1267,16 @@ mod tests {
             })
             .menu
         };
-        let before = at(0.41, vec![klisi()]);
-        let after = at(0.42, vec![klisi()]);
+        let before = at(0.41, vec![tide()]);
+        let after = at(0.42, vec![tide()]);
         assert_ne!(before, after);
         assert!(before.same_shape(&after));
 
-        let mut more = klisi();
+        let mut more = tide();
         more.bundles.push(bundle("summarize", "0.1.0", 'c', false));
         assert!(!before.same_shape(&at(0.42, vec![more])));
 
-        let mut approved = klisi();
+        let mut approved = tide();
         approved.bundles[1].approved = true;
         assert!(!before.same_shape(&at(0.42, vec![approved])));
     }
@@ -1286,7 +1286,7 @@ mod tests {
         let fx = Fixture::new();
         let view = fx.view(&Snapshot {
             paused: false,
-            services: vec![klisi(), lab(fx.now)],
+            services: vec![tide(), lab(fx.now)],
             job: None,
             last_job: None,
             ..Snapshot::default()
@@ -1295,7 +1295,7 @@ mod tests {
         assert!(
             fx.view(&Snapshot {
                 paused: false,
-                services: vec![klisi()],
+                services: vec![tide()],
                 job: None,
                 last_job: None,
                 ..Snapshot::default()
@@ -1345,8 +1345,8 @@ mod tests {
         // Hooks and folders can come from git.
         fx.home.hooks = vec![hook("tr\u{202e}anscribe\nOK", true)];
         fx.home.problems = vec![problem("services/\u{2066}evil\u{2069}\nOK")];
-        let mut service = klisi();
-        service.name = "kli\u{202e}si\nOK".into();
+        let mut service = tide();
+        service.name = "ti\u{202e}de\nOK".into();
         service.bundles[1].info.name = format!("{}x", "long".repeat(20));
         let menu = fx
             .view(&Snapshot {
@@ -1359,7 +1359,7 @@ mod tests {
             .menu;
         let lines = lines(&menu);
         assert!(
-            lines.contains(&"klisi OK — klisi.example.com ▸".to_owned()),
+            lines.contains(&"tide OK — tide.example.com ▸".to_owned()),
             "{lines:#?}"
         );
         assert!(

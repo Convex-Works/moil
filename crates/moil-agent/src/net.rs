@@ -147,7 +147,7 @@ mod tests {
     fn plain_http_is_only_for_loopback_unless_allowed() {
         let check = |s: &str, allow| check_url(&Url::parse(s).unwrap(), allow);
         for ok in [
-            "https://klisi.example.com",
+            "https://tide.example.com",
             "http://localhost:8787",
             "http://LOCALHOST",
             "http://127.0.0.1:1",
@@ -157,7 +157,7 @@ mod tests {
             assert!(check(ok, false).is_ok(), "{ok}");
         }
         for insecure in [
-            "http://klisi.example.com",
+            "http://tide.example.com",
             "http://10.0.0.2",
             "http://localhost.evil.com",
         ] {

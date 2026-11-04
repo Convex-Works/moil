@@ -23,13 +23,13 @@ Examples:
 
 pub const PAIR: &str = "\
 Examples:
-  moil pair https://klisi.convex.works/moil
-  moil pair klisi.convex.works    # a service the home knows, such as a clone from git
-  moil pair https://klisi.convex.works/moil --name \"Ada's MacBook Pro\" --no-browser --json";
+  moil pair https://tide.convex.works/moil
+  moil pair tide.convex.works     # a service the home knows, such as a clone from git
+  moil pair https://tide.convex.works/moil --name \"Ada's MacBook Pro\" --no-browser --json";
 
 pub const UNPAIR: &str = "\
 Example:
-  moil unpair klisi.convex.works";
+  moil unpair tide.convex.works";
 
 pub const SERVICES: &str = "\
 Examples:
@@ -38,24 +38,24 @@ Examples:
 
 pub const REVIEW: &str = "\
 Examples:
-  moil review klisi
-  moil review klisi 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
-  moil review klisi 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --json";
+  moil review tide
+  moil review tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
+  moil review tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --json";
 
 pub const APPROVE: &str = "\
 Examples:
-  moil approve klisi 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
-  moil approve klisi 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --yes --json";
+  moil approve tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6
+  moil approve tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6 --yes --json";
 
 pub const REVOKE: &str = "\
 Example:
-  moil revoke klisi 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6";
+  moil revoke tide 42d30e3fb23030627d993330b1e2917a0ac2f4abef567fc6e82328d8acedeae6";
 
 pub const LOGS: &str = "\
 Examples:
   moil logs -n 50                 # the agent's last 50 lines
   moil logs -f                    # the agent's log, as it is written
-  moil logs klisi transcribe -f   # klisi's hook for transcribe";
+  moil logs tide transcribe -f    # tide's hook for transcribe";
 
 pub const HOME: &str = "\
 Examples:
@@ -89,7 +89,7 @@ WHERE IT LIVES
   <home>/services/<service ID>/hooks/<bundle name>
   <home>/services/<service ID>/hooks/<bundle name>.<extension>
 
-such as ~/.moil/services/klisi.convex.works/hooks/transcribe.py, for the attempts of klisi's bundle named transcribe. `moil home` prints the home, and `moil services` the services' IDs. A hook is named after its bundle, with at most one extension of letters and digits, such as .py or .sh, which tells you and your editor what it is; moil runs it the same way whatever its extension. A bundle has at most one hook: if two files could be its hook, such as transcribe and transcribe.py, moil runs neither. Files named otherwise, and hidden files, are never run.
+such as ~/.moil/services/tide.convex.works/hooks/transcribe.py, for the attempts of tide's bundle named transcribe. `moil home` prints the home, and `moil services` the services' IDs. A hook is named after its bundle, with at most one extension of letters and digits, such as .py or .sh, which tells you and your editor what it is; moil runs it the same way whatever its extension. A bundle has at most one hook: if two files could be its hook, such as transcribe and transcribe.py, moil runs neither. Files named otherwise, and hidden files, are never run.
 
 WHEN IT RUNS
 
@@ -104,9 +104,9 @@ On stdin, the hook context: one line of JSON, then end-of-file. For example (spr
   {
     "v": 1,
     "service": {
-      "id": "klisi.convex.works",
-      "name": "klisi",
-      "base_url": "https://klisi.convex.works/moil"
+      "id": "tide.convex.works",
+      "name": "tide",
+      "base_url": "https://tide.convex.works/moil"
     },
     "bundle": {
       "name": "transcribe",
@@ -175,7 +175,7 @@ Some of what a hook gets comes from the service: title, params, meta and job_id,
 
 AN EXAMPLE
 
-~/.moil/services/klisi.convex.works/hooks/transcribe.py, made executable with chmod +x, keeps each transcript in ~/Transcripts:
+~/.moil/services/tide.convex.works/hooks/transcribe.py, made executable with chmod +x, keeps each transcript in ~/Transcripts:
 
   #!/usr/bin/env -S uv run --script
   # /// script

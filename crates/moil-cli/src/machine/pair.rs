@@ -57,7 +57,7 @@ fn target(ctx: &Context, service: &str) -> anyhow::Result<String> {
             if !service.contains(['/', '.', ':']) && service.trim() != "localhost" {
                 bail!(
                     "the home knows no service {service:?}. To pair with a new service, give \
-                     its moil URL, such as https://klisi.example.com/moil; `moil services` \
+                     its moil URL, such as https://tide.example.com/moil; `moil services` \
                      lists those the home knows"
                 );
             }
