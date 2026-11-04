@@ -58,8 +58,8 @@ Spans are `[start, end]` in seconds from the start of the recording file.
 Participants may repeat a name: their spans are merged. Fields other than
 these are ignored.
 
-Without this input, the outputs and events are byte for byte those of
-version 0.1.0. A timeline that can't be used (bad JSON, another shape, a `v`
+Without this input, every speaker stays `Speaker N`, and the outputs and
+events have no `name` or `speaker_map`. A timeline that can't be used (bad JSON, another shape, a `v`
 other than 1, a span that isn't two finite numbers in order) never fails the
 job: it logs one warning, and the job carries on as if there were none. One
 bad entry rejects the whole file.
@@ -143,8 +143,8 @@ best name only if all three hold:
   timeline never saw, such as a shared video's, can't take the name of someone
   who talked over it.
 
-Otherwise they stay `Speaker N`: an unknown label beats a wrong name. All three
-numbers are starting points, not yet tuned on real recordings.
+Otherwise they stay `Speaker N`: an unknown label beats a wrong name. These three
+numbers aren't tuned on real recordings.
 
 The match is for a whole speaker, never for a word. LiveKit samples who is
 active every 400 ms with smoothing, too coarsely to say who said a word, but
@@ -252,8 +252,7 @@ This is a summary, not legal advice. The license texts are what count.
 ## Platforms
 
 - **macOS on Apple silicon**: verified, on the GPU through MPS, and on the
-  CPU. Intel Macs aren't supported, since torch no longer ships wheels for
-  them.
+  CPU. Intel Macs aren't supported, since torch has no wheels for them.
 - **Linux**: the lockfile's torch is the PyPI build, which bundles CUDA 13,
   so an NVIDIA GPU with a recent driver is used automatically. Without one,
   the job runs on the CPU.

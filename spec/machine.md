@@ -14,9 +14,8 @@ Three rules shape it:
   folder that the owner, a code editor or an LLM can read, and that the
   owner can keep in git.
 - **The owner's code is kept apart from the services' code.** Bundles are
-  the services' code: approved by hash, run by moil, and one day
-  sandboxed. Hooks are the owner's: nobody approves them, and they run as
-  the owner.
+  the services' code: approved by hash and run by moil. Hooks are the
+  owner's: nobody approves them, and they run as the owner.
 - **The command line does everything the app does**, including while the
   app runs, so that scripts and agents can drive moil.
 

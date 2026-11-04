@@ -3,8 +3,8 @@
 The tray app: how a machine's owner pairs with services, reads and approves
 job bundles, sees what runs, and pauses or stops work. It runs the agent on
 the home (`~/.moil`, spec/machine.md) and serves the control socket, so that
-the `moil` command does everything the app does while it runs. macOS first;
-the platform-specific parts are small and live behind `cfg` in
+the `moil` command does everything the app does while it runs. It runs on
+macOS. The platform-specific parts are small and live behind `cfg` in
 `platform.rs`, `login.rs` and `local_bin.rs`.
 
 ## Run it
@@ -73,15 +73,16 @@ events to them and carries out what they ask for.
 | `backend` | `Backend`, what the UI needs from the agent; its implementation for `Hosted`, and real-mode startup |
 | `demo` | `Demo`, the simulated agent behind `--demo`, and the demo bundles in `demo/` |
 | `view` | `TrayView::new`: a `Snapshot` and the home's report become the menu model, the icon's state and the title |
-| `reports` | the home's hooks and problems, from its status report, rebuilt as the agent's state changes |
 | `tray` | makes a `TrayView` real with tray-icon and muda, relabelling in place when only text changed |
 | `icon` | draws the tray icon as a template image |
+| `format` | numbers and times as the owner reads them |
 | `review`, `pair`, `unpair` | one window each: its state machine and its page |
 | `page` | the page shell (policy, style, script) and helpers for untrusted text |
 | `ipc`, `links` | strict parsing of page messages, `moil://` links and navigation |
 | `snapshots` | the agent's snapshots and the home's reports, taken by the event loop when it gets to them, however fast they come |
 | `login` | Open at Login, for the menu and `moil login-item` |
 | `local_bin` | the rule for linking `~/.local/bin/moil` |
+| `gallery` | writes every page and the tray menu to files, for a look at them |
 | `app` | the tao event loop, wry windows and Tokio tasks; `Controls`, which carries `moil quit` and `moil login-item` into the event loop |
 
 Pages show text a service controls, so every page is escaped by maud, runs

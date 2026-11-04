@@ -2,7 +2,7 @@
 
 A protocol, a server SDK (Go), a job runtime and a tray app (Rust, macOS
 first) that let people lend their machines to web services, one approved
-job bundle at a time. README.md explains the idea. **spec/protocol.md
+job bundle at a time. docs/how-it-works.md explains the idea. **spec/protocol.md
 (the wire) and spec/machine.md (the home, hooks and command line) are the
 contract**. Read them before changing anything that crosses a boundary.
 
@@ -21,7 +21,8 @@ contract**. Read them before changing anything that crosses a boundary.
 | `crates/moil-app` | The tray app (macOS) |
 | `sdk/go` | The Go server SDK (`moil`) and a fake machine for service tests (`moiltest`) |
 | `e2e/` | End-to-end tests: the Go SDK against the real `moil` binary and real uv |
-| `examples/` | Example bundles and an example service |
+| `examples/` | Example bundles, an example service and an example hook |
+| `docs/` | How moil works and its trust model |
 
 ## Rules that bite
 
@@ -43,6 +44,17 @@ contract**. Read them before changing anything that crosses a boundary.
   implementation isn't worth having. Keep them fast and deterministic: no
   fixed sleeps where a condition can be awaited.
 - `make check` must pass before any commit.
+
+## Docs
+
+| Read | Before |
+|---|---|
+| `docs/how-it-works.md` | Changing how pairing, bundles, approval or jobs fit together |
+| `docs/trust-model.md` | Changing what a machine trusts or checks |
+| `sdk/go/README.md` | Changing the SDK's public API |
+| `crates/moil-app/README.md` | Changing the app: its modules, build and tests |
+| `e2e/README.md` | Adding or changing an end-to-end test |
+| `examples/bundles/transcribe/README.md` | Changing the transcribe bundle. Any change to its `job.py`, `job.py.lock` or `manifest.json` changes the bundle hash |
 
 ## Style
 

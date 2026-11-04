@@ -2,116 +2,49 @@
 
 Lend your machine to the services you use, one approved job at a time.
 
-moil is a small protocol, a server SDK and a tray app. A web service (e.g.
-[tide], a self-hosted video meeting app) posts a job, such as "transcribe
-this meeting with speaker labels". One of the machines its users have
-paired picks up the job, runs a script the machine's owner has read and
-approved, and streams progress and results back.
+A web service, such as [tide], posts a job: "transcribe this meeting with
+speaker labels". A machine that its owner paired with the service runs a
+script the owner approved. The machine streams progress and results back.
 
-The name is plain English for "to toil".
+moil is a protocol, a Go server SDK and a tray app. It is for self-hosted
+services that need occasional heavy compute, and for the people who use them.
 
-> Status: alpha. Everything below works end to end on macOS; Linux and
-> Windows machines come later. [spec/protocol.md](spec/protocol.md) is
-> version 1 of the protocol.
+> Status: alpha. Machines run on macOS only. The protocol is at version 1.
 
-## Why
-
-Self-hosted services often need occasional heavy compute (speech-to-text,
-diarization, embeddings) that the server itself lacks, while their users
-have idle laptops and desktops with capable GPUs. moil lets those users
-offer that compute explicitly, per service and per script, without opening
-ports or trusting the service with anything they haven't read.
-
-## Principles
-
-- **Explicit consent, pinned by hash.** A machine runs only job bundles
-  whose exact hash its owner approved after reading the whole bundle. A new
-  version means a new hash and a new approval.
-- **Machines open every connection.** Machines only make outbound
-  connections: no open ports, no NAT traversal.
-- **Services decide eligibility; machines decide consent.** Which machines
-  may receive a given job (e.g. only the meeting owner's) is the service's
-  policy. moil only enforces what the machine's owner approved.
-- **Large data moves out of band.** Inputs and outputs travel as
-  short-lived URLs, such as pre-signed S3 URLs, not over the control
-  channel.
-
-## How it works
-
-```
-┌────────────────────┐        WebSocket        ┌──────────────────────┐
-│  Service (tide)    │◀── opened by machine ───│   moil app (Rust)    │
-│  + Go SDK          │                         │   tray, agent        │
-└────────────────────┘                         └──────────┬───────────┘
-         │                                                │ stdin / stdout
-         │ pre-signed URLs                                ▼
-         ▼                                     job runtime: uv run --locked
-   object storage  ◀──── inputs and outputs ────  job.py
-```
-
-**Pairing.** In the app, the owner enters the service's moil address. The
-app shows a short code and opens the service's confirmation page, where the
-owner, already signed in, checks the code and confirms. That is the device
-flow `gh auth login` uses, and the app never sees the owner's password. The
-machine's token goes into the keychain.
-
-**Bundles.** A job bundle is three files:
-
-| File | Contents |
-|---|---|
-| `job.py` | The script, with its dependencies declared inline (PEP 723). |
-| `job.py.lock` | Every package at an exact version, with the hash of every artifact (`uv lock --script job.py`). |
-| `manifest.json` | Name, version, description, model weights to download (URL and SHA-256) and the resources it needs. |
-
-The bundle hash is the SHA-256 of their `sha256sum` listing, so anyone can
-check it by hand:
-
-```sh
-shasum -a 256 job.py job.py.lock manifest.json | shasum -a 256
-```
-
-**Approval.** When a service offers a new bundle, the app's review window
-shows the three files in full, every package the lockfile installs, what
-the manifest downloads, and what changed since the version the owner
-approved before. Approving stores that exact copy; jobs only ever run from
-it, re-checked before each run.
-
-**Jobs.** The service offers a job to the eligible machines that approved
-its bundle, picks one of those that bid, and assigns it. The machine's
-runtime prepares the environment with `uv sync --locked`, downloads and
-verifies the assets and inputs, runs `uv run --locked --script job.py` in
-its own process group, and uploads the outputs. The script reads the job
-from stdin and writes one JSON event per line to stdout:
-
-```jsonl
-{"v":1,"type":"progress","fraction":0.42,"message":"diarizing"}
-{"v":1,"type":"data","payload":{"speaker":1,"text":"Shall we start?"}}
-{"v":1,"type":"result","files":["transcript.json"],"meta":{"speakers":4}}
-```
-
-It never sees the WebSocket, the machine's token or any URL. Leases,
-sequence numbers and acknowledgements let an attempt survive a dropped
-connection, and a machine that disappears loses its job to another.
+moil has no sandbox. An approved script runs with your permissions, so read
+each bundle before you approve it. See the [trust model](docs/trust-model.md).
 
 ## Try it
 
-You need Rust, Go 1.24 or later, and [uv](https://docs.astral.sh/uv/).
+You need Rust 1.90 or later, Go 1.24 or later, and
+[uv](https://docs.astral.sh/uv/).
 
-Start the example service, which publishes the `echo` bundle:
+1. Start the example service. It publishes the `echo` bundle.
 
-```sh
-cd examples/service && go run . -bundles ../bundles/echo
-```
+   ```sh
+   cd examples/service && go run . -bundles ../bundles/echo
+   ```
 
-Then run the app and pair it with `http://127.0.0.1:8787/moil`:
+2. In a second terminal, start the app.
 
-```sh
-cargo run -p moil-app             # or: packaging/macos/build.sh && open target/macos/Moil.app
-```
+   ```sh
+   cargo run -p moil-app
+   ```
 
-Confirm the code on the page that opens, review and approve `echo` from
-the tray menu, and submit a job from http://127.0.0.1:8787. The same works
-from a terminal, while the app runs or without it:
+3. Pair the app with `http://127.0.0.1:8787/moil`.
+4. Confirm the code on the page that opens.
+5. Review and approve `echo` from the tray menu.
+6. Submit a job from http://127.0.0.1:8787.
+
+To see the app without a service, run `cargo run -p moil-app -- --demo`.
+
+To build `Moil.app`, run `packaging/macos/build.sh`.
+
+## Use the command line
+
+The `moil` command does everything the app does, while the app runs too.
+Scripts and agents can use it. `Moil.app` links it to `~/.local/bin/moil`.
+From source, run `cargo build -p moil-cli` and use `target/debug/moil`.
 
 ```sh
 moil pair http://127.0.0.1:8787/moil
@@ -121,13 +54,12 @@ moil status                               # what moil is doing; --json for scrip
 moil agent                                # without the app: take jobs until Ctrl-C
 ```
 
-`cargo run -p moil-app -- --demo` shows the app with a simulated agent.
+Run `moil --help` for every command.
 
-## Your machine, as files
+## Use hooks
 
-Everything moil runs or acts on is in one folder, `~/.moil`, which you,
-your editor or an LLM can read, and which you can keep in git
-([spec/machine.md](spec/machine.md)):
+Everything moil runs or acts on is in one folder, `~/.moil`. You, your editor
+or an LLM can read it, and you can keep it in git.
 
 ```
 ~/.moil/
@@ -139,24 +71,18 @@ your editor or an LLM can read, and which you can keep in git
     logs/transcribe.log          what that hook printed
 ```
 
-**Hooks** are how a job's results become yours. After a job of a bundle
-succeeds on your machine, moil runs your executable
-`services/<service>/hooks/<bundle>`, such as `hooks/transcribe.py`, with
-the job's context on stdin and its outputs in a folder. The service never
-learns a hook exists. The [example hook](examples/hooks/meeting-notes.py)
-turns a tide transcript into meeting notes in an Obsidian vault; `moil
-hooks --help` has the whole contract.
+A hook makes a job's results yours. After a job succeeds on your machine, moil
+runs your executable `services/<service>/hooks/<bundle>`. The hook gets the
+job's context on stdin and its outputs in a folder. The service never learns
+that a hook exists.
 
-**The command line does everything the app does**, while the app runs
-too, so scripts and agents can drive moil: `moil status`, `pause`,
-`stop`, `pair`, `review`, `approve`, `hooks`, `logs` and the rest, with
-`--json` on all that report something. A service folder kept in git moves
-your approvals and hooks to your other machines; `.gitignore` keeps out
-what belongs to one machine alone, and the token is never in a service's
-folder: it stays in the keychain (in `.machine/` off macOS), kept with the
-one URL it may be sent to.
+The [example hook](examples/hooks/meeting-notes.py) turns a tide transcript
+into meeting notes in an Obsidian vault. Run `moil hooks --help` for the whole
+contract.
 
 ## Write a bundle
+
+A bundle is a script, its lockfile and a manifest.
 
 ```sh
 moil init mybundle        # job.py, manifest.json and a lockfile to start from
@@ -164,14 +90,15 @@ moil check mybundle       # valid, lockfile current, what it installs and downlo
 moil run mybundle --input audio.ogg=meeting.ogg --output transcript.json
 ```
 
-`moil run` runs the bundle exactly as a machine would, with inputs and
-outputs moving over a local HTTP server. [examples/bundles/echo](examples/bundles/echo)
-uses every part of the script contract and is the place to start;
+`moil run` runs the bundle exactly as a machine does. A local HTTP server
+moves the inputs and outputs.
+
+Start from [examples/bundles/echo](examples/bundles/echo), which uses every
+part of the script contract.
 [examples/bundles/transcribe](examples/bundles/transcribe) transcribes a
 meeting with speaker labels, using Nemotron 3 Diarization and Parakeet.
 
-Making a script work on every platform (CUDA, Apple MPS, CPU) is the
-bundle author's job.
+The bundle author makes the script work on each platform (CUDA, Apple MPS, CPU).
 
 ## Add moil to a service
 
@@ -192,69 +119,21 @@ for ev := range run.Events(ctx) { /* progress, live data */ }
 result, err := run.Wait(ctx)
 ```
 
-[sdk/go/README.md](sdk/go/README.md) covers onboarding your users (where
-to get the app, `moil.AppURL`, and the three steps to show them), the
-pairing page, publishing bundles, submitting jobs and testing a service
-with `moiltest`, a fake machine.
+The [Go SDK guide](sdk/go/README.md) covers how to onboard your users, the
+pairing page, bundles, jobs and tests.
 
-## Trust model
+## Documentation
 
-moil runs arbitrary code. Approving a bundle hash means "I trust exactly
-this code, and the exact dependencies it pins", in the same way installing
-an app means trusting its author.
-
-- A compromised service can't swap the code: the machine verifies the hash
-  locally before every run, and shows only what it verified.
-- Nor the dependencies: the lockfile must pin every artifact by hash and
-  come from https sources, and packages that have wheels install only
-  from those wheels. A package that must be built from source is marked in
-  the review, because its build tools aren't pinned.
-- The review marks characters that could hide code from a reader:
-  carriage returns, escape sequences, bidirectional overrides and
-  invisible characters.
-- A compromised service *can* send malicious inputs to an approved script,
-  so scripts should treat inputs as untrusted. It can't aim a job's
-  downloads and uploads at services that listen only on the owner's
-  machine: plain `http` to loopback is only for services on loopback.
-- Whoever runs a machine can see the job's inputs. Services must only offer
-  sensitive data (e.g. meeting audio) to machines their policy allows,
-  typically the data owner's own.
-- There is no sandbox yet. The review window says so plainly.
-- Hooks are your own code: nobody approves them, and they run as you.
-  What they're given comes partly from the service (a job's title and
-  params, its outputs' names and contents), so a hook should treat it as
-  untrusted. Whoever can push to a service folder you keep in git can
-  approve bundles and add hooks on your machines.
-
-## Repository
-
-| Path | What |
-|---|---|
-| [`spec/`](spec) | The protocol spec and the test vectors both implementations check against |
-| [`sdk/go`](sdk/go) | The Go server SDK and `moiltest` |
-| [`crates/moil-app`](crates/moil-app) | The tray app (macOS) |
-| `crates/moil-cli` | The `moil` command line |
-| `crates/moil-agent` | The machine side: pairing, approvals, control channels |
-| `crates/moil-runtime` | Runs attempts: uv environments, assets, the script, outputs |
-| `crates/moil-bundle`, `crates/moil-proto` | Bundles and wire types |
-| [`e2e/`](e2e) | End-to-end tests: the Go SDK against the real `moil` binary and uv |
-| [`examples/`](examples) | Example bundles, a demo service, and example hooks |
-
-`make check` runs everything: formatting, lints, the Rust and Go tests and
-the end-to-end suite.
-
-## Later
-
-- The app on Linux and Windows; a signed and notarized macOS build.
-- Trusting a publisher's signing key instead of approving each hash.
-- Sandboxing: `sandbox-exec` on macOS, Landlock or bubblewrap on Linux, Job
-  Objects on Windows. A sandboxed script must also lose the reach it has
-  today into `~/.moil` and moil's control socket.
-- Jobs that survive a service restart; server SDKs in other languages.
-- Bundles in languages other than Python.
-
-[tide]: https://github.com/Convex-Works/tide
+- [How moil works](docs/how-it-works.md): the design, pairing, bundles, approval and jobs.
+- [Trust model](docs/trust-model.md): what approving a bundle means, and what moil protects against.
+- [Machine spec](spec/machine.md): the home's files, settings, hooks and the command line.
+- [Protocol spec](spec/protocol.md): what machines and services say to each other.
+- [Go SDK guide](sdk/go/README.md): add moil to a service.
+- [Tray app](crates/moil-app/README.md): run, build and test the app.
+- [AGENTS.md](AGENTS.md): the repository layout, and the rules for changing moil.
 
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+[tide]: https://github.com/Convex-Works/tide
